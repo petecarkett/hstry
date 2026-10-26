@@ -41,6 +41,7 @@ globalThis.fetch = async (url, init = {}) => {
       : Response.json({ items: [project(A)], cursor: 'NEXT' });
   }
   if (u.pathname === '/backend-api/conversations') {
+    if (u.searchParams.get('is_archived') === 'true') return Response.json({ items: [], total: 0 });
     return Response.json({ items: [{ id: 'personal-one', update_time: old }], total: 1 });
   }
   if (u.pathname === `/backend-api/gizmos/${A}/conversations`) {

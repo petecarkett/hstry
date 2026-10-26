@@ -28,6 +28,7 @@ globalThis.fetch = async (url, init = {}) => {
   if (u.pathname === '/backend-api/gizmos/snorlax/sidebar') return Response.json({ items: [], cursor: null });
   if (u.pathname === '/backend-api/conversations') {
     listCalls++;
+    if (u.searchParams.get('is_archived') === 'true') return Response.json({ total: 0, items: [] });
     if (rateLimitedList) return new Response('', { status: 429, headers: { 'retry-after': '180' } });
     const rows = data[acc] ?? [];
     const start = Number(u.searchParams.get('offset'));

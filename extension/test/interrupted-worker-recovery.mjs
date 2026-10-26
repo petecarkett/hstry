@@ -43,6 +43,8 @@ globalThis.chrome = {
   runtime: {
     onInstalled: events, onStartup: events, onMessage: events,
   },
+  tabs: { onUpdated: events, onRemoved: events, onActivated: events },
+  scripting: {}, // Injection is not part of this recovery fixture.
   action: {
     onClicked: events,
     async setBadgeText({text}) {badgeText.push(text);},

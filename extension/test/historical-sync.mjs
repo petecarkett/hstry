@@ -28,6 +28,7 @@ globalThis.fetch = async url => {
   if (path === '/api/auth/session') return Response.json({ accessToken: 'fixture-token' });
   if (path === '/backend-api/accounts/check/v4-2023-04-27') return Response.json({ accounts: {} });
   if (path === '/backend-api/gizmos/snorlax/sidebar') return Response.json({ items: [], cursor: null });
+  if (path === '/backend-api/conversations' && new URL(url).searchParams.get('is_archived') === 'true') return Response.json({ total: 0, items: [] });
   if (path === '/backend-api/conversations') return Response.json({ total: 1, items: [{ id: 'old-chat', update_time: historySeconds }] });
   if (path === '/backend-api/conversation/old-chat') return Response.json(oldConversation);
   throw new Error(`Unexpected path ${path}`);

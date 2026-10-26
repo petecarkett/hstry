@@ -41,7 +41,7 @@ globalThis.fetch = async (url,options={}) => {
   assert.equal(u.origin,'https://chatgpt.com','never contact an external service in test');
   callsThisRun++;
   maxCalls=Math.max(maxCalls,callsThisRun);
-  events.push({run:activeRun,path:u.pathname,cursor:u.searchParams.get('cursor')});
+  events.push({run:activeRun,path:u.pathname,cursor:u.searchParams.get('cursor'),archived:u.searchParams.get('is_archived') === 'true'});
   assert(callsThisRun<=1,'at most one ChatGPT request per worker run');
   if (u.pathname==='/api/auth/session') {
     sessionCalls++;
@@ -132,12 +132,16 @@ try {
   assert.deepEqual(ingested.map(c=>c.workspace),[A,B]);
   assert.equal(accountCalls,1,'account discovery only once per sweep');
   assert.equal(sidebarCalls,3,'paginated workspace and personal project discovery');
-  assert.equal(sessionCalls,2,'session token reused until invalid/expired');
+  assert.equal(sessionCalls,3,'token is refreshed after the 401 and again on its two-hour TTL');
+  assert.deepEqual(events.filter(e=>e.path==='/api/auth/session').map(e=>e.run),[1,8,16],
+    'repeated 15-minute worker invocations reuse session until the 401 or TTL');
   assert.equal(detailCalls,3,'a single 401 is retried after refreshing next worker');
   assert.equal(state.pending,undefined,'no stale cursor after completed sweep');
   assert.equal(state.discovery,undefined,'discovery checkpoint cleared when complete');
   assert.equal(store.size,1,'only temporary session token cached');
-  assert.equal(listCalls,4,'two project collection lists and two personal lists');
+  assert.equal(listCalls,6,'two project lists, two active personal lists and two archived personal lists');
+  assert.equal(events.filter(e=>e.path==='/backend-api/conversations' && e.archived).length,2,
+    'both accounts must enumerate their archived conversation scope');
   const sessionSeen=events.filter(e=>e.path==='/api/auth/session').map(e=>e.run);
   assert(sessionSeen.every(run=>events.filter(e=>e.run===run).length===1),
     'authentication refresh is isolated from all other ChatGPT API calls');
