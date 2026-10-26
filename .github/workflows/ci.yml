@@ -77,6 +77,26 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo build -p hstry-cli
       - run: bun adapters/pi-durable/cli-proof.ts
+      - name: Chrome extension provider regression suites
+        run: node --test extension/test/*.mjs
+      - name: Extension providers to real HSTRY API and search
+        run: |
+          cargo build -p hstry-api
+          temp="$(mktemp -d)"
+          export XDG_CONFIG_HOME="$temp/config" XDG_DATA_HOME="$temp/data" XDG_STATE_HOME="$temp/state"
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
+          export PATH="$PWD/target/debug:$PATH"
+          hstry-api --config "$temp/config.toml" --port 39132 --token testtoken > "$temp/api.log" 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true; wait "$api_pid" 2>/dev/null || true; rm -rf "$temp"' EXIT
+          ready=0
+          for attempt in {1..80}; do
+            if curl -fsS http://127.0.0.1:39132/health > /dev/null 2>&1; then ready=1; break; fi
+            if ! kill -0 "$api_pid" 2>/dev/null; then cat "$temp/api.log"; exit 1; fi
+            sleep 0.2
+          done
+          test "$ready" -eq 1
+          node extension/test/run.js 39132 testtoken "$temp/config.toml"
 
   web-ui:
     name: Web UI and Oqto App

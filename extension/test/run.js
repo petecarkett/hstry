@@ -44,6 +44,22 @@ const FIXTURES = {
         { id: 'gpt-conv-1', title: 'GPT fixture chat', create_time: OLD_S, update_time: OLD_S },
       ],
     },
+    '/backend-api/conversation/gpt-archived-1': {
+      title: 'Archived GPT fixture',
+      create_time: OLD_S,
+      update_time: OLD_S,
+      current_node: 'archived1',
+      mapping: {
+        archived1: {
+          id: 'archived1', parent: null,
+          message: {
+            author: { role: 'user' },
+            create_time: OLD_S,
+            content: { content_type: 'text', parts: ['archived fixture record'] },
+          },
+        },
+      },
+    },
     '/backend-api/conversation/gpt-conv-1': {
       title: 'GPT fixture chat',
       create_time: OLD_S,
@@ -108,6 +124,15 @@ globalThis.fetch = async (url, init = {}) => {
   if (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') {
     return realFetch(url, init);
   }
+  // Archived conversations are a distinct collection, not a replay of
+  // the active collection. Keep one archived fixture for real API ingestion.
+  if (parsed.hostname === 'chatgpt.com' && parsed.pathname === '/backend-api/conversations' &&
+      parsed.searchParams.get('is_archived') === 'true') {
+    return Response.json({
+      total: 1,
+      items: [{id: 'gpt-archived-1', title: 'Archived GPT fixture', create_time: OLD_S, update_time: OLD_S}],
+    });
+  }
   const fixture = FIXTURES[parsed.hostname]?.[parsed.pathname];
   if (fixture === undefined) {
     return new Response('not found', { status: 404 });
@@ -152,11 +177,11 @@ for (let i = 0; i < 8; i++) {
 check('chatgpt complete sync', gpt1.hasMore, false);
 const claude1 = await syncClaude({ state: {}, push, log });
 
-check('chatgpt run 1 conversations', chatgptCount, 2); // personal + workspace account
+check('chatgpt run 1 conversations', chatgptCount, 4); // active + archived in personal and workspace
 check('claude run 1 conversations', claude1.conversations, 1);
 check(
   'source ids',
-  pushes.map(p => p.sourceId).sort(),
+  [...new Set(pushes.map(p => p.sourceId))].sort(),
   ['chatgpt-web', 'chatgpt-web-accteam1', 'claude-web']
 );
 
@@ -168,16 +193,21 @@ check('chatgpt run 2 conversations (incremental)', gpt2.conversations, 0);
 check('claude run 2 conversations (incremental)', claude2.conversations, 0);
 check('run 2 pushes', pushes.length, 0);
 
-// The current hstry-api exposes ingestion, not HTTP /search. Validate the
-// exact isolated database through hstry's maintained read interface.
+// Check the actual indexed database through the maintained hstry CLI.
 const search = JSON.parse(execFileSync('hstry', [
-  '--config', CONFIG_PATH, '--json', 'search', 'fixture', '--limit', '10',
+  '--config', CONFIG_PATH, '--json', 'search', 'fixture', '--limit', '50', '--max-chars', '25000',
 ], { encoding: 'utf8' }));
 const hits = search.result?.hits ?? [];
 const sources = [...new Set(hits.map(h => h.provenance?.source))].sort();
 check('search finds all sources', sources, ['chatgpt-web', 'chatgpt-web-accteam1', 'claude-web']);
 const gptHit = hits.find(h => h.provenance?.source === 'chatgpt-web' && h.role === 'assistant');
 check('gpt assistant content', gptHit?.snippet, 'fixture response');
+const archivedSearch = JSON.parse(execFileSync('hstry', [
+  '--config', CONFIG_PATH, '--json', 'search', 'archived', '--limit', '10',
+], { encoding: 'utf8' }));
+check('archived conversations indexed in both ChatGPT accounts',
+  archivedSearch.result?.hits?.filter(hit => hit.snippet?.includes('archived fixture record')).length,
+  2);
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) FAILED.`);
 process.exit(failures === 0 ? 0 : 1);
