@@ -541,8 +541,9 @@ impl Database {
 
     /// Insert a conversation (upsert by source_id + external_id).
     ///
-    /// NOTE: workspace uses COALESCE(NULLIF(...), existing) to prevent adapter
-    /// syncs from overwriting a correct workspace with an empty value.  The Pi
+    /// NOTE: workspace normally preserves a known value when an adapter provides
+    /// nothing, except for ChatGPT's explicit projectId=null (project removal).
+    /// The Pi
     /// adapter's `decodeWorkspaceFromPath` fallback is lossy (replaces all
     /// hyphens with slashes) and sometimes yields empty/corrupt workspace
     /// strings.  The runner writes the correct workspace first via gRPC, so we
@@ -589,7 +590,12 @@ impl Database {
                 updated_at = excluded.updated_at,
                 model = excluded.model,
                 provider = excluded.provider,
-                workspace = COALESCE(NULLIF(excluded.workspace, ''), conversations.workspace),
+                workspace = CASE
+                    WHEN excluded.source_id LIKE 'chatgpt-web%'
+                        AND json_type(excluded.metadata, '$.projectId') = 'null'
+                    THEN NULL
+                    ELSE COALESCE(NULLIF(excluded.workspace, ''), conversations.workspace)
+                END,
                 tokens_in = excluded.tokens_in,
                 tokens_out = excluded.tokens_out,
                 cost_usd = excluded.cost_usd,
@@ -1629,7 +1635,8 @@ impl Database {
 
     /// Upsert a conversation within an existing transaction.
     ///
-    /// See [`upsert_conversation`] for the workspace COALESCE rationale.
+    /// See [`upsert_conversation`] for workspace preservation and explicit
+    /// ChatGPT project removal semantics.
     pub async fn upsert_conversation_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -1666,7 +1673,12 @@ impl Database {
                 updated_at = excluded.updated_at,
                 model = excluded.model,
                 provider = excluded.provider,
-                workspace = COALESCE(NULLIF(excluded.workspace, ''), conversations.workspace),
+                workspace = CASE
+                    WHEN excluded.source_id LIKE 'chatgpt-web%'
+                        AND json_type(excluded.metadata, '$.projectId') = 'null'
+                    THEN NULL
+                    ELSE COALESCE(NULLIF(excluded.workspace, ''), conversations.workspace)
+                END,
                 tokens_in = excluded.tokens_in,
                 tokens_out = excluded.tokens_out,
                 cost_usd = excluded.cost_usd,
@@ -3478,7 +3490,8 @@ fn project_content(content: &str, parts_json: &serde_json::Value) -> String {
         };
         let part_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or_default();
         let raw_text = match part_type {
-            "text" | "thinking" => obj.get("text").and_then(|v| v.as_str()),
+            // Thinking is retained in original parts_json but is not a user-visible search projection.
+            "text" => obj.get("text").and_then(|v| v.as_str()),
             "status" | "error" => obj
                 .get("message")
                 .or_else(|| obj.get("text"))
@@ -3546,7 +3559,23 @@ fn readable_id_from_metadata(metadata: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod fts_query_tests {
-    use super::sanitize_fts_query;
+    use super::{project_content, sanitize_fts_query};
+
+    #[test]
+    fn hidden_thinking_is_not_copied_into_search_projection() {
+        let hidden = serde_json::json!([{"type":"thinking","text":"not visible to the user"}]);
+        assert_eq!(project_content("", &hidden), "");
+
+        let mixed = serde_json::json!([
+            {"type":"thinking","text":"not visible to the user"},
+            {"type":"text","text":"the visible response"}
+        ]);
+        assert_eq!(project_content("", &mixed), "the visible response");
+        assert_eq!(
+            project_content("normal user text", &serde_json::json!([])),
+            "normal user text"
+        );
+    }
 
     #[test]
     fn quotes_tokens_to_neutralize_operators() {

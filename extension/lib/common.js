@@ -38,7 +38,7 @@ const MAX_BACKOFF_MS = 60_000;
  * otherwise uses exponential backoff with jitter. 401/403 fail fast as
  * "not logged in" — retrying those is pointless.
  */
-export async function fetchJson(url, init = {}, { retries = 5, baseDelayMs = 1000 } = {}) {
+export async function fetchJson(url, init = {}, { retries = 5, baseDelayMs = 1000, maxBackoffMs = MAX_BACKOFF_MS } = {}) {
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(url, { credentials: 'include', ...init });
 
@@ -47,27 +47,43 @@ export async function fetchJson(url, init = {}, { retries = 5, baseDelayMs = 100
     }
 
     if (res.status === 429 || res.status === 502 || res.status === 503) {
-      if (attempt >= retries) {
-        throw new RateLimitedError(`${init.method ?? 'GET'} ${url} -> ${res.status} (gave up after ${retries} retries)`);
-      }
-      const retryAfter = Number(res.headers.get('retry-after'));
-      const headerMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 0;
+      const retryHeader = res.headers.get('retry-after');
+      const retrySeconds = retryHeader?.trim() ? Number(retryHeader) : NaN;
+      const retryDate = retryHeader ? Date.parse(retryHeader) : NaN;
+      const serverRetryAfterMs = Number.isFinite(retrySeconds) && retrySeconds >= 0
+        ? retrySeconds * 1000
+        : Number.isFinite(retryDate) ? Math.max(0, retryDate - Date.now()) : null;
       const backoffMs = baseDelayMs * 2 ** attempt + Math.floor(Math.random() * 500);
-      await sleep(Math.min(MAX_BACKOFF_MS, Math.max(headerMs, backoffMs)));
+      const requestedWaitMs = Math.max(serverRetryAfterMs ?? 0, backoffMs);
+      const waitMs = Math.min(MAX_BACKOFF_MS, requestedWaitMs);
+      if (attempt >= retries || requestedWaitMs > maxBackoffMs) {
+        throw new RateLimitedError(
+          `${init.method ?? 'GET'} ${url} -> ${res.status} (retry later)`,
+          requestedWaitMs,
+          res.status,
+          serverRetryAfterMs
+        );
+      }
+      await sleep(waitMs);
       continue;
     }
 
     if (!res.ok) {
-      throw new Error(`${init.method ?? 'GET'} ${url} -> ${res.status}`);
+      const error = new Error(`${init.method ?? 'GET'} ${url} -> ${res.status}`);
+      error.status = res.status;
+      throw error;
     }
     return res.json();
   }
 }
 
 export class RateLimitedError extends Error {
-  constructor(message) {
+  constructor(message, retryAfterMs = 60_000, status = null, serverRetryAfterMs = null) {
     super(message);
     this.name = 'RateLimitedError';
+    this.retryAfterMs = retryAfterMs;
+    this.status = status;
+    this.serverRetryAfterMs = serverRetryAfterMs;
   }
 }
 

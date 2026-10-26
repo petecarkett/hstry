@@ -32,5 +32,30 @@ async fn search_and_expand_share_a_real_message_anchor() -> anyhow::Result<()> {
         expanded["result"]["records"][0]["text"],
         "needle@example.test FixtureOnlyValue"
     );
+    let by_external = serde_json::from_value(serde_json::json!({
+        "conversation_id": "test", "message_idx": 0
+    }))?;
+    let response: serde_json::Value =
+        serde_json::from_str(&server.expand(Parameters(by_external)).await)?;
+    assert_eq!(
+        response["result"]["records"][0]["text"], "needle@example.test FixtureOnlyValue",
+        "external ID must use the same HSTRY read path"
+    );
     Ok(())
+}
+
+#[test]
+fn chatgpt_link_and_archive_id_resolve_to_one_reference() {
+    let id = "11111111-2222-3333-4444-555555555555";
+    let project = "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert_eq!(
+        normalize_conversation_reference(id).unwrap(),
+        (id.into(), None)
+    );
+    let link = format!("https://chatgpt.com/g/{project}-example/c/{id}");
+    assert_eq!(
+        normalize_conversation_reference(&link).unwrap(),
+        (id.into(), Some(project.into()))
+    );
+    assert!(normalize_conversation_reference("https://example.invalid/c/123").is_err());
 }

@@ -49,7 +49,7 @@ function renderResyncControls(status = {}) {
     const description = row.querySelector('small');
     description.id = `resync-description-${id}`;
     description.textContent = enabled
-      ? `Re-import all conversations from ${provider.site}.`
+      ? `Re-import available conversations from ${provider.site}.`
       : 'Enable this provider before running a full resync.';
     const button = row.querySelector('button');
     const providerRunning =
@@ -104,7 +104,7 @@ async function checkConnection() {
   } catch {
     indicator.className = 'connection-result error';
     dot.className = 'status-dot error';
-    indicator.textContent = `Cannot reach http://127.0.0.1:${currentSettings.port}. Check that hstry-api is running on this exact port.`;
+    indicator.textContent = 'Connection not ready: set the ingest token and check the local API.';
     apiConnected = false;
     await renderStatus();
     return false;

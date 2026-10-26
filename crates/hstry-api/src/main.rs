@@ -17,6 +17,7 @@ use tower_http::trace::TraceLayer;
 
 use hstry_core::db::{SearchMode, SearchOptions};
 use hstry_core::ingest::ingest_batch;
+use hstry_core::live::{LiveCapture, LiveIngestOutcome, ingest_live_capture, resolve_live_source};
 use hstry_core::models::Source;
 use hstry_core::parsed::ParsedConversation;
 use hstry_core::{Config, Database};
@@ -82,13 +83,14 @@ async fn try_main() -> Result<()> {
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
-        .route("/config", get(get_config))
-        .route("/search", get(search))
-        .route("/read", post(read_evidence))
         .route("/sources", post(register_source))
         .route(
             "/ingest",
             post(ingest).layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT)),
+        )
+        .route(
+            "/ingest/live",
+            post(ingest_live).layer(DefaultBodyLimit::max(2_500_000)),
         )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -397,6 +399,48 @@ async fn register_source(
         adapter: source.adapter,
         created,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiveIngestRequest {
+    source: String,
+    capture: LiveCapture,
+}
+
+async fn ingest_live(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LiveIngestRequest>,
+) -> Result<Json<LiveIngestOutcome>, StatusCode> {
+    authorize_ingest(&state, &headers)?;
+    let mut capture = req.capture;
+    let source = if req.source == "auto" {
+        let found = resolve_live_source(&state.db, &capture)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::CONFLICT)?;
+        if capture.account_id.is_none() {
+            capture.account_id = found.account_id;
+        }
+        if capture.project_name.is_none() {
+            capture.project_name = found.project_name;
+        }
+        found.source
+    } else {
+        req.source
+    };
+    let source = source.trim();
+    if !valid_source_id(source) || !source.starts_with("chatgpt-web") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let result = ingest_live_capture(&state.db, source, &capture)
+        .await
+        .map_err(|error| {
+            log::warn!("Live capture rejected: {error}");
+            StatusCode::BAD_REQUEST
+        })?;
+    Ok(Json(result))
 }
 
 async fn ingest(

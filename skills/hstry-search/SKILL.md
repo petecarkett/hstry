@@ -28,12 +28,28 @@ Start with one query, inspect the best few hits, then narrow using identifiers
 found in those hits. Reformulate or widen scope if needed; do not repeatedly rerun
 the same query. Missing results never prove something did not happen.
 
+### Project-scoped ChatGPT semantic evidence (Mac installation)
+
+When the existing local hstry-context command is available, use it for meaning-based
+search over the original message text, including portions beyond the searchable
+content projection:
+
+    hstry-context takeover CHATGPT_CONVERSATION_URL --tail 8 --limit 6
+    hstry-context search "the question" --project EXACT_G_P_ID --by-chat --limit 8
+
+A project ID must come from the source URL or verified archived metadata, never
+from a similar topic or title. A missing chat is not proof it never existed.
+The local archive is source evidence, not a live browser or release-authority
+substitute. Do not surface hidden thinking-only parts. Results include exact
+conversation IDs and message positions to follow with a bounded native read.
+
 ## Read evidence progressively
 
 ```sh
 hstry read CONVERSATION --message-idx INDEX --before 2 --after 2 --json
 hstry read CONVERSATION --message-id UUID --expand-interactions --json
 hstry read CONVERSATION --message-idx INDEX --field content --offset-chars POSITION --json
+hstry read CONVERSATION --message-idx INDEX --field parts/0/text --offset-chars POSITION --json
 hstry read CONVERSATION --remote MACHINE --json
 ```
 
@@ -41,7 +57,10 @@ Preserve the originating machine when reading remote hits. Bounded reads execute
 on that machine; incompatible peers fail rather than returning an unlimited body.
 
 The response has result.records, ordered anchor-first when an anchor is supplied.
-Each record identifies a message and one field (content or parts/N/input/output).
+Each record identifies a message and one field (content, visible parts/N/text,
+or tool parts/N/input/output). The content field is deliberately shortened
+for some long messages; follow a visible parts/N/text field to recover the
+original source text without a full unbudgeted transcript.
 A truncated field reports next_offset_chars: continue using the same message,
 field, and --offset-chars. result.next_offset instead advances field-record pages
 with --offset. These are different cursors: paging to the next record does not

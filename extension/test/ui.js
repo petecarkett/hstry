@@ -1,4 +1,4 @@
-import { DEFAULT_PROVIDER_SETTINGS, friendlyError, formatTime, normalizeSettings, progressDetail, providerState } from '../ui.js';
+import { DEFAULT_PROVIDER_SETTINGS, badgeState, friendlyError, formatTime, normalizeSettings, progressDetail, providerState } from '../ui.js';
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -10,9 +10,6 @@ function check(label, actual, expected) {
 const now = Date.parse('2026-07-10T12:00:00Z');
 check('new providers are opt-in', DEFAULT_PROVIDER_SETTINGS, {
   chatgpt: true,
-  claude: true,
-  gemini: false,
-  perplexity: false,
 });
 check('never synced time', formatTime(null, now), 'Never');
 check('relative sync time', formatTime(now - 17 * 60_000, now), '17m ago');
@@ -44,6 +41,19 @@ check('queued provider explains continuation', providerState({
   label: 'Continuing',
   detail: '219 detected · 10 processed · next batch queued',
 });
+check('rate-limit cooldown shows a real wait instead of claiming active progress',
+  providerState({ continuationPending: true, lastDeferredHttpStatus: 429,
+    nextAllowedAtMs: Date.now() + 10 * 60_000,
+    progress: { detected: 12, processed: 8 } }, true).label, 'Rate limit cooldown');
+check('no server header is reported as unknown', providerState({
+  continuationPending: true, lastDeferredHttpStatus: 429,
+  nextAllowedAtMs: Date.now() + 15 * 60_000, state: {},
+}, true).detail.includes('server Retry-After unavailable'), true);
+check('server header time is distinguished from client schedule', providerState({
+  continuationPending: true, lastDeferredHttpStatus: 429,
+  nextAllowedAtMs: Date.now() + 15 * 60_000,
+  state: { serverRetryAfterUntilMs: Date.now() + 2 * 60_000 },
+}, true).detail.includes('server retry hint'), true);
 check('progress detail omits empty counters', progressDetail({ detected: 4, processed: 1 }), '4 detected · 1 processed');
 check('visible settings normalize before sync', normalizeSettings({
   port: '3434',
@@ -54,7 +64,7 @@ check('visible settings normalize before sync', normalizeSettings({
   port: 3434,
   token: 'hello',
   intervalMinutes: 15,
-  providers: { chatgpt: true, claude: true, gemini: false, perplexity: false },
+  providers: { chatgpt: true },
 });
 check('invalid port cannot escape form constraints', normalizeSettings({
   port: '70000',
@@ -65,7 +75,23 @@ check('invalid port cannot escape form constraints', normalizeSettings({
   port: 41770,
   token: '',
   intervalMinutes: 15,
-  providers: { chatgpt: false, claude: false, gemini: false, perplexity: false },
+  providers: { chatgpt: false },
 });
+
+check('queued retry shows progress rather than a stale red badge',
+  badgeState({ chatgpt: { continuationPending: true, lastError: 'Earlier request failed' } }),
+  '…');
+check('interrupted pending continuation shows progress',
+  badgeState({ chatgpt: { running: false, progress: { phase: 'queued' } } }),
+  '…');
+check('genuine terminal error retains red indicator',
+  badgeState({ chatgpt: { lastError: 'Authentication rejected', running: false } }),
+  '!');
+check('disabled provider cannot keep stale error indicator',
+  badgeState({ chatgpt: { lastError: 'Authentication rejected' } }, { chatgpt: false }),
+  '');
+check('successful finished provider clears badge',
+  badgeState({ chatgpt: { progress: { phase: 'complete' }, lastError: null } }),
+  '');
 
 process.exit(failures ? 1 : 0);

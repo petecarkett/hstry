@@ -1,0 +1,223 @@
+// Browser-only continuation UI. It never calls ChatGPT history endpoints.
+(() => {
+  if (window !== window.top || typeof chrome === 'undefined' || !chrome.runtime?.id) return;
+  // A page can outlive an extension reload. Old booleans must not block
+  // the new version from replacing an orphaned click handler.
+  const version = chrome.runtime.getManifest().version;
+  if (window.__hstryOneclickInstalled === version) return;
+  window.__hstryOneclickInstalled = version;
+  // A prior extension instance can leave an orphaned DOM button behind.
+  // Replace it so its invalidated click handler can no longer be invoked.
+  document.getElementById('hstry-continue-chat')?.remove();
+
+  const RETRY_KEY = 'hstry.takeover.retryAfterReload';
+  const RETRY_TTL_MS = 60_000;
+  let retryOnce = false;
+  let resumePending = false;
+  try {
+    const saved = sessionStorage.getItem(RETRY_KEY);
+    sessionStorage.removeItem(RETRY_KEY);
+    if (saved) {
+      const retry = JSON.parse(saved);
+      if (retry?.path === location.pathname &&
+          Number.isFinite(retry.at) && Date.now() - retry.at < RETRY_TTL_MS &&
+          Date.now() >= retry.at) {
+        resumePending = true;
+        retryOnce = true;
+      }
+    }
+  } catch { /* Session storage is optional; normal clicks still work. */ }
+
+  const WARNING = /you(?:'|\u2019)ve\s+reached\s+the\s+maximum\s+length\s+for\s+this\s+conversation/i;
+  const WAIT_MS = 45_000;
+  let started = false;
+  let detectionTimer;
+  let handoffStarted = false;
+  let checkingHandoff = false;
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  const send = msg => new Promise((resolve, reject) => {
+    try {
+      chrome.runtime.sendMessage(msg, response => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message));
+        else resolve(response);
+      });
+    } catch (err) { reject(err); }
+  });
+
+  async function startTakeover(btn) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = 'Opening continuation...';
+    try {
+      const result = await send({ type: 'HSTRY_TAKEOVER_START' });
+      if (!result?.ok) throw new Error(result?.error || 'Unable to open the new chat');
+      btn.textContent = 'Opened continuation tab';
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'Continue with HSTRY';
+      const message = String(err?.message || err);
+      btn.title = message;
+      if (!retryOnce &&
+          (/extension context invalidated/i.test(message) || !chrome.runtime?.id)) {
+        // One reload restores a current extension context. A tab-local marker
+        // resumes this user-initiated action exactly once after navigation.
+        try {
+          sessionStorage.setItem(RETRY_KEY,
+            JSON.stringify({ path: location.pathname, at: Date.now() }));
+          location.reload();
+          return;
+        } catch { /* Do not reload if the marker could not be stored. */ }
+      }
+      fallbackBanner(/extension context invalidated/i.test(message)
+        ? 'HSTRY was updated but the extension is still unavailable. Refresh this chat and try again.'
+        : 'HSTRY takeover: ' + message);
+    }
+  }
+
+  function detectLimit() {
+    if (document.getElementById('hstry-continue-chat')) return;
+    if (!/\/c\/[0-9a-f-]{36}/i.test(location.pathname)) return;
+    if (!WARNING.test(document.body?.textContent || '')) return;
+    const native = [...document.querySelectorAll('button, a')].find(node =>
+      /start new chat/i.test(node.textContent || ''));
+    if (!native) return;
+    let panel = native.parentElement;
+    for (let i = 0; i < 5 && panel && !WARNING.test(panel.textContent || ''); i++) {
+      panel = panel.parentElement;
+    }
+    if (!panel || (panel.textContent || '').length > 1500) return;
+    const btn = document.createElement('button');
+    btn.id = 'hstry-continue-chat';
+    btn.type = 'button';
+    btn.textContent = 'Continue with HSTRY';
+    btn.title = 'Open a new chat and resume from your HSTRY archive';
+    btn.style.cssText = 'margin:8px 8px 8px 0;padding:9px 16px;border-radius:24px;'+
+      'border:1px solid #7d9e88;background:#305e46;color:#fff;cursor:pointer;'+
+      'font:inherit;font-size:14px;';
+    btn.addEventListener('click', event => {
+      event.preventDefault();
+      void startTakeover(btn);
+    });
+    native.insertAdjacentElement('afterend', btn);
+    if (resumePending) {
+      resumePending = false;
+      void startTakeover(btn);
+    }
+  }
+
+  function editableElement() {
+    const matches = document.querySelectorAll(
+      '#prompt-textarea, [data-testid="prompt-textarea"], '+
+      '[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], '+
+      '[contenteditable="true"][data-placeholder]');
+    return [...matches].find(el => el.getBoundingClientRect().width > 0 &&
+      el.getBoundingClientRect().height > 0 && !el.hasAttribute('disabled')) || null;
+  }
+
+  function enterPrompt(el, prompt) {
+    el.focus();
+    if (el instanceof HTMLTextAreaElement) {
+      const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+      setValue.call(el, prompt);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    } else {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      // React/ProseMirror editors listen for native insertion/input events.
+      if (!document.execCommand('insertText', false, prompt)) {
+        el.textContent = prompt;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
+      }
+    }
+    return (el.value || el.textContent || '').includes(prompt.slice(0, 32));
+  }
+
+  function sendButton() {
+    const candidates = document.querySelectorAll(
+      'button[data-testid="send-button"], button[aria-label="Send prompt"], '+
+      'button[aria-label="Send message"], button[aria-label="Send"]');
+    return [...candidates].find(b => !b.disabled && b.getBoundingClientRect().width > 0) || null;
+  }
+
+  function fallbackBanner(text) {
+    if (document.getElementById('hstry-takeover-feedback')) return;
+    const b = document.createElement('div');
+    b.id = 'hstry-takeover-feedback';
+    b.setAttribute('role', 'status');
+    b.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:999999;'+
+      'max-width:340px;padding:14px;background:#274735;color:#fff;'+
+      'border-radius:12px;box-shadow:0 4px 20px #0004;font:14px sans-serif';
+    b.textContent = text;
+    document.body.append(b);
+  }
+
+  async function takeOverIfPending() {
+    if (handoffStarted || checkingHandoff) return;
+    checkingHandoff = true;
+    let result;
+    try { result = await send({ type:'HSTRY_TAKEOVER_POLL' }); }
+    catch { checkingHandoff = false; return; }
+    checkingHandoff = false;
+    if (!result?.ok || !result.found || handoffStarted) return;
+    handoffStarted = true;
+    const prompt = result.prompt;
+    const startedAt = Date.now();
+    try {
+      let editor;
+      while (Date.now() - startedAt < WAIT_MS) {
+        editor = editableElement();
+        if (editor) break;
+        await pause(600);
+      }
+      if (!editor) throw new Error('ChatGPT composer did not load');
+      if (!enterPrompt(editor, prompt)) throw new Error('ChatGPT did not accept the takeover text');
+      // Wait for ChatGPT to enable its native send control.
+      let button;
+      for (let i = 0; i < 20; i++) {
+        button = sendButton();
+        if (button) break;
+        await pause(250);
+      }
+      if (!button) throw new Error('Takeover text is ready; send it manually');
+      button.click();
+      await send({ type:'HSTRY_TAKEOVER_DONE' });
+    } catch (e) {
+      fallbackBanner('HSTRY takeover: ' + String(e.message || e) +
+        '. If the instruction is in the composer, press Send. Otherwise retry from the original chat.');
+    }
+  }
+
+  chrome.runtime.onMessage.addListener(msg => {
+    if (msg?.type === 'HSTRY_TAKEOVER_WAKE') takeOverIfPending();
+  });
+
+  // Existing chat tabs do not poll. Only a new-chat landing page can be a
+  // handoff destination; this does not create remote network traffic.
+  if (location.pathname === '/' || /^\/g\/g-p-[0-9a-f]{32}(?:-[a-z0-9-]+)?(?:\/project)?\/?$/i.test(location.pathname)) {
+    let retries = 0;
+    const poll = setInterval(() => {
+      if (handoffStarted || ++retries > 30) return clearInterval(poll);
+      takeOverIfPending();
+    }, 800);
+    takeOverIfPending();
+  }
+
+  let observer;
+  function scheduleWarningCheck() {
+    clearTimeout(detectionTimer);
+    detectionTimer = setTimeout(() => {
+      detectLimit();
+      if (document.getElementById('hstry-continue-chat')) observer?.disconnect();
+    }, 700);
+  }
+  if (document.body) {
+    observer = new MutationObserver(scheduleWarningCheck);
+    observer.observe(document.body, { childList: true, subtree: true });
+    scheduleWarningCheck();
+  }
+})();

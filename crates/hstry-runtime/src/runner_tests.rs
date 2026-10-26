@@ -50,6 +50,9 @@ mod runtime_tests {
         assert!(args.contains(&"run"));
         assert!(args.contains(&"--allow-read"));
         assert!(args.contains(&"--allow-env"));
+        // Deno 2.9+ requires explicit OS homedir permission for Node os.homedir().
+        assert!(args.contains(&"--allow-sys=homedir"));
+        assert!(!args.contains(&"--allow-sys"));
     }
 
     #[test]

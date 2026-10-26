@@ -184,6 +184,8 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("SKILL.md"))?, "local edit");
         assert_eq!(update(&dir, false, true)?.state, "current");
         assert!(CONTENT.contains("next_offset_chars"));
+        assert!(CONTENT.contains("parts/N/text"));
+        assert!(CONTENT.contains("hstry-context takeover"));
         Ok(())
     }
 }

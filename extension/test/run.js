@@ -5,13 +5,16 @@
 // a real database. Usage:
 //
 //   hstry-api --config <tmp>/config.toml --port 39132 --token testtoken &
-//   bun extension/test/run.js 39132 testtoken
+//   node extension/test/run.js 39132 testtoken <tmp>/config.toml
 
+import { execFileSync } from 'node:child_process';
 import { syncChatGPT } from '../providers/chatgpt.js';
 import { syncClaude } from '../providers/claude.js';
 
 const PORT = process.argv[2] ?? '39132';
 const TOKEN = process.argv[3] ?? 'testtoken';
+const CONFIG_PATH = process.argv[4];
+if (!CONFIG_PATH) throw new Error('Pass the isolated test database config path.');
 
 const NOW_S = Date.now() / 1000;
 const NOW_ISO = new Date().toISOString();
@@ -24,6 +27,7 @@ const OLD_ISO = new Date((NOW_S - 3600) * 1000).toISOString();
 const FIXTURES = {
   'chatgpt.com': {
     '/api/auth/session': { accessToken: 'fixture-token' },
+    '/backend-api/gizmos/snorlax/sidebar': { items: [], cursor: null },
     '/backend-api/accounts/check/v4-2023-04-27': {
       accounts: {
         default: {
@@ -135,11 +139,20 @@ function check(label, actual, expected) {
   if (!ok) failures++;
 }
 
-// --- First run: full sync ---
-const gpt1 = await syncChatGPT({ state: {}, push, log });
+// --- First sync: bounded Chrome worker chunks, preserving the same cursor ---
+let gpt1State = {};
+let chatgptCount = 0;
+let gpt1;
+for (let i = 0; i < 8; i++) {
+  gpt1 = await syncChatGPT({ state: gpt1State, push, log });
+  gpt1State = gpt1.state;
+  chatgptCount += gpt1.conversations;
+  if (!gpt1.hasMore) break;
+}
+check('chatgpt complete sync', gpt1.hasMore, false);
 const claude1 = await syncClaude({ state: {}, push, log });
 
-check('chatgpt run 1 conversations', gpt1.conversations, 2); // personal + workspace account
+check('chatgpt run 1 conversations', chatgptCount, 2); // personal + workspace account
 check('claude run 1 conversations', claude1.conversations, 1);
 check(
   'source ids',
@@ -155,14 +168,16 @@ check('chatgpt run 2 conversations (incremental)', gpt2.conversations, 0);
 check('claude run 2 conversations (incremental)', claude2.conversations, 0);
 check('run 2 pushes', pushes.length, 0);
 
-// --- Verify what landed in hstry via the search API ---
-const hits = await (
-  await realFetch(`http://127.0.0.1:${PORT}/search?query=fixture&limit=10`)
-).json();
-const sources = [...new Set(hits.map(h => h.source_id))].sort();
+// The current hstry-api exposes ingestion, not HTTP /search. Validate the
+// exact isolated database through hstry's maintained read interface.
+const search = JSON.parse(execFileSync('hstry', [
+  '--config', CONFIG_PATH, '--json', 'search', 'fixture', '--limit', '10',
+], { encoding: 'utf8' }));
+const hits = search.result?.hits ?? [];
+const sources = [...new Set(hits.map(h => h.provenance?.source))].sort();
 check('search finds all sources', sources, ['chatgpt-web', 'chatgpt-web-accteam1', 'claude-web']);
-const gptHit = hits.find(h => h.source_id === 'chatgpt-web' && h.role === 'assistant');
-check('gpt assistant content', gptHit?.content, 'fixture response');
+const gptHit = hits.find(h => h.provenance?.source === 'chatgpt-web' && h.role === 'assistant');
+check('gpt assistant content', gptHit?.snippet, 'fixture response');
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) FAILED.`);
 process.exit(failures === 0 ? 0 : 1);

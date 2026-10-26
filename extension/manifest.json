@@ -1,18 +1,17 @@
 {
   "manifest_version": 3,
   "name": "hstry sync",
-  "version": "0.4.0",
-  "description": "Background-syncs web conversations from ChatGPT, Claude, Gemini, Perplexity, and M365 Copilot Chat into a local hstry database.",
-  "permissions": ["alarms", "storage"],
+  "version": "0.4.23",
+  "description": "Capture ChatGPT personal and project conversations into the private local hstry archive.",
+  "permissions": [
+    "alarms",
+    "storage",
+    "scripting",
+    "unlimitedStorage"
+  ],
   "host_permissions": [
     "https://chatgpt.com/*",
-    "https://chat.openai.com/*",
-    "https://claude.ai/*",
-    "https://gemini.google.com/*",
-    "https://www.perplexity.ai/*",
-    "https://m365.cloud.microsoft/*",
-    "http://127.0.0.1/*",
-    "http://localhost/*"
+    "http://127.0.0.1/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -22,5 +21,26 @@
   "action": {
     "default_title": "hstry sync",
     "default_popup": "popup.html"
-  }
+  },
+  "version_name": "0.4.23 HSTRY stale-tab reinjection repair",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "live-content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "handoff-content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
 }

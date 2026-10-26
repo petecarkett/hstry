@@ -2,6 +2,22 @@ import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS } from './providers/index.js';
 
 export { DEFAULT_PROVIDER_SETTINGS, PROVIDERS };
 
+
+export function badgeState(status = {}, enabledProviders = DEFAULT_PROVIDER_SETTINGS) {
+  let running = false;
+  let failed = false;
+  for (const [name, enabled] of Object.entries(enabledProviders)) {
+    if (!enabled) continue;
+    const entry = status[name];
+    if (entry?.running || entry?.continuationPending || entry?.progress?.phase === 'queued') {
+      running = true;
+    } else if (entry?.lastError) {
+      failed = true;
+    }
+  }
+  return failed ? '!' : running ? '…' : '';
+}
+
 export function normalizeSettings(values, defaults) {
   const port = Number(values.port);
   const intervalMinutes = Number(values.intervalMinutes);
@@ -45,6 +61,19 @@ export function providerState(entry, enabled = true, { apiConnected = false } = 
     };
   }
   if (entry?.continuationPending || entry?.progress?.phase === 'queued') {
+    const waitMinutes = Math.ceil(((entry.nextAllowedAtMs ?? 0) - Date.now()) / 60_000);
+    if (waitMinutes > 1) {
+      const serverUntil = entry.state?.serverRetryAfterUntilMs;
+      const serverHint = entry.lastDeferredHttpStatus === 429
+        ? serverUntil == null ? 'server Retry-After unavailable'
+          : `server retry hint ${new Date(serverUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+        : null;
+      return {
+        tone: 'syncing',
+        label: entry.lastDeferredHttpStatus === 429 ? 'Rate limit cooldown' : 'Waiting',
+        detail: `${progressDetail(entry.progress ?? {})} · ${serverHint ? `${serverHint} · ` : ''}next attempt in ${waitMinutes}m`,
+      };
+    }
     return {
       tone: 'syncing',
       label: 'Continuing',
@@ -90,6 +119,7 @@ export function progressDetail(progress) {
   const parts = [`${detected} detected`, `${processed} processed`];
   if ((progress.created ?? 0) > 0) parts.push(`${progress.created} new`);
   if ((progress.updated ?? 0) > 0) parts.push(`${progress.updated} updated`);
+  if ((progress.failed ?? 0) > 0) parts.push(`${progress.failed} failed`);
   return parts.join(' · ');
 }
 

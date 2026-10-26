@@ -6,7 +6,7 @@ use clap::{Args, Parser};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
     transport::io::stdio,
 };
@@ -36,10 +36,14 @@ async fn try_main() -> Result<()> {
     let server = McpServer::new(config, db);
     let transport = stdio();
 
-    server
+    let running = server
         .serve(transport)
         .await
         .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
+    running
+        .waiting()
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP service error: {e}"))?;
 
     Ok(())
 }
@@ -85,8 +89,45 @@ struct SearchRequest {
     raw: Option<bool>,
 }
 
+// Resolve ChatGPT links locally; do not fetch the conversation from ChatGPT.
+fn normalize_conversation_reference(input: &str) -> anyhow::Result<(String, Option<String>)> {
+    let input = input.trim();
+    anyhow::ensure!(
+        !input.is_empty() && input.len() <= 1024,
+        "Invalid conversation reference"
+    );
+    let path = if let Some(path) = input.strip_prefix("https://chatgpt.com/") {
+        path
+    } else if let Some(path) = input.strip_prefix("https://chat.openai.com/") {
+        path
+    } else {
+        anyhow::ensure!(
+            !input.contains("://"),
+            "Only ChatGPT conversation URLs are supported"
+        );
+        return Ok((input.to_owned(), None));
+    };
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        ["c", id] if !id.is_empty() && id.len() <= 128 => Ok(((*id).into(), None)),
+        ["g", slug, "c", id] if !id.is_empty() && id.len() <= 128 => {
+            let prefix = slug.get(..36);
+            let valid = prefix.is_some_and(|p| {
+                p.starts_with("g-p-")
+                    && p.as_bytes()[4..].iter().all(u8::is_ascii_hexdigit)
+                    && (slug.len() == 36 || slug.as_bytes().get(36) == Some(&b'-'))
+            });
+            anyhow::ensure!(valid, "Invalid ChatGPT project URL");
+            Ok(((*id).into(), prefix.map(str::to_owned)))
+        }
+        _ => anyhow::bail!("Invalid ChatGPT conversation URL"),
+    }
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ExpandRequest {
+    /// HSTRY ID, ChatGPT conversation ID, readable ID, or ChatGPT conversation URL.
     conversation_id: String,
     message_idx: Option<i32>,
     message_id: Option<String>,
@@ -124,7 +165,7 @@ impl McpServer {
 #[tool_router]
 impl McpServer {
     #[tool(
-        description = "Find relevant evidence across all message roles. Default 3000-char envelope with snippets, message anchors, attempted modes and snapshot completeness. Exact is literal; auto/needle report regex/FTS fallback. Use expand for a matching passage."
+        description = "Search locally indexed HSTRY message text. For a known ChatGPT conversation ID or full conversation URL, call expand directly; no ChatGPT network lookup or text search is needed. Default 3000-char envelope with snippets, message anchors, attempted modes and snapshot completeness."
     )]
     async fn search(&self, Parameters(req): Parameters<SearchRequest>) -> String {
         let result: anyhow::Result<serde_json::Value> = async {
@@ -193,7 +234,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Read evidence with a serialized budget locally or on a named remote. Pass message_idx or message_id for anchor-first context, or omit for chronological pages. Each record has a field and next_offset_chars: continue that field with offset and field. next_offset advances field-record pages via page_offset. Pass version during pagination to detect changes. expand_interactions includes only directly linked tool calls/results."
+        description = "Read a conversation from the HSTRY archive only, using its internal ID, original ChatGPT conversation ID, or complete ChatGPT project/conversation URL. No ChatGPT network lookup is performed. Pass message_idx or message_id for anchor-first context, or omit for chronological pages. Continue truncated fields with offset and field; advance records with page_offset. Pass version during pagination to detect changes."
     )]
     async fn expand(&self, Parameters(req): Parameters<ExpandRequest>) -> String {
         let result: anyhow::Result<serde_json::Value> = async {
@@ -211,6 +252,7 @@ impl McpServer {
                 version: req.version,
                 machine: None,
             };
+            let (reference, workspace) = normalize_conversation_reference(&req.conversation_id)?;
             let page = if let Some(name) = &req.remote {
                 let peer = self
                     .config
@@ -218,11 +260,22 @@ impl McpServer {
                     .iter()
                     .find(|r| r.name == *name && r.enabled)
                     .ok_or_else(|| anyhow::anyhow!("Unknown remote"))?;
-                hstry_core::remote::read_remote(peer, &req.conversation_id, &options).await?
+                hstry_core::remote::read_remote(peer, &reference, &options).await?
             } else {
-                self.db
-                    .read_page(req.conversation_id.parse()?, options)
+                let conversation = self
+                    .db
+                    .get_conversation_by_reference(
+                        None,
+                        Some(&reference),
+                        Some(&reference),
+                        Some(&reference),
+                        workspace.as_deref(),
+                    )
                     .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Conversation not indexed in local HSTRY archive")
+                    })?;
+                self.db.read_page(conversation.id, options).await?
             };
             Ok(serde_json::json!({"ok":true,"result":page}))
         }
@@ -251,7 +304,9 @@ impl McpServer {
     }
 
     /// Get service configuration
-    #[tool(description = "Returns the service configuration (enabled and poll interval)")]
+    #[tool(
+        description = "Returns only the native HSTRY service scheduler configuration. service.enabled=false does not disable the separate Chrome history-sync extension, its alarms, or the HSTRY ingestion API. Verify Chrome extension status independently."
+    )]
     async fn get_runtime_config(&self) -> String {
         tokio::task::yield_now().await;
         serde_json::to_string_pretty(&self.config.service).unwrap_or_else(|_| "{}".to_string())
@@ -260,11 +315,8 @@ impl McpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some("MCP server for hstry - Universal AI chat history".to_string()),
-            ..Default::default()
-        }
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("MCP server for hstry - Universal AI chat history")
     }
 }

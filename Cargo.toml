@@ -75,7 +75,7 @@ log = "0.4"
 env_logger = "0.11"
 
 # MCP
-rmcp = { version = "0.14", features = ["server", "transport-io"] }
+rmcp = { version = "3.7", features = ["server", "transport-io"] }
 
 # Internal crates
 hstry-core = { path = "crates/hstry-core" }
