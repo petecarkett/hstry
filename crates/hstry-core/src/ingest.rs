@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(unassigned.metadata["owner"], "preserve-me");
 
         db.close().await;
-        std::fs::remove_file(path)?;
+        remove_db_files(&path);
         Ok(())
     }
 
