@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use clap::{Args, Parser};
 use log::info;
 use serde::{Deserialize, Serialize};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use hstry_core::db::{SearchMode, SearchOptions};
@@ -28,6 +28,97 @@ mod search_tests;
 
 /// Ingest payloads carry full conversation histories; allow generous bodies.
 const INGEST_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Only extension-to-local-API write requests may use cross-origin CORS.
+/// The web UI is same-origin and needs no CORS access to private reads.
+fn cors_origin_allowed(origin: &HeaderValue, request: &axum::http::request::Parts) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    if !(origin.starts_with("chrome-extension://") || origin.starts_with("moz-extension://")) {
+        return false;
+    }
+    // The extension's harmless liveness probe also needs CORS access.
+    if request.uri.path() == "/health" && request.method == Method::GET {
+        return true;
+    }
+    if !matches!(request.uri.path(), "/ingest" | "/ingest/live" | "/sources") {
+        return false;
+    }
+    if request.method == Method::OPTIONS {
+        return request
+            .headers
+            .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+            .and_then(|value| value.to_str().ok())
+            == Some("POST");
+    }
+    request.method == Method::POST
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+
+    fn allows(method: Method, path: &str, origin: &str, requested_method: Option<&str>) -> bool {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::ORIGIN, origin);
+        if let Some(method) = requested_method {
+            request = request.header(header::ACCESS_CONTROL_REQUEST_METHOD, method);
+        }
+        let (parts, _) = request.body(()).expect("fixture request").into_parts();
+        cors_origin_allowed(
+            &HeaderValue::from_str(origin).expect("fixture origin"),
+            &parts,
+        )
+    }
+
+    #[test]
+    fn private_reads_never_allow_cross_origin_browser_access() {
+        let ext = "chrome-extension://abfldilemjfiapglikbncpecpibiekbd";
+        for path in [
+            "/sessions",
+            "/sessions/a",
+            "/sources",
+            "/search",
+            "/ui",
+            "/config",
+        ] {
+            assert!(!allows(Method::GET, path, ext, None), "private GET {path}");
+            assert!(!allows(
+                Method::GET,
+                path,
+                "https://malicious.invalid",
+                None
+            ));
+        }
+        assert!(!allows(Method::POST, "/read", ext, None));
+        assert!(allows(Method::GET, "/health", ext, None));
+        assert!(!allows(
+            Method::GET,
+            "/health",
+            "https://malicious.invalid",
+            None
+        ));
+    }
+
+    #[test]
+    fn only_extension_writes_allow_browser_cors() {
+        let ext = "chrome-extension://abfldilemjfiapglikbncpecpibiekbd";
+        for path in ["/ingest", "/ingest/live", "/sources"] {
+            assert!(allows(Method::POST, path, ext, None));
+            assert!(allows(Method::OPTIONS, path, ext, Some("POST")));
+            assert!(!allows(
+                Method::POST,
+                path,
+                "https://malicious.invalid",
+                None
+            ));
+            assert!(!allows(Method::OPTIONS, path, ext, Some("GET")));
+        }
+    }
+}
 
 fn main() {
     if let Err(err) = try_main() {
@@ -76,10 +167,13 @@ async fn try_main() -> Result<()> {
         ingest_token: Arc::new(ingest_token),
     };
 
+    // Cross-origin browser access is needed only for the extension's
+    // token-protected write endpoints. Never publish the unauthenticated
+    // session / search / configuration reads to arbitrary website origins.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::predicate(cors_origin_allowed))
+        .allow_methods([Method::POST])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
     let app = Router::new()
         .route("/", get(root))
