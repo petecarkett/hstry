@@ -22,6 +22,7 @@ use hstry_core::models::Source;
 use hstry_core::parsed::ParsedConversation;
 use hstry_core::{Config, Database};
 
+mod browse;
 #[cfg(test)]
 mod search_tests;
 
@@ -83,7 +84,14 @@ async fn try_main() -> Result<()> {
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
-        .route("/sources", post(register_source))
+        .route("/config", get(get_config))
+        .route("/search", get(search))
+        .route("/read", post(read_evidence))
+        .route("/sources", get(browse::sources).post(register_source))
+        .route("/sessions", get(browse::sessions))
+        .route("/sessions/{id}", get(browse::session))
+        .route("/agents", get(browse::agents))
+        .route("/ui", get(browse::ui))
         .route(
             "/ingest",
             post(ingest).layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT)),
@@ -139,7 +147,7 @@ struct CommonOpts {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     config: Arc<Config>,
     db: Arc<Database>,
     ingest_token: Arc<Option<String>>,

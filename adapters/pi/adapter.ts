@@ -23,7 +23,6 @@ import type {
   ToolCall,
   ExportOptions,
   ExportResult,
-  ExportFile,
 } from '../types/index.ts';
 import {
   runAdapter,
@@ -34,6 +33,10 @@ import {
   textOnlyParts,
   isUnderCanonicalRoot,
 } from '../types/index.ts';
+
+import {exportNativePi, validateNativePiSession, type FidelityReport} from './native.ts';
+import {exportDurableConversation} from '../pi-durable/export.ts';
+import {exportGenericPi} from './generic.ts';
 
 const DEFAULT_PI_PATH = join(homedir(), '.pi', 'agent', 'sessions');
 
@@ -76,6 +79,9 @@ interface CompactionEntry extends SessionEntryBase {
   tokensBefore: number;
   details?: unknown;
   fromHook?: boolean;
+  /** Usage from generating the summary; included in session totals. */
+  usage?: PiUsage;
+  systemMessage?: PiMessage;
 }
 
 // Branch summary entry (created when forking a session)
@@ -84,6 +90,7 @@ interface BranchSummaryEntry extends SessionEntryBase {
   fromId: string;
   summary: string;
   details?: unknown;
+  usage?: PiUsage;
 }
 
 // Thinking level change entry
@@ -105,6 +112,24 @@ interface LabelEntry extends SessionEntryBase {
   label: string | undefined;
 }
 
+/** Model-attributed usage that is not an assistant message (e.g. cache warming). */
+interface UsageEntry extends SessionEntryBase {
+  type: 'usage';
+  kind?: string;
+  provider?: string;
+  model?: string;
+  usage?: PiUsage;
+}
+
+/** Extension-provided message that participates in LLM context. */
+interface CustomMessageEntry extends SessionEntryBase {
+  type: 'custom_message';
+  customType?: string;
+  content?: PiContentBlock[] | string;
+  display?: boolean;
+  attribution?: string;
+}
+
 type SessionEntry = 
   | SessionHeader 
   | MessageEntry 
@@ -114,13 +139,19 @@ type SessionEntry =
   | ThinkingLevelChangeEntry 
   | SessionInfoEntry 
   | LabelEntry
+  | UsageEntry
+  | CustomMessageEntry
   | SessionEntryBase;
 
 // Pi message types
 interface PiMessage {
-  role: 'user' | 'assistant' | 'toolResult' | 'custom';
-  content?: PiContentBlock[];
+  role: 'user' | 'assistant' | 'toolResult' | 'custom' | 'system';
+  content?: PiContentBlock[] | string;
   timestamp?: number;
+  /** System messages carry the prompt sections and tool loadout; later messages patch by name. */
+  sections?: Record<string, string | null>;
+  toolsAdded?: { name?: string }[];
+  toolsRemoved?: { name?: string }[];
   // Assistant-specific fields
   api?: string;
   provider?: string;
@@ -137,10 +168,15 @@ interface PiContentBlock {
   type: string;
   text?: string;
   thinking?: string;
-  // Tool call fields
+  // Tool call fields (native camelCase `toolCall`, plus imported `tool_use`)
   id?: string;
   name?: string;
   arguments?: Record<string, unknown>;
+  input?: Record<string, unknown>;
+  // Imported Anthropic-style tool result blocks
+  tool_use_id?: string;
+  is_error?: boolean;
+  content?: string | PiContentBlock[];
   // Image fields
   data?: string;
   mimeType?: string;
@@ -259,13 +295,31 @@ const adapter: Adapter = {
       throw new Error(`Unsupported export format: ${opts.format}`);
     }
 
-    const files = buildPiFiles(conversations, opts);
+    const reports: FidelityReport[] = [];
+    const files = conversations.flatMap(conversation => {
+      if (conversation.metadata?.nativeConversation && conversation.metadata?.storeId) {
+        const exported = exportDurableConversation(conversation);
+        reports.push(exported.report);
+        return exported.files;
+      }
+      const native = conversation.metadata?.nativePiSession;
+      if (native) {
+        const exported = exportNativePi(conversation, validateNativePiSession(native));
+        reports.push(exported.report);
+        return exported.files;
+      }
+      const exported = exportGenericPi(conversation, opts);
+      reports.push(exported.report);
+      return exported.files;
+    });
     return {
       format: 'pi',
       files,
       mimeType: 'application/x-ndjson',
       metadata: {
-        root: 'sessions/',
+        root: 'detached/',
+        disposition: 'detached-continuation',
+        fidelityReports: reports,
       },
     };
   },
@@ -302,137 +356,6 @@ function conversationsToMarkdown(conversations: Conversation[]): string {
   return blocks.join('\n').trim() + '\n';
 }
 
-function buildPiFiles(conversations: Conversation[], opts: ExportOptions): ExportFile[] {
-  const files: ExportFile[] = [];
-
-  for (const conv of conversations) {
-    const sessionId = conv.externalId ?? randomId('ses_');
-    const workspace = conv.workspace ?? process.cwd();
-    const safePath = `--${workspace.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
-    const timestamp = new Date(conv.createdAt).toISOString().replace(/[:.]/g, '-');
-    const filename = `${timestamp}_${sessionId}.jsonl`;
-    const filePath = `sessions/${safePath}/${filename}`;
-
-    const lines: string[] = [];
-
-    // Session header
-    const header: SessionHeader = {
-      type: 'session',
-      version: 3,
-      id: sessionId,
-      timestamp: new Date(conv.createdAt).toISOString(),
-      cwd: workspace,
-    };
-    lines.push(JSON.stringify(header));
-
-    // Model change entry (if we have model info)
-    let lastEntryId: string | null = null;
-    if (conv.model) {
-      const modelEntry = {
-        type: 'model_change',
-        id: randomId(''),
-        parentId: lastEntryId,
-        timestamp: new Date(conv.createdAt).toISOString(),
-        provider: conv.provider ?? deriveProvider(conv.model),
-        modelId: conv.model,
-      };
-      lines.push(JSON.stringify(modelEntry));
-      lastEntryId = modelEntry.id;
-    }
-
-    // Session name (if title exists and isn't derived from first message)
-    if (conv.title) {
-      const infoEntry: SessionInfoEntry = {
-        type: 'session_info',
-        id: randomId(''),
-        parentId: lastEntryId,
-        timestamp: new Date(conv.createdAt).toISOString(),
-        name: conv.title,
-      };
-      lines.push(JSON.stringify(infoEntry));
-      lastEntryId = infoEntry.id;
-    }
-
-    // Messages
-    for (const msg of conv.messages) {
-      const msgId = randomId('msg_');
-      const msgTimestamp = msg.createdAt
-        ? new Date(msg.createdAt).toISOString()
-        : new Date(conv.createdAt).toISOString();
-
-      const contentBlocks: PiContentBlock[] = [];
-      if (msg.content) {
-        contentBlocks.push({ type: 'text', text: msg.content });
-      }
-
-      // Add tool calls if present
-      if (opts.includeTools && msg.toolCalls) {
-        for (const tc of msg.toolCalls) {
-          contentBlocks.push({
-            type: 'toolCall',
-            id: randomId('call_'),
-            name: tc.toolName,
-            arguments: tc.input as Record<string, unknown> | undefined,
-          });
-        }
-      }
-
-      const piRole = mapRoleToPi(msg.role);
-      const piMessage: PiMessage = {
-        role: piRole,
-        content: contentBlocks.length > 0 ? contentBlocks : undefined,
-        timestamp: msg.createdAt,
-        model: msg.model,
-        // Pi's interactive footer unconditionally reads usage and usage.cost
-        // from every assistant entry. Converted histories often lack token or
-        // cost data, so emit a complete zero-valued structure rather than
-        // omitting fields required by the native session schema.
-        usage: piRole === 'assistant' ? {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: msg.tokens ?? 0,
-          cost: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            total: msg.costUsd ?? 0,
-          },
-        } : undefined,
-      };
-
-      const msgEntry: MessageEntry = {
-        type: 'message',
-        id: msgId,
-        parentId: lastEntryId,
-        timestamp: msgTimestamp,
-        message: piMessage,
-      };
-      lines.push(JSON.stringify(msgEntry));
-      lastEntryId = msgId;
-    }
-
-    files.push({
-      path: filePath,
-      content: lines.join('\n') + '\n',
-    });
-  }
-
-  return files;
-}
-
-function mapRoleToPi(role: Message['role']): PiMessage['role'] {
-  switch (role) {
-    case 'user': return 'user';
-    case 'assistant': return 'assistant';
-    case 'tool': return 'toolResult';
-    case 'system': return 'custom';
-    default: return 'user';
-  }
-}
-
 function deriveProvider(model: string): string {
   const lower = model.toLowerCase();
   if (lower.includes('claude') || lower.includes('anthropic')) return 'anthropic';
@@ -442,25 +365,35 @@ function deriveProvider(model: string): string {
   return 'unknown';
 }
 
-function randomId(prefix: string): string {
-  const uuid = typeof globalThis.crypto?.randomUUID === 'function'
-    ? globalThis.crypto.randomUUID()
-    : `${Date.now()}${Math.random().toString(16).slice(2)}`;
-  return `${prefix}${uuid.replace(/-/g, '').slice(0, 12)}`;
-}
-
 /** Build CanonPart[] from Pi content blocks for user/assistant messages. */
-function buildContentParts(content?: PiContentBlock[], includeTools?: boolean): CanonPart[] | undefined {
+function buildContentParts(content?: PiContentBlock[] | string, includeTools?: boolean): CanonPart[] | undefined {
   if (!content || !Array.isArray(content) || content.length === 0) return undefined;
   const parts: CanonPart[] = [];
   for (const block of content) {
     if (!block) continue;
     if (block.type === 'text' && block.text) {
-      parts.push(textPart(block.text));
+      parts.push({...textPart(block.text), meta: {native: block}});
     } else if (block.type === 'thinking' && block.thinking) {
-      parts.push(thinkingPart(block.thinking));
+      parts.push({...thinkingPart(block.thinking), meta: {native: block}});
     } else if (block.type === 'toolCall' && block.name && includeTools) {
-      parts.push(toolCallPart(block.id ?? block.name, block.name, block.arguments));
+      if (block.id) {
+        parts.push({...toolCallPart(block.id, block.name, block.arguments), meta: {native: block}});
+      } else {
+        // Never fabricate an association; keep the call as opaque content.
+        parts.push({id: '', type: 'x-pi-content', payload: block});
+      }
+    } else if (block.type === 'tool_use' && block.name && includeTools) {
+      // Sessions imported from Anthropic-style logs keep snake_case blocks.
+      const callId = block.id ?? '';
+      if (callId) parts.push({...toolCallPart(callId, block.name, block.input ?? block.arguments), meta: {native: block}});
+      else parts.push({id: '', type: 'x-pi-content', payload: block});
+    } else if (block.type === 'tool_result') {
+      const callId = block.tool_use_id ?? '';
+      const output = toolResultText(block.content);
+      if (callId) parts.push({...toolResultPart(callId, output, {isError: block.is_error === true}), meta: {native: block}});
+      else parts.push({id: '', type: 'x-pi-content', payload: block});
+    } else if (block.type !== 'toolCall') {
+      parts.push({id: '', type: 'x-pi-content', payload: block});
     }
   }
   return parts.length > 0 ? parts : undefined;
@@ -468,8 +401,9 @@ function buildContentParts(content?: PiContentBlock[], includeTools?: boolean): 
 
 /** Build CanonPart[] for a toolResult message. */
 function buildToolResultParts(msg: PiMessage): CanonPart[] | undefined {
-  const toolCallId = msg.toolCallId ?? msg.toolName ?? 'unknown';
-  const output = extractContent(msg.content) || undefined;
+  const toolCallId = msg.toolCallId;
+  const output = msg.content;
+  if (!toolCallId) return [{id: '', type: 'x-pi-content', payload: {type: 'toolResult', toolName: msg.toolName, isError: msg.isError, content: output}}];
   return [toolResultPart(toolCallId, output, { name: msg.toolName ?? undefined, isError: msg.isError ?? false })];
 }
 
@@ -565,17 +499,43 @@ function extractMessages(entries: SessionEntry[], includeTools: boolean): Messag
       continue;
     }
 
+    // Extension-injected messages participate in LLM context.
+    if (entry.type === 'custom_message') {
+      const custom = entry as CustomMessageEntry;
+      const content = typeof custom.content === 'string' ? custom.content.trim() : extractContent(custom.content);
+      if (content) {
+        messages.push({
+          role: 'system',
+          content,
+          parts: textOnlyParts(content),
+          createdAt,
+          metadata: {
+            entryType: 'custom_message',
+            id: entry.id,
+            parentId: entry.parentId,
+            customType: custom.customType,
+            display: custom.display,
+            attribution: custom.attribution,
+          },
+        });
+      }
+      continue;
+    }
+
     // Regular messages
     if (entry.type === 'message') {
       const msgEntry = entry as MessageEntry;
       const msg = msgEntry.message;
       if (!msg || !msg.role) continue;
 
-      const content = extractContent(msg.content);
-      
+      let content = extractContent(msg.content);
+      // System messages carry the prompt/tool checkpoint in `sections` with an
+      // empty `content`; surface the section text instead of dropping the turn.
+      if (!content && msg.sections) content = sectionsToText(msg.sections);
+
       // Skip empty messages unless they have tool calls
       const toolCalls = includeTools ? extractToolCalls(msg.content) : undefined;
-      if (!content && (!toolCalls || toolCalls.length === 0)) continue;
+      if (!content && (!toolCalls || toolCalls.length === 0) && (!Array.isArray(msg.content) || !msg.content.length) && !msg.sections) continue;
 
       const msgCreatedAt = msg.timestamp ?? createdAt;
 
@@ -604,6 +564,9 @@ function extractMessages(entries: SessionEntry[], includeTools: boolean): Messag
           isError: msg.isError,
           toolCallId: msg.toolCallId,
           toolName: msg.toolName,
+          sections: msg.sections,
+          toolsAdded: msg.toolsAdded?.map(tool => tool?.name).filter(Boolean),
+          toolsRemoved: msg.toolsRemoved?.map(tool => tool?.name).filter(Boolean),
         },
       });
     }
@@ -613,7 +576,16 @@ function extractMessages(entries: SessionEntry[], includeTools: boolean): Messag
   return messages;
 }
 
-function extractContent(content?: PiContentBlock[]): string {
+function sectionsToText(sections: Record<string, string | null>): string {
+  return Object.entries(sections)
+    .filter(([, value]) => typeof value === 'string' && value.trim())
+    .map(([name, value]) => `${name}:\n${value}`)
+    .join('\n\n')
+    .trim();
+}
+
+function extractContent(content?: PiContentBlock[] | string): string {
+  if (typeof content === 'string') return content;
   if (!content || !Array.isArray(content)) return '';
 
   const parts: string[] = [];
@@ -623,13 +595,16 @@ function extractContent(content?: PiContentBlock[]): string {
       parts.push(block.text.trim());
     } else if (block.type === 'thinking' && block.thinking) {
       parts.push(block.thinking.trim());
+    } else if (block.type === 'tool_result') {
+      const output = toolResultText(block.content);
+      if (output) parts.push(output);
     }
   }
 
   return parts.filter(Boolean).join('\n').trim();
 }
 
-function extractToolCalls(content?: PiContentBlock[]): ToolCall[] | undefined {
+function extractToolCalls(content?: PiContentBlock[] | string): ToolCall[] | undefined {
   if (!content || !Array.isArray(content)) return undefined;
 
   const calls: ToolCall[] = [];
@@ -639,10 +614,26 @@ function extractToolCalls(content?: PiContentBlock[]): ToolCall[] | undefined {
         toolName: block.name,
         input: block.arguments,
       });
+    } else if (block.type === 'tool_use' && block.name) {
+      calls.push({
+        toolName: block.name,
+        input: block.input ?? block.arguments,
+      });
     }
   }
 
   return calls.length > 0 ? calls : undefined;
+}
+
+/** Flatten a tool result block's `content` (string or text blocks). */
+function toolResultText(content?: string | PiContentBlock[]): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map(block => (typeof block === 'string' ? block : block?.text ?? ''))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
 }
 
 function mapRole(role: string): Message['role'] {
@@ -681,6 +672,26 @@ function calculateTotals(entries: SessionEntry[]): {
       }
       if (modelEntry.modelId) {
         model = modelEntry.modelId;
+      }
+      continue;
+    }
+    if (entry.type === 'usage') {
+      const usageEntry = entry as UsageEntry;
+      if (usageEntry.usage) {
+        tokensIn += usageEntry.usage.input + usageEntry.usage.cacheRead;
+        tokensOut += usageEntry.usage.output;
+        costUsd += usageEntry.usage.cost?.total ?? 0;
+      }
+      if (usageEntry.model) model = usageEntry.model;
+      if (usageEntry.provider) provider = usageEntry.provider;
+      continue;
+    }
+    if (entry.type === 'compaction' || entry.type === 'branch_summary') {
+      const usage = (entry as { usage?: PiUsage }).usage;
+      if (usage) {
+        tokensIn += usage.input + usage.cacheRead;
+        tokensOut += usage.output;
+        costUsd += usage.cost?.total ?? 0;
       }
       continue;
     }
@@ -797,10 +808,16 @@ async function parseFiles(files: string[], opts?: ParseOptions): Promise<Convers
     const lines = raw.split(/\r?\n/).filter(line => line.trim().length > 0);
     if (lines.length === 0) continue;
 
+    // Indexing is lenient per session: a session Pi is still writing (partial
+    // last line) or one with unusual content must stay searchable and must
+    // never abort the other sessions in this batch. Every deviation is
+    // recorded in metadata.parseWarnings, and only fully valid trees qualify
+    // for lossless native Pi export.
     const entries: SessionEntry[] = [];
+    const parseWarnings: string[] = [];
     let header: SessionHeader | null = null;
 
-    for (const line of lines) {
+    for (const [index, line] of lines.entries()) {
       try {
         const entry = JSON.parse(line) as SessionEntry;
         if (entry.type === 'session') {
@@ -808,13 +825,35 @@ async function parseFiles(files: string[], opts?: ParseOptions): Promise<Convers
         }
         entries.push(entry);
       } catch {
-        continue;
+        parseWarnings.push(index === lines.length - 1
+          ? `line ${index + 1}: incomplete trailing line skipped (session may still be written)`
+          : `line ${index + 1}: invalid JSON skipped`);
       }
     }
 
-    if (!header) continue;
+    if (!header) {
+      console.error(`pi adapter: skipped ${filePath}: no session header`);
+      continue;
+    }
 
+    let nativePiSession: ReturnType<typeof validateNativePiSession> | undefined;
+    let nativeQualification: { qualified: boolean; reason?: string };
+    try {
+      if (parseWarnings.length) throw new Error('session JSONL has skipped lines');
+      nativePiSession = validateNativePiSession({header, entries: entries.filter(entry => entry.type !== 'session')});
+      nativeQualification = { qualified: true };
+    } catch (error) {
+      nativeQualification = { qualified: false, reason: (error as Error).message };
+      parseWarnings.push(`not qualified for native Pi export: ${(error as Error).message}`);
+    }
+    const byId = new Map(entries.filter(entry => entry.type !== 'session').map(entry => [(entry as {id?: string}).id, entry]));
     const messages = extractMessages(entries, opts?.includeTools ?? true);
+    for (const message of messages) {
+      const entryId = message.metadata?.id as string;
+      const anchor = `pi:${header.id}:${entryId}`;
+      message.metadata = {...message.metadata, sourceMessageId: anchor, nativePiEntry: byId.get(entryId)};
+      message.parts = message.parts?.map((part, index) => ({...part, id: `${anchor}:${index}`}));
+    }
 
     const timestamps = messages
       .map(msg => msg.createdAt)
@@ -879,6 +918,9 @@ async function parseFiles(files: string[], opts?: ParseOptions): Promise<Convers
         file: filePath,
         version: header.version,
         parentSession: header.parentSession,
+        nativePiSession,
+        nativeQualification,
+        ...(parseWarnings.length ? { parseWarnings } : {}),
       },
     });
 
@@ -965,4 +1007,5 @@ function decodeWorkspaceFromPath(_filePath: string): string | undefined {
   return undefined;
 }
 
-runAdapter(adapter);
+if (import.meta.main) runAdapter(adapter);
+export default adapter;

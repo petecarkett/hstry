@@ -123,8 +123,7 @@ pub async fn ingest_batch(
                     let same_project = !project_cleared
                         && existing_map.get("projectId") == new_map.get("projectId");
                     for (k, v) in new_map {
-                        // An unknown name must not erase a verified name for
-                        // the same project. A project move/clear may replace it.
+                        // Unknown project names must not erase verified names.
                         if k == "projectName"
                             && v.is_null()
                             && same_project
@@ -135,8 +134,19 @@ pub async fn ingest_batch(
                         {
                             continue;
                         }
-                        if project_declared
-                            && matches!(k.as_str(), "url" | "projectId" | "projectName")
+                        // Preserve authoritative project changes and native
+                        // adapter snapshots; other keys retain annotations.
+                        if (project_declared
+                            && matches!(k.as_str(), "url" | "projectId" | "projectName"))
+                            || matches!(
+                                k.as_str(),
+                                "nativePiSession"
+                                    | "sourceCursor"
+                                    | "sourceProvenance"
+                                    | "nativeConversation"
+                                    | "selection"
+                                    | "sdkVersion"
+                            )
                         {
                             existing_map.insert(k, v);
                         } else {
@@ -214,13 +224,20 @@ pub async fn ingest_batch(
             // Stable, content-addressable message id (trx-hjjw.4): replays
             // of the same data produce the same row id, so the existing
             // ON CONFLICT clauses naturally dedupe.
+            // Native source identity wins over mutable text and ordinal position.
+            let source_message_id = msg
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("sourceMessageId"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty());
             let stable_id = stable_message_id(
                 source_id,
                 hstry_conv.external_id.as_deref(),
                 idx,
                 role_str,
                 &msg.content,
-                None,
+                source_message_id,
             );
             let external_message_id = if source_id.starts_with("chatgpt-web") {
                 msg.metadata
@@ -244,11 +261,16 @@ pub async fn ingest_batch(
                 model: msg.model.clone(),
                 tokens: msg.tokens,
                 cost_usd: msg.cost_usd,
-                metadata: serde_json::Value::Object(serde_json::Map::default()),
+                metadata: msg
+                    .metadata
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
                 sender: None,
                 provider: None,
                 harness: None,
-                client_id: external_message_id,
+                // Preserve upstream native IDs and the browser's canonical
+                // ChatGPT UUID needed to reconcile live/canonical messages.
+                client_id: source_message_id.map(str::to_owned).or(external_message_id),
             };
             batch_msgs.push(hstry_msg);
         }
@@ -332,6 +354,14 @@ mod tests {
     use crate::models::Source;
     use crate::parsed::{ParsedConversation, ParsedMessage};
 
+    /// Windows can keep the SQLite main/WAL/SHM handles locked briefly after
+    /// `close`, so unlinking the temp database is best-effort there.
+    fn remove_db_files(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     fn parsed_conversation() -> ParsedConversation {
         ParsedConversation {
             external_id: Some("progress-fixture".to_string()),
@@ -363,6 +393,111 @@ mod tests {
             parent_message_idx: None,
             fork_type: None,
         }
+    }
+
+    #[tokio::test]
+    async fn native_source_identity_and_metadata_survive_reimport() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("hstry-native-ingest-{}.db", Uuid::new_v4()));
+        let db = Database::open(&path).await?;
+        db.upsert_source(&Source {
+            id: "native".into(),
+            adapter: "pi-durable".into(),
+            path: None,
+            last_sync_at: None,
+            config: serde_json::json!({}),
+        })
+        .await?;
+        let mut conversation = parsed_conversation();
+        conversation.metadata = Some(
+            serde_json::json!({"sourceCursor": {"sourceVersion": "first"}, "nativePiSession": {"entries": ["initial"]}, "annotation": "keep"}),
+        );
+        conversation.messages[0].metadata = Some(
+            serde_json::json!({"sourceMessageId": "store-a:conversation1:entry1", "opaque": {"native": true}}),
+        );
+        let mut other = conversation.messages[0].clone();
+        other.metadata =
+            Some(serde_json::json!({"sourceMessageId": "store-a:conversation1:entry2"}));
+        conversation.messages.push(other);
+        ingest_batch(&db, "native", vec![conversation.clone()]).await?;
+        let id = db
+            .get_conversation_id("native", "progress-fixture")
+            .await?
+            .expect("imported conversation");
+        let before = db.get_messages(id).await?;
+        assert_eq!(
+            before
+                .iter()
+                .map(|message| (
+                    message.id,
+                    message.client_id.clone(),
+                    message.metadata.clone()
+                ))
+                .collect::<Vec<_>>(),
+            conversation
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(idx, message)| {
+                    let native_id = message
+                        .metadata
+                        .as_ref()
+                        .and_then(|value| value["sourceMessageId"].as_str())
+                        .expect("fixture source identity");
+                    (
+                        stable_message_id(
+                            "native",
+                            conversation.external_id.as_deref(),
+                            idx as i32,
+                            &message.role,
+                            &message.content,
+                            Some(native_id),
+                        ),
+                        Some(native_id.to_owned()),
+                        message.metadata.clone().expect("fixture metadata"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        conversation.metadata = Some(
+            serde_json::json!({"sourceCursor": {"sourceVersion": "next"}, "nativePiSession": {"entries": ["initial", "appended"]}}),
+        );
+        ingest_batch(&db, "native", vec![conversation.clone()]).await?;
+        let refreshed = db
+            .get_conversation_by_reference(
+                Some("native"),
+                Some("progress-fixture"),
+                None,
+                None,
+                None,
+            )
+            .await?
+            .expect("refreshed");
+        assert_eq!(
+            refreshed.metadata,
+            serde_json::json!({"sourceCursor": {"sourceVersion": "next"}, "nativePiSession": {"entries": ["initial", "appended"]}, "annotation": "keep"})
+        );
+        let mut expected = serde_json::to_value(before)?;
+        assert_eq!(serde_json::to_value(db.get_messages(id).await?)?, expected);
+        let mut native_message = db.get_messages(id).await?.remove(0);
+        native_message.metadata["sourceProbe"] = serde_json::json!("refreshed without text change");
+        assert!(db.insert_message(&native_message).await?);
+        expected[0]["metadata"] = native_message.metadata;
+        assert_eq!(serde_json::to_value(db.get_messages(id).await?)?, expected);
+        // Identical text is not evidence of identity: swapping native IDs must
+        // never refresh an unrelated existing row just because idx matches.
+        conversation.messages.swap(0, 1);
+        let error = ingest_batch(&db, "native", vec![conversation])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Native source identity/position changed")
+        );
+        assert_eq!(serde_json::to_value(db.get_messages(id).await?)?, expected);
+        db.close().await;
+        remove_db_files(&path);
+        Ok(())
     }
 
     #[tokio::test]
@@ -410,7 +545,7 @@ mod tests {
         let db = Arc::try_unwrap(db)
             .unwrap_or_else(|_| panic!("all ingestion tasks should release the database"));
         db.close().await;
-        std::fs::remove_file(path)?;
+        remove_db_files(&path);
         Ok(())
     }
 

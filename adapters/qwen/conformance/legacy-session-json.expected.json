@@ -1,0 +1,83 @@
+[
+  {
+    "externalId": "5b6c7d8e-0000-4000-8000-0000000000aa",
+    "title": "What does main.rs do?",
+    "createdAt": 1772359200000,
+    "updatedAt": 1772359209000,
+    "model": "qwen3-coder-plus",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What does main.rs do?",
+        "parts": [
+          {
+            "id": "p-1",
+            "type": "text",
+            "text": "What does main.rs do?"
+          }
+        ],
+        "createdAt": 1772359201000
+      },
+      {
+        "role": "assistant",
+        "content": "Reading: Looking at main.rs\nIt parses CLI arguments and starts the server.",
+        "parts": [
+          {
+            "id": "p-2",
+            "type": "thinking",
+            "text": "Reading: Looking at main.rs"
+          },
+          {
+            "id": "p-3",
+            "type": "tool_call",
+            "toolCallId": "read_file-1",
+            "name": "read_file",
+            "input": {
+              "absolute_path": "/work/main.rs"
+            }
+          },
+          {
+            "id": "p-4",
+            "type": "tool_result",
+            "toolCallId": "read_file-1",
+            "output": "fn main() {}"
+          },
+          {
+            "id": "p-5",
+            "type": "text",
+            "text": "It parses CLI arguments and starts the server."
+          }
+        ],
+        "createdAt": 1772359205000,
+        "model": "qwen3-coder-plus",
+        "toolCalls": [
+          {
+            "toolName": "read_file",
+            "input": {
+              "absolute_path": "/work/main.rs"
+            },
+            "output": "fn main() {}",
+            "status": "success"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": "Thanks\nbye",
+        "parts": [
+          {
+            "id": "p-6",
+            "type": "text",
+            "text": "Thanks\nbye"
+          }
+        ],
+        "createdAt": 1772359208000
+      }
+    ],
+    "metadata": {
+      "source": "qwen-code",
+      "format": "legacy",
+      "projectHash": "abc123hash"
+    }
+  }
+]

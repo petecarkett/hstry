@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod ingest;
+pub mod listing;
 pub mod live;
 pub mod models;
 pub mod parsed;

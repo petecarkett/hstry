@@ -4,7 +4,7 @@
  * Parses Open WebUI SQLite database (webui.db)
  * Location: data/webui.db (in Docker: /app/backend/data/webui.db)
  *
- * Requires: better-sqlite3 (npm install better-sqlite3)
+ * Uses bun:sqlite under Bun, or better-sqlite3 under Node.
  */
 
 import { readdir, stat } from 'fs/promises';
@@ -13,19 +13,40 @@ import { homedir } from 'os';
 import type {
   Adapter,
   AdapterInfo,
+  CanonPart,
   Conversation,
   Message,
   ParseOptions,
 } from '../types/index.ts';
-import { runAdapter, textOnlyParts } from '../types/index.ts';
+import {
+  runAdapter,
+  textPart,
+  thinkingPart,
+  toolCallPart,
+  toolResultPart,
+} from '../types/index.ts';
 
-// Dynamic import for better-sqlite3 (optional dependency)
-let Database: typeof import('better-sqlite3') | null = null;
+// Dynamic SQLite support: bun:sqlite (Bun) or better-sqlite3 (Node). better-sqlite3 is not
+// loaded under Bun because its native addon crashes the runtime.
+interface SqliteDb {
+  prepare(sql: string): { all(...params: unknown[]): unknown[] };
+  close(): void;
+}
+let openDb: ((path: string) => SqliteDb) | null = null;
 try {
-  Database = (await import('better-sqlite3')).default;
+  if (typeof Bun !== 'undefined') {
+    // @ts-ignore - bun:sqlite is Bun-only
+    const { Database: BunDb } = await import('bun:sqlite');
+    openDb = (path: string) => new BunDb(path, { readonly: true }) as unknown as SqliteDb;
+  } else {
+    const BetterSqlite = (await import('better-sqlite3')).default;
+    openDb = (path: string) => new BetterSqlite(path, { readonly: true }) as unknown as SqliteDb;
+  }
 } catch {
   // SQLite not available - adapter will return empty results
 }
+
+declare const Bun: unknown;
 
 const DEFAULT_PATHS = [
   // Docker default
@@ -54,7 +75,7 @@ interface ChatRow {
 
 interface ChatData {
   messages?: OpenWebUIMessage[];
-  history?: { messages?: Record<string, OpenWebUIMessage> };
+  history?: { currentId?: string; messages?: Record<string, OpenWebUIMessage> };
   models?: string[];
 }
 
@@ -67,6 +88,34 @@ interface OpenWebUIMessage {
   parentId?: string;
   childrenIds?: string[];
   done?: boolean;
+  /** Assistant structured output (Responses API): reasoning, function_call, output, ... */
+  output?: OpenWebUIOutputItem[];
+  /** Legacy tool calls stored on the message itself. */
+  tool_calls?: OpenWebUIToolCall[];
+}
+
+interface OpenWebUIOutputItem {
+  type?: string;
+  id?: string;
+  call_id?: string;
+  name?: string;
+  status?: string;
+  arguments?: unknown;
+  content?: { type?: string; text?: unknown }[];
+  summary?: { type?: string; text?: unknown }[];
+  output?: { type?: string; text?: unknown }[];
+  code?: string;
+  lang?: string;
+  queries?: unknown[];
+  action?: Record<string, unknown>;
+  error?: unknown;
+}
+
+interface OpenWebUIToolCall {
+  id?: string;
+  name?: string;
+  arguments?: unknown;
+  function?: { name?: string; arguments?: unknown };
 }
 
 const adapter: Adapter = {
@@ -80,13 +129,13 @@ const adapter: Adapter = {
   },
 
   async detect(path: string): Promise<number | null> {
-    if (!Database) return null;
+    if (!openDb) return null;
 
     const dbPath = await findDatabase(path);
     if (!dbPath) return null;
 
     try {
-      const db = new Database(dbPath, { readonly: true });
+      const db = openDb(dbPath);
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[];
       db.close();
 
@@ -103,7 +152,7 @@ const adapter: Adapter = {
   },
 
   async parse(path: string, opts?: ParseOptions): Promise<Conversation[]> {
-    if (!Database) return [];
+    if (!openDb) return [];
 
     const dbPath = await findDatabase(path);
     if (!dbPath) return [];
@@ -111,7 +160,7 @@ const adapter: Adapter = {
     const conversations: Conversation[] = [];
 
     try {
-      const db = new Database(dbPath, { readonly: true });
+      const db = openDb(dbPath);
 
       let query = 'SELECT * FROM chat WHERE 1=1';
       const params: unknown[] = [];
@@ -231,19 +280,14 @@ function extractMessages(chatData: ChatData): Message[] {
     return messages;
   }
 
-  // Try history.messages (tree structure)
+  // history.messages is a tree; history.currentId names the leaf of the branch
+  // the user actually sees. Walking its parentId chain avoids importing
+  // regenerated/edited siblings that sorting by timestamp would interleave.
   if (chatData.history?.messages) {
     const msgMap = chatData.history.messages;
-    // Find root messages and traverse
-    const allMsgs = Object.values(msgMap);
-    
-    // Sort by timestamp if available, otherwise by tree order
-    const sorted = allMsgs.sort((a, b) => {
-      if (a.timestamp && b.timestamp) return a.timestamp - b.timestamp;
-      return 0;
-    });
-
-    for (const msg of sorted) {
+    const active = walkActiveBranch(msgMap, chatData.history.currentId);
+    const entries = active.length ? active : sortByTimestamp(Object.values(msgMap));
+    for (const msg of entries) {
       const parsed = parseMessage(msg);
       if (parsed) messages.push(parsed);
     }
@@ -252,13 +296,96 @@ function extractMessages(chatData: ChatData): Message[] {
   return messages;
 }
 
+/** Walk currentId -> parents back to the root and return root-first order. */
+function walkActiveBranch(
+  msgMap: Record<string, OpenWebUIMessage>,
+  currentId: string | undefined
+): OpenWebUIMessage[] {
+  if (!currentId || !msgMap[currentId]) return [];
+  const chain: OpenWebUIMessage[] = [];
+  const seen = new Set<string>();
+  let id: string | undefined = currentId;
+  while (id && msgMap[id] && !seen.has(id)) {
+    seen.add(id);
+    chain.push(msgMap[id]);
+    id = msgMap[id].parentId;
+  }
+  return chain.reverse();
+}
+
+function sortByTimestamp(messages: OpenWebUIMessage[]): OpenWebUIMessage[] {
+  return [...messages].sort((a, b) => {
+    if (a.timestamp && b.timestamp) return a.timestamp - b.timestamp;
+    return 0;
+  });
+}
+
 function parseMessage(msg: OpenWebUIMessage): Message | null {
-  if (!msg.role || !msg.content) return null;
+  const parts: CanonPart[] = [];
+  const chunks: string[] = [];
+  let outputText = '';
+
+  for (const item of Array.isArray(msg.output) ? msg.output : []) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'reasoning') {
+      const text = outputPartsText(item.summary) || outputPartsText(item.content);
+      if (text) {
+        parts.push(thinkingPart(text));
+        chunks.push(text);
+      }
+    } else if (item.type === 'function_call') {
+      const callId = String(item.call_id ?? item.id ?? item.name ?? 'tool');
+      parts.push(toolCallPart(callId, String(item.name ?? 'tool'), parseArguments(item.arguments)));
+    } else if (item.type === 'function_call_output') {
+      const text = outputPartsText(item.output);
+      parts.push(toolResultPart(String(item.call_id ?? item.id ?? 'unknown'), text, { isError: item.status === 'failed' }));
+      if (text) chunks.push(text);
+    } else if (item.type === 'open_webui:code_interpreter') {
+      const callId = String(item.call_id ?? item.id ?? 'code_interpreter');
+      parts.push(toolCallPart(callId, 'code_interpreter', { code: item.code, lang: item.lang }));
+      const text = outputPartsText(item.output);
+      if (text) {
+        parts.push(toolResultPart(callId, text, { name: 'code_interpreter' }));
+        chunks.push(text);
+      }
+    } else if (item.type === 'web_search_call' || item.type === 'file_search_call' || item.type === 'computer_call') {
+      const callId = String(item.call_id ?? item.id ?? item.type);
+      parts.push(toolCallPart(callId, item.type.replace(/_call$/, ''), item.action ?? item.queries ?? undefined));
+    } else if (item.type === 'message' || item.type === 'error' || item.content) {
+      const text = outputPartsText(item.content) || outputPartsText(item.output);
+      if (text) {
+        if (!outputText) outputText = text;
+        parts.push(textPart(text));
+        chunks.push(text);
+      }
+    } else if (typeof (item as { text?: unknown }).text === 'string') {
+      const text = (item as { text: string }).text.trim();
+      if (text) {
+        parts.push(textPart(text));
+        chunks.push(text);
+      }
+    }
+  }
+
+  for (const call of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
+    if (!call || typeof call !== 'object') continue;
+    const name = call.function?.name ?? call.name ?? 'tool';
+    const callId = String(call.id ?? name);
+    parts.push(toolCallPart(callId, String(name), parseArguments(call.function?.arguments ?? call.arguments)));
+  }
+
+  const content = typeof msg.content === 'string' ? msg.content.trim() : '';
+  if (content && content !== outputText) {
+    parts.unshift(textPart(content));
+    chunks.unshift(content);
+  }
+
+  if (!parts.length) return null;
 
   return {
-    role: mapRole(msg.role),
-    content: msg.content,
-    parts: textOnlyParts(msg.content),
+    role: mapRole(msg.role ?? 'assistant'),
+    content: chunks.join('\n').trim(),
+    parts,
     createdAt: msg.timestamp ? msg.timestamp * 1000 : undefined,
     model: msg.model,
     metadata: {
@@ -267,6 +394,28 @@ function parseMessage(msg: OpenWebUIMessage): Message | null {
       done: msg.done,
     },
   };
+}
+
+function outputPartsText(parts?: { type?: string; text?: unknown }[]): string {
+  if (!Array.isArray(parts)) return '';
+  return parts
+    .filter(part => part?.type !== 'input_image')
+    .map(part => (part?.text === undefined || part?.text === null ? '' : typeof part.text === 'string' ? part.text : String(part.text)))
+    .join('')
+    .trim();
+}
+
+function parseArguments(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  let parsed: unknown = value.trim();
+  while (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      break;
+    }
+  }
+  return parsed;
 }
 
 function mapRole(role: string): Message['role'] {

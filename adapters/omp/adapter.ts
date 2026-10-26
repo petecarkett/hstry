@@ -44,6 +44,7 @@ interface SessionHeader {
   id: string;
   timestamp: string;
   cwd: string;
+  title?: string;
   parentSession?: string;
 }
 
@@ -64,8 +65,18 @@ interface MessageEntry extends SessionEntryBase {
 // Model change entry
 interface ModelChangeEntry extends SessionEntryBase {
   type: 'model_change';
-  provider: string;
-  modelId: string;
+  /** Current omp: "provider/modelId". */
+  model?: string;
+  /** Older entries: separate provider and modelId. */
+  provider?: string;
+  modelId?: string;
+}
+
+function modelChangeTarget(entry: ModelChangeEntry): { provider?: string; modelId?: string } {
+  if (entry.modelId) return { provider: entry.provider, modelId: entry.modelId };
+  const slash = entry.model?.indexOf('/') ?? -1;
+  if (entry.model && slash > 0) return { provider: entry.model.slice(0, slash), modelId: entry.model.slice(slash + 1) };
+  return { modelId: entry.model };
 }
 
 // Compaction entry (context summarization)
@@ -114,13 +125,28 @@ type SessionEntry =
   | ThinkingLevelChangeEntry 
   | SessionInfoEntry 
   | LabelEntry
+  | CustomMessageEntry
   | SessionEntryBase;
 
 // OMP message types
 interface OmpMessage {
-  role: 'user' | 'assistant' | 'toolResult' | 'custom';
+  role: 'user' | 'developer' | 'assistant' | 'toolResult' | 'bashExecution' | 'pythonExecution' | 'hookMessage' | 'fileMention' | 'custom';
   content?: OmpContentBlock[];
   timestamp?: number;
+  // Bash/Python execution fields
+  command?: string;
+  code?: string;
+  output?: string;
+  exitCode?: number;
+  cancelled?: boolean;
+  truncated?: boolean;
+  excludeFromContext?: boolean;
+  // Extension-injected message fields
+  customType?: string;
+  display?: boolean;
+  attribution?: string;
+  // fileMention fields
+  files?: Array<{ path?: string; content?: string; lineCount?: number; byteSize?: number; skippedReason?: string }>;
   // Assistant-specific fields
   api?: string;
   provider?: string;
@@ -131,6 +157,16 @@ interface OmpMessage {
   toolCallId?: string;
   toolName?: string;
   isError?: boolean;
+}
+
+/** Extension-provided message that participates in LLM context. */
+interface CustomMessageEntry extends SessionEntryBase {
+  type: 'custom_message';
+  customType?: string;
+  content?: string | OmpContentBlock[];
+  display?: boolean;
+  details?: unknown;
+  attribution?: string;
 }
 
 interface OmpContentBlock {
@@ -182,14 +218,16 @@ const adapter: Adapter = {
     // Check if any file looks like a Pi session (has session header with cwd)
     for (const file of files.slice(0, 3)) {
       const content = await readFile(file, 'utf-8').catch(() => '');
-      const firstLine = content.split('\n')[0];
-      try {
-        const header = JSON.parse(firstLine);
-        if (header.type === 'session' && header.cwd && header.id) {
-          return 0.95;
+      // Current omp files begin with a fixed-width `type: "title"` slot before the header.
+      for (const line of content.split('\n').slice(0, 3)) {
+        try {
+          const header = JSON.parse(line);
+          if (header.type === 'session' && header.cwd && header.id) {
+            return 0.95;
+          }
+        } catch {
+          continue;
         }
-      } catch {
-        continue;
       }
     }
 
@@ -484,23 +522,24 @@ function extractMessages(entries: SessionEntry[], includeTools: boolean): Messag
     // Track model changes for subsequent messages
     if (entry.type === 'model_change') {
       const modelEntry = entry as ModelChangeEntry;
-      currentModel = modelEntry.modelId;
-      currentProvider = modelEntry.provider;
+      const target = modelChangeTarget(modelEntry);
+      currentModel = target.modelId;
+      currentProvider = target.provider;
       
       // Add as system message to preserve the event
-      const sysContent = `Model changed to ${modelEntry.provider}/${modelEntry.modelId}`;
+      const sysContent = `Model changed to ${target.provider ? `${target.provider}/` : ''}${target.modelId}`;
       messages.push({
         role: 'system',
         content: sysContent,
         parts: textOnlyParts(sysContent),
         createdAt,
-        model: modelEntry.modelId,
+        model: target.modelId,
         metadata: {
           entryType: 'model_change',
           id: entry.id,
           parentId: entry.parentId,
-          provider: modelEntry.provider,
-          modelId: modelEntry.modelId,
+          provider: target.provider,
+          modelId: target.modelId,
         },
       });
       continue;
@@ -565,11 +604,72 @@ function extractMessages(entries: SessionEntry[], includeTools: boolean): Messag
       continue;
     }
 
+    // Extension-injected messages participate in LLM context.
+    if (entry.type === 'custom_message') {
+      const custom = entry as CustomMessageEntry;
+      const content = typeof custom.content === 'string' ? custom.content.trim() : extractContent(custom.content);
+      if (content) {
+        messages.push({
+          role: 'system',
+          content,
+          parts: textOnlyParts(content),
+          createdAt,
+          metadata: {
+            entryType: 'custom_message',
+            id: entry.id,
+            parentId: entry.parentId,
+            customType: custom.customType,
+            display: custom.display,
+            attribution: custom.attribution,
+          },
+        });
+      }
+      continue;
+    }
+
     // Regular messages
     if (entry.type === 'message') {
       const msgEntry = entry as MessageEntry;
       const msg = msgEntry.message;
       if (!msg || !msg.role) continue;
+
+      // Standalone !bash / $python executions are tool records, not assistant prose.
+      if (msg.role === 'bashExecution' || msg.role === 'pythonExecution') {
+        const command = (msg.role === 'bashExecution' ? msg.command : msg.code) ?? '';
+        const output = msg.output ?? '';
+        const name = msg.role === 'bashExecution' ? 'bash' : 'python';
+        const isError = typeof msg.exitCode === 'number' && msg.exitCode !== 0;
+        const content = [command, output].filter(Boolean).join('\n').trim();
+        messages.push({
+          role: 'tool',
+          content,
+          parts: [toolCallPart(msgEntry.id, name, { command }), toolResultPart(msgEntry.id, output, { name, isError })],
+          createdAt: msg.timestamp ?? createdAt,
+          toolCalls: [{ toolName: name, input: { command }, output, status: isError ? 'error' : 'success' }],
+          metadata: {
+            entryType: 'message', role: msg.role, id: msgEntry.id, parentId: msgEntry.parentId,
+            exitCode: msg.exitCode, cancelled: msg.cancelled, truncated: msg.truncated, excludeFromContext: msg.excludeFromContext,
+          },
+        });
+        continue;
+      }
+
+      // Inlined @file mention contents.
+      if (msg.role === 'fileMention') {
+        const files = Array.isArray(msg.files) ? msg.files.filter(file => file && typeof file.path === 'string') : [];
+        const content = files.map(file => `@${file.path}\n${file.content ?? ''}`).join('\n\n').trim();
+        if (!content) continue;
+        const parts: CanonPart[] = [textPart(content)];
+        for (const file of files) parts.push({ id: `x-file-${msgEntry.id}-${parts.length}`, type: 'file_ref', uri: file.path!, originText: file.content });
+        messages.push({
+          role: 'system',
+          content,
+          parts,
+          createdAt: msg.timestamp ?? createdAt,
+          metadata: { entryType: 'message', role: 'fileMention', id: msgEntry.id, parentId: msgEntry.parentId },
+        });
+        continue;
+      }
 
       const content = extractContent(msg.content);
       
@@ -652,8 +752,14 @@ function mapRole(role: string): Message['role'] {
     case 'assistant':
       return 'assistant';
     case 'toolresult':
+    case 'bashexecution':
+    case 'pythonexecution':
       return 'tool';
     case 'system':
+    case 'developer':
+    case 'filemention':
+    case 'custom':
+    case 'hookmessage':
       return 'system';
     default:
       return 'assistant';
@@ -676,11 +782,12 @@ function calculateTotals(entries: SessionEntry[]): {
   for (const entry of entries) {
     if (entry.type === 'model_change') {
       const modelEntry = entry as ModelChangeEntry;
-      if (modelEntry.provider) {
-        provider = modelEntry.provider;
+      const target = modelChangeTarget(modelEntry);
+      if (target.provider) {
+        provider = target.provider;
       }
-      if (modelEntry.modelId) {
-        model = modelEntry.modelId;
+      if (target.modelId) {
+        model = target.modelId;
       }
       continue;
     }
@@ -841,7 +948,11 @@ async function parseFiles(files: string[], opts?: ParseOptions): Promise<Convers
       (e): e is SessionInfoEntry => e.type === 'session_info' && 'name' in e && !!e.name
     );
     const latestSessionInfo = sessionInfoEntries[sessionInfoEntries.length - 1];
-    const rawTitle = latestSessionInfo?.name || deriveTitle(messages);
+    // Current omp: latest title_change entry, else the header title (folded from the title slot).
+    const titleChanges = entries.filter(
+      (e): e is SessionEntryBase & { title: string } => e.type === 'title_change' && typeof (e as { title?: unknown }).title === 'string' && !!(e as { title: string }).title
+    );
+    const rawTitle = titleChanges[titleChanges.length - 1]?.title || header.title || latestSessionInfo?.name || deriveTitle(messages);
 
     // Parse Pi title format: "workspace: Title Text [readable-id]"
     const { title: parsedTitle, readableId } = parsePiTitle(rawTitle);

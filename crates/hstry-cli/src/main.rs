@@ -11,6 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
 use hstry_core::config::{AdapterRepo, AdapterRepoSource};
+use hstry_core::listing::is_continuation_fragment;
 use hstry_core::models::{Conversation, Message, MessageRole, Source};
 use hstry_core::{Config, Database};
 use hstry_runtime::{AdapterRunner, ExportConversation, ExportOptions, ParsedMessage, Runtime};
@@ -27,6 +28,7 @@ use api::ApiCommand;
 use serde::{Serialize, de::DeserializeOwned};
 
 mod api;
+mod pick;
 mod pretty;
 mod read_cli;
 mod resume;
@@ -370,6 +372,71 @@ enum Command {
         /// Read JSON input from file or "-" for stdin
         #[arg(long)]
         input: Option<PathBuf>,
+    },
+
+    /// Open the web UI (find, read and act on sessions in the browser)
+    Ui {
+        /// Port to serve on (defaults to the configured API port)
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Print the URL instead of opening a browser
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Find a session and act on it (default: copy its transcript)
+    Pick {
+        /// Fuzzy query over title, first message, workspace and id
+        query: Option<String>,
+
+        /// Copy the transcript to the clipboard (default action)
+        #[arg(long)]
+        copy: bool,
+
+        /// Print the transcript to stdout
+        #[arg(long, conflicts_with = "copy")]
+        print: bool,
+
+        /// Print only the conversation id
+        #[arg(long)]
+        id_only: bool,
+
+        /// Print only the on-disk source path
+        #[arg(long)]
+        path: bool,
+
+        /// Open the session in an agent (e.g. pi, claude, codex)
+        #[arg(long, value_name = "AGENT")]
+        open: Option<String>,
+
+        /// Export the transcript in a format (markdown, json, ...)
+        #[arg(long, value_name = "FORMAT")]
+        export: Option<String>,
+
+        /// Skip the interactive picker and choose the best query match
+        #[arg(long)]
+        no_pick: bool,
+
+        /// Restrict to one source/adapter
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Restrict to workspaces matching this substring
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Only sessions at or after this date/time
+        #[arg(long)]
+        after: Option<String>,
+
+        /// Only sessions at or before this date/time
+        #[arg(long)]
+        before: Option<String>,
+
+        /// Maximum number of candidate sessions to consider
+        #[arg(short, long, default_value = "2000")]
+        limit: i64,
     },
 
     /// Show a token-efficient peek bundle for a single conversation
@@ -988,8 +1055,21 @@ fn default_log_filter(verbose: u8) -> &'static str {
     }
 }
 
+fn main() -> Result<()> {
+    // The command dispatch future is large enough to overflow Windows' default
+    // 1 MiB main-thread stack. Run the runtime on a thread with a generous
+    // stack so `hstry` behaves the same on every platform.
+    std::thread::Builder::new()
+        .name("hstry".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run)
+        .map_err(|error| anyhow::anyhow!("failed to spawn CLI thread: {error}"))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("CLI thread panicked"))?
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.no_color {
@@ -1228,6 +1308,49 @@ async fn main() -> Result<()> {
             let db = Database::open(&config.database).await?;
             apply_storage_config(&db, &config);
             cmd_peek(&db, &id, chars, cli.json).await
+        }
+        Command::Ui { port, no_open } => api::cmd_ui(&config_path, port, !no_open),
+        Command::Pick {
+            query,
+            copy,
+            print,
+            id_only,
+            path,
+            open,
+            export,
+            no_pick,
+            source,
+            workspace,
+            after,
+            before,
+            limit,
+        } => {
+            let db = Database::open(&config.database).await?;
+            apply_storage_config(&db, &config);
+            let runner = Runtime::parse(&config.js_runtime)
+                .map(|runtime| AdapterRunner::new(runtime, config.adapter_paths.clone()));
+            cmd_pick(
+                &db,
+                runner.as_ref(),
+                &config,
+                PickArgs {
+                    query,
+                    copy,
+                    print,
+                    id_only,
+                    path,
+                    open,
+                    export,
+                    no_pick,
+                    source,
+                    workspace,
+                    after,
+                    before,
+                    limit,
+                },
+                cli.json,
+            )
+            .await
         }
         Command::Remove { id, yes, dry_run } => {
             let db = Database::open(&config.database).await?;
@@ -2110,13 +2233,19 @@ async fn cmd_import(
             let role_str = msg.role.as_str();
             // Stable, content-addressable id (trx-hjjw.4) so re-imports of
             // the same source produce idempotent rows.
+            let source_message_id = msg
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("sourceMessageId"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty());
             let stable_id = hstry_core::stable_message_id(
                 &source_id,
                 hstry_conv.external_id.as_deref(),
                 idx,
                 role_str,
                 &msg.content,
-                None,
+                source_message_id,
             );
             let hstry_msg = hstry_core::models::Message {
                 id: stable_id,
@@ -2132,11 +2261,14 @@ async fn cmd_import(
                 model: msg.model.clone(),
                 tokens: msg.tokens,
                 cost_usd: msg.cost_usd,
-                metadata: serde_json::Value::Object(serde_json::Map::default()),
+                metadata: msg
+                    .metadata
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
                 sender: None,
                 provider: None,
                 harness: None,
-                client_id: None,
+                client_id: source_message_id.map(str::to_owned),
             };
             db.insert_message(&hstry_msg).await?;
             imported_msgs += 1;
@@ -2481,17 +2613,6 @@ fn is_system_context(content: &str) -> bool {
     false
 }
 
-/// Detect a resume/compaction continuation fragment whose first user message is
-/// the synthetic "conversation history ... compacted" summary Claude Code
-/// injects. These are hidden from `list` by default but stay fully searchable.
-fn is_continuation_fragment(first_user: Option<&str>) -> bool {
-    first_user.is_some_and(|content| {
-        content
-            .trim_start()
-            .starts_with("The conversation history before this point was compacted")
-    })
-}
-
 #[derive(Serialize)]
 struct SearchApiQuery<'a> {
     query: &'a str,
@@ -2628,82 +2749,6 @@ impl std::fmt::Display for SearchRoleArg {
     }
 }
 
-fn conversation_identity_key(conv: &Conversation) -> String {
-    let harness = conv.harness.as_deref().unwrap_or_default();
-    if let Some(external_id) = conv.external_id.as_deref().filter(|v| !v.is_empty()) {
-        return format!("{harness}|external|{external_id}");
-    }
-    if let Some(readable_id) = conv.readable_id.as_deref().filter(|v| !v.is_empty()) {
-        return format!("{harness}|readable|{readable_id}");
-    }
-    if let Some(platform_id) = conv.platform_id.as_deref().filter(|v| !v.is_empty()) {
-        return format!("{harness}|platform|{platform_id}");
-    }
-    format!("{harness}|id|{}", conv.id)
-}
-
-fn conversation_sort_ts(conv: &Conversation) -> i64 {
-    conv.updated_at.unwrap_or(conv.created_at).timestamp()
-}
-
-fn source_preference(source_id: &str, harness: Option<&str>) -> u8 {
-    if let Some(harness) = harness {
-        if source_id == harness {
-            return 0;
-        }
-        if source_id == format!("import-{harness}") {
-            return 2;
-        }
-    }
-
-    if source_id.starts_with("import-") {
-        2
-    } else {
-        1
-    }
-}
-
-fn should_replace_conversation(candidate: &Conversation, current: &Conversation) -> bool {
-    let candidate_pref = source_preference(&candidate.source_id, candidate.harness.as_deref());
-    let current_pref = source_preference(&current.source_id, current.harness.as_deref());
-
-    if candidate_pref != current_pref {
-        return candidate_pref < current_pref;
-    }
-
-    conversation_sort_ts(candidate) > conversation_sort_ts(current)
-}
-
-fn dedup_conversation_previews(
-    previews: Vec<hstry_core::db::ConversationPreview>,
-) -> Vec<hstry_core::db::ConversationPreview> {
-    let mut best_by_key: HashMap<String, hstry_core::db::ConversationPreview> = HashMap::new();
-
-    for preview in previews {
-        let key = conversation_identity_key(&preview.conversation);
-        match best_by_key.get(&key) {
-            Some(existing)
-                if !should_replace_conversation(&preview.conversation, &existing.conversation) => {}
-            _ => {
-                best_by_key.insert(key, preview);
-            }
-        }
-    }
-
-    let mut deduped: Vec<hstry_core::db::ConversationPreview> = best_by_key.into_values().collect();
-    deduped.sort_by(|a, b| {
-        conversation_sort_ts(&b.conversation).cmp(&conversation_sort_ts(&a.conversation))
-    });
-    deduped
-}
-
-fn expanded_list_limit(limit: i64) -> i64 {
-    if limit <= 0 {
-        return limit;
-    }
-    (limit.saturating_mul(4)).min(2000)
-}
-
 async fn cmd_list(
     db: &Database,
     source: Option<String>,
@@ -2714,34 +2759,20 @@ async fn cmd_list(
     include_all: bool,
     json: bool,
 ) -> Result<()> {
-    let dedup_across_sources = source.is_none();
-    let workspace = workspace.map(|value| format!("%{value}%"));
-    let opts = hstry_core::db::ListConversationsOptions {
-        source_id: source,
-        workspace,
-        after,
-        before,
-        limit: Some(if dedup_across_sources {
-            expanded_list_limit(limit)
-        } else {
-            limit
-        }),
-    };
-
-    let mut fetched = db.list_conversation_previews(opts).await?;
-    if !include_all {
-        fetched.retain(|preview| !is_continuation_fragment(preview.first_user_message.as_deref()));
-    }
-
-    let previews = if dedup_across_sources {
-        let mut deduped = dedup_conversation_previews(fetched);
-        if limit > 0 {
-            deduped.truncate(limit as usize);
-        }
-        deduped
-    } else {
-        fetched
-    };
+    let previews = hstry_core::listing::list_sessions(
+        db,
+        hstry_core::listing::ListSessionsOptions {
+            list: hstry_core::db::ListConversationsOptions {
+                source_id: source,
+                workspace: workspace.map(|value| format!("%{value}%")),
+                after,
+                before,
+                limit: Some(limit),
+            },
+            include_fragments: include_all,
+        },
+    )
+    .await?;
 
     if json {
         return emit_json(JsonResponse {
@@ -2783,29 +2814,21 @@ async fn cmd_list_peek(
     before: Option<chrono::DateTime<chrono::Utc>>,
     last_assistant_chars: Option<usize>,
 ) -> Result<()> {
-    let dedup_across_sources = source.is_none();
-    let workspace_filter = workspace.map(|value| format!("%{value}%"));
-    let opts = hstry_core::db::ListConversationsOptions {
-        source_id: source,
-        workspace: workspace_filter,
-        after,
-        before,
-        limit: Some(if dedup_across_sources {
-            expanded_list_limit(limit)
-        } else {
-            limit
-        }),
-    };
-
-    let previews = if dedup_across_sources {
-        let mut deduped = dedup_conversation_previews(db.list_conversation_previews(opts).await?);
-        if limit > 0 {
-            deduped.truncate(limit as usize);
-        }
-        deduped
-    } else {
-        db.list_conversation_previews(opts).await?
-    };
+    // Peek bundles always included continuation fragments; keep that.
+    let previews = hstry_core::listing::list_sessions(
+        db,
+        hstry_core::listing::ListSessionsOptions {
+            list: hstry_core::db::ListConversationsOptions {
+                source_id: source,
+                workspace: workspace.map(|value| format!("%{value}%")),
+                after,
+                before,
+                limit: Some(limit),
+            },
+            include_fragments: true,
+        },
+    )
+    .await?;
 
     let mut cfg = hstry_core::peek::PeekConfig::default();
     if let Some(n) = last_assistant_chars {
@@ -5191,6 +5214,220 @@ async fn run_fzf_picker(
     .await
 }
 
+struct PickArgs {
+    query: Option<String>,
+    copy: bool,
+    print: bool,
+    id_only: bool,
+    path: bool,
+    open: Option<String>,
+    export: Option<String>,
+    no_pick: bool,
+    source: Option<String>,
+    workspace: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    limit: i64,
+}
+
+/// Resolve one session (interactively or by fuzzy query) and act on it.
+async fn cmd_pick(
+    db: &Database,
+    runner: Option<&AdapterRunner>,
+    config: &Config,
+    args: PickArgs,
+    json_output: bool,
+) -> Result<()> {
+    use hstry_core::db::ListConversationsOptions;
+
+    let after = args.after.as_deref().map(parse_date_filter).transpose()?;
+    let before = args.before.as_deref().map(parse_date_filter).transpose()?;
+    let workspace_like = args.workspace.as_ref().map(|value| format!("%{value}%"));
+
+    let summaries = db
+        .list_conversation_summaries(ListConversationsOptions {
+            source_id: args.source.clone(),
+            workspace: workspace_like,
+            after,
+            before,
+            limit: Some(args.limit),
+        })
+        .await?;
+
+    if summaries.is_empty() {
+        anyhow::bail!("No sessions found. Try adjusting --source/--workspace/--after/--before.");
+    }
+
+    let candidates: Vec<pick::Candidate> = summaries
+        .iter()
+        .map(|summary| {
+            let conv = &summary.conversation;
+            let title = conv
+                .title
+                .clone()
+                .or_else(|| summary.first_user_message.clone())
+                .unwrap_or_else(|| "(untitled)".to_string());
+            let date = conv.created_at.format("%Y-%m-%d %H:%M").to_string();
+            let workspace = conv.workspace.clone().unwrap_or_default();
+            let id_short = conv.id.to_string()[..8].to_string();
+            let label = format!(
+                "[{}] {}  {}  {}  ({})",
+                conv.source_id, date, workspace, title, id_short
+            );
+            let first = summary.first_user_message.clone().unwrap_or_default();
+            pick::Candidate::new(
+                conv.id,
+                label,
+                &[
+                    title.as_str(),
+                    workspace.as_str(),
+                    conv.source_id.as_str(),
+                    first.as_str(),
+                    &conv.id.to_string(),
+                ],
+            )
+        })
+        .collect();
+
+    let query = args.query.clone().unwrap_or_default();
+    let selected = if !args.no_pick && pick::interactive_available() {
+        match pick::pick_interactive(&candidates, &query)? {
+            Some(id) => id,
+            None => return Ok(()),
+        }
+    } else {
+        let ranked = pick::rank(&candidates, &query);
+        let index = ranked.first().copied().ok_or_else(|| {
+            anyhow::anyhow!("No session matches '{query}'. Run without --no-pick for the picker.")
+        })?;
+        candidates[index].id
+    };
+
+    let summary = summaries
+        .iter()
+        .find(|summary| summary.conversation.id == selected)
+        .expect("selection came from candidates");
+    let conv = &summary.conversation;
+
+    // `--copy` is the default action; it exists so scripts can be explicit.
+    let _ = args.copy;
+
+    if args.id_only {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({"id": conv.id, "source": conv.source_id})
+            );
+        } else {
+            println!("{}", conv.id);
+        }
+        return Ok(());
+    }
+
+    if args.path {
+        let sources = db.list_sources().await?;
+        let path = sources
+            .iter()
+            .find(|source| source.id == conv.source_id)
+            .and_then(|source| source.path.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("No on-disk path recorded for source '{}'", conv.source_id)
+            })?;
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({"id": conv.id, "source": conv.source_id, "path": path})
+            );
+        } else {
+            println!("{path}");
+        }
+        return Ok(());
+    }
+
+    if let Some(format) = args.export {
+        let runner =
+            runner.ok_or_else(|| anyhow::anyhow!("No JavaScript runtime found for export."))?;
+        return cmd_export(
+            db,
+            runner,
+            &format,
+            &conv.id.to_string(),
+            None,
+            None,
+            Vec::new(),
+            None,
+            false,
+            false,
+            json_output,
+        )
+        .await;
+    }
+
+    if let Some(agent) = args.open {
+        let runner =
+            runner.ok_or_else(|| anyhow::anyhow!("No JavaScript runtime found for open."))?;
+        return cmd_resume(
+            db,
+            runner,
+            config,
+            Some(conv.id.to_string()),
+            None,
+            Some(agent),
+            None,
+            None,
+            None,
+            None,
+            args.limit,
+            false,
+            false,
+            false,
+            json_output,
+        )
+        .await;
+    }
+
+    // Copy (default) or print the transcript.
+    let messages = db.get_messages(conv.id).await?;
+    let transcript = pick::format_transcript(
+        conv.title
+            .as_deref()
+            .or(summary.first_user_message.as_deref()),
+        conv.id,
+        &conv.source_id,
+        conv.workspace.as_deref(),
+        conv.created_at,
+        &messages,
+    );
+
+    if args.print {
+        println!("{transcript}");
+        return Ok(());
+    }
+
+    match pick::copy_to_clipboard(&transcript) {
+        Ok(()) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"id": conv.id, "copied": true, "chars": transcript.chars().count()})
+                );
+            } else {
+                eprintln!(
+                    "Copied {} of '{}' to the clipboard.",
+                    conv.id,
+                    conv.title.as_deref().unwrap_or("(untitled)")
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("Clipboard unavailable ({error}); printing transcript instead.");
+            println!("{transcript}");
+            Ok(())
+        }
+    }
+}
+
 async fn cmd_resume(
     db: &Database,
     runner: &AdapterRunner,
@@ -5580,6 +5817,20 @@ async fn cmd_resume(
         .export(&adapter_path, vec![export_conv], export_opts)
         .await?;
 
+    // Qualified detached Pi exports allocate their own native target identity.
+    // The resume plan must describe the actual artifact, not an earlier guess.
+    if let Some(target_id) = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("fidelityReports"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|reports| reports.first())
+        .and_then(|report| report.get("targetSessionId"))
+        .and_then(serde_json::Value::as_str)
+    {
+        target_conversation.external_id = Some(target_id.to_owned());
+    }
+
     // Step 5: Place the exported file(s) in the agent's native session directory
     let session_dir = Config::expand_path(&agent_config.session_dir);
     let placed_paths = place_exported_session(&result, &session_dir, &target_conversation, true)?;
@@ -5600,6 +5851,7 @@ async fn cmd_resume(
                     "launched": false,
                     "native_verification": "not_checked",
                     "fidelity": "adapter_projection_not_runtime_state",
+                    "adapter_fidelity": result.metadata,
                     "warnings": ["Native load/continuation is not verified for this installed agent version; runtime state, permissions, reasoning signatures and attachment availability may not survive conversion"],
                     "target_session_id": target_conversation.external_id,
                     "origin": target_conversation.metadata["hstry_origin"],
