@@ -8,7 +8,7 @@ const oldWatermark = Date.now() + 86_400_000;
 const stored = {
   settings: {
     port: 41770,
-    token: '',
+    token: 'fixture-ingest-token',
     intervalMinutes: 15,
     providers: { chatgpt: true, claude: false, gemini: false, perplexity: false },
   },
@@ -70,6 +70,7 @@ globalThis.fetch = async (url, init = {}) => {
   if (parsed.pathname === '/backend-api/accounts/check/v4-2023-04-27') {
     return Response.json({ accounts: {} });
   }
+  if (parsed.pathname === '/backend-api/gizmos/snorlax/sidebar') return Response.json({ items: [], cursor: null });
   if (parsed.pathname === '/backend-api/conversations') {
     return Response.json({
       total: 1,

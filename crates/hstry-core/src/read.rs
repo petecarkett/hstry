@@ -16,7 +16,7 @@ pub struct ReadOptions {
     pub offset: usize,
     pub limit: usize,
     pub max_chars: usize,
-    /// `content` or `parts/N/input` / `parts/N/output` (canonical part index).
+    /// Search projection, visible original text, or tool fields; canonical part index.
     pub field: Option<String>,
     pub offset_chars: usize,
     /// Pass the preceding page's version to reject edits during pagination.
@@ -120,13 +120,13 @@ fn field_path(field: &str) -> Result<Option<String>> {
     let parts: Vec<_> = field.split('/').collect();
     if parts.len() == 3
         && parts[0] == "parts"
-        && matches!(parts[2], "input" | "output")
+        && matches!(parts[2], "text" | "input" | "output")
         && let Ok(idx) = parts[1].parse::<u32>()
     {
         return Ok(Some(format!("$[{idx}].{}", parts[2])));
     }
     Err(Error::Other(
-        "field must be content or parts/N/input or parts/N/output".into(),
+        "field must be content or parts/N/text or parts/N/input or parts/N/output".into(),
     ))
 }
 #[derive(Clone)]
@@ -152,11 +152,28 @@ impl Database {
                 "Conversation changed; restart pagination with its new version".into(),
             ));
         }
-        let rows =
-            sqlx::query("SELECT id,idx,role FROM messages WHERE conversation_id=? ORDER BY idx,id")
-                .bind(id.to_string())
-                .fetch_all(&mut *tx)
-                .await?;
+        let rows = sqlx::query(
+            r#"
+                SELECT m.id, m.idx, m.role
+                FROM messages AS m
+                WHERE m.conversation_id = ?
+                  AND (
+                    NOT EXISTS (
+                      SELECT 1 FROM json_each(m.parts_json) AS p
+                      WHERE json_extract(p.value, '$.type') = 'thinking'
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM json_each(m.parts_json) AS p
+                      WHERE json_extract(p.value, '$.type') = 'text'
+                        AND length(json_extract(p.value, '$.text')) > 0
+                    )
+                  )
+                ORDER BY m.idx, m.id
+                "#,
+        )
+        .bind(id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
         let all: Vec<Anchor> = rows
             .iter()
             .map(|r| Anchor {
@@ -207,7 +224,10 @@ impl Database {
                 continue;
             }
             fields.push((m.clone(), "content".into()));
-            let rows=sqlx::query("SELECT p.key AS part, json_extract(p.value,'$.type') AS kind FROM messages m,json_each(m.parts_json) p WHERE m.id=? AND ((json_extract(p.value,'$.type')='tool_call' AND json_type(p.value,'$.input') IS NOT NULL AND json_type(p.value,'$.input')!='null') OR (json_extract(p.value,'$.type')='tool_result' AND json_type(p.value,'$.output') IS NOT NULL AND json_type(p.value,'$.output')!='null'))").bind(&m.id).fetch_all(&mut *tx).await?;
+            // The stored content is a bounded search projection. Advertise
+            // original visible text only when source parts contain more text.
+            // Hidden thinking parts must not be treated as user-visible text.
+            let rows=sqlx::query("SELECT p.key AS part, json_extract(p.value,'$.type') AS kind FROM messages m,json_each(m.parts_json) p WHERE m.id=? AND ((json_extract(p.value,'$.type')='tool_call' AND json_type(p.value,'$.input') IS NOT NULL AND json_type(p.value,'$.input')!='null') OR (json_extract(p.value,'$.type')='tool_result' AND json_type(p.value,'$.output') IS NOT NULL AND json_type(p.value,'$.output')!='null') OR (json_extract(p.value,'$.type')='text' AND (SELECT COALESCE(SUM(length(json_extract(t.value,'$.text'))),0) FROM json_each(m.parts_json) t WHERE json_extract(t.value,'$.type')='text')>length(m.content)))").bind(&m.id).fetch_all(&mut *tx).await?;
             for r in rows {
                 let part: i64 = r.get("part");
                 let kind: String = r.get("kind");
@@ -215,10 +235,11 @@ impl Database {
                     m.clone(),
                     format!(
                         "parts/{part}/{}",
-                        if kind == "tool_call" {
-                            "input"
-                        } else {
-                            "output"
+                        match kind.as_str() {
+                            "tool_call" => "input",
+                            "tool_result" => "output",
+                            "text" => "text",
+                            _ => unreachable!("filtered part type"),
                         }
                     ),
                 ));
@@ -319,6 +340,22 @@ fn set_text(page: &mut ReadPage, chars: &[char], start: usize, count: usize) {
 }
 async fn load_field(tx: &mut SqliteConnection, id: &str, field: &str) -> Result<String> {
     if let Some(path) = field_path(field)? {
+        if field.ends_with("/text") {
+            // A thinking part also has a text key, but must never be exposed
+            // through the visible-text field selector.
+            let type_path = path.replace(".text", ".type");
+            let value: Option<String> = sqlx::query_scalar(
+                "SELECT CAST(json_extract(parts_json,?) AS TEXT) FROM messages WHERE id=? AND json_extract(parts_json,?)='text'",
+            )
+            .bind(path)
+            .bind(id)
+            .bind(type_path)
+            .fetch_optional(tx)
+            .await?
+            .flatten();
+            return value
+                .ok_or_else(|| Error::Other("Requested visible text field is absent".into()));
+        }
         let value: Option<String> = sqlx::query_scalar(
             "SELECT CAST(json_extract(parts_json,?) AS TEXT) FROM messages WHERE id=?",
         )

@@ -59,7 +59,7 @@
   <body>
     <main>
       <header class="page-header">
-        <div><h1>hstry web sync</h1><p>Import conversations from the accounts already signed in to this browser.</p></div>
+        <div><h1>hstry web sync</h1><p>Sync ChatGPT conversations from this browser, including historical chats.</p></div>
         <span class="version">v0.4.0</span>
       </header>
 
@@ -70,7 +70,7 @@
       </div>
 
       <section class="section" aria-labelledby="connection-heading">
-        <div class="section-heading"><h2 id="connection-heading">Connection</h2><p>The API must be running on this computer. The token is only required when the API was started with one.</p></div>
+        <div class="section-heading"><h2 id="connection-heading">Connection</h2><p>The API must be running on this computer. This installation requires the local API ingest token.</p></div>
         <div class="form-grid">
           <label for="port">Port</label><div class="control"><input id="port" type="number" min="1" max="65535" /><span class="hint">Default: 41770</span></div>
           <label for="token">Ingest token</label><div class="control"><input id="token" type="password" autocomplete="off" placeholder="No token" /><span class="hint">Must match <code style="padding:1px 3px">--token</code> or <code style="padding:1px 3px">HSTRY_API_TOKEN</code>.</span></div>
@@ -93,7 +93,7 @@
         <div class="section-heading"><h2 id="advanced-heading">Advanced</h2><p>Recovery actions for conversations missed by incremental sync.</p></div>
         <details class="advanced-panel">
           <summary>Full resync controls</summary>
-          <p class="resync-note">A full resync re-imports every available conversation for one provider. Existing conversations are updated rather than duplicated.</p>
+          <p class="resync-note">A full resync re-imports all available ChatGPT conversations. Existing conversations are updated rather than duplicated.</p>
           <div id="resync-list"></div>
           <p id="resync-result" class="resync-result" role="status" aria-live="polite"></p>
         </details>

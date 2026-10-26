@@ -19,6 +19,8 @@
       .provider { display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 13px 0; border-bottom: 1px solid var(--rule); }
       .provider h2 { margin: 0; font-size: 13px; }
       .provider p { margin: 3px 0 0; color: var(--muted); font-size: 11px; line-height: 1.4; }
+      .provider details { margin-top: 7px; font-size: 11px; }
+      .failure-details { max-height: 160px; overflow: auto; overflow-wrap: anywhere; padding-left: 16px; }
       .provider-meta { text-align: right; }
       .provider-meta strong { display: block; font-size: 11px; }
       .provider-meta span { color: var(--faint); font-size: 11px; }
@@ -31,12 +33,13 @@
   </head>
   <body>
     <main>
-      <header><h1>hstry web sync</h1><span>v0.3.2</span></header>
+      <header><h1>hstry web sync</h1><span id="extension-version"></span></header>
       <section class="connection" aria-live="polite">
         <span id="api-dot" class="status-dot checking"></span>
         <div class="connection-copy"><strong id="api-title">Checking endpoint…</strong><span id="api-detail">http://127.0.0.1:41770</span></div>
         <button id="retry" class="button-quiet">Check</button>
       </section>
+      <p id="live-capture" role="status" style="font-size:11px;color:var(--muted);margin:14px 0 0"></p>
       <div id="providers" class="providers"></div>
       <div class="actions"><button id="sync" class="button-primary">Sync now</button><button id="settings" class="button-secondary">Settings</button></div>
       <p id="notice" role="status"></p>

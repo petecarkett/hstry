@@ -57,7 +57,7 @@ impl Runtime {
     pub fn run_args(&self) -> Vec<&'static str> {
         match self.kind {
             RuntimeKind::Bun => vec!["run"],
-            RuntimeKind::Deno => vec!["run", "--allow-read", "--allow-env"],
+            RuntimeKind::Deno => vec!["run", "--allow-read", "--allow-env", "--allow-sys=homedir"],
             RuntimeKind::Node => vec!["--experimental-strip-types"],
         }
     }

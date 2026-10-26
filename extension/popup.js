@@ -15,11 +15,34 @@ function providerCard(name, entry, enabled) {
   const detail = article.querySelector('p');
   detail.textContent = state.detail;
   if (state.tone === 'error') detail.className = 'error-copy';
+  const recent = entry?.state?.failureDetails;
+  if (name === 'chatgpt' && Array.isArray(recent) && recent.length) {
+    const disclosure = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = `Failure details (${recent.length} recorded)`;
+    disclosure.appendChild(summary);
+    const list = document.createElement('ul');
+    list.className = 'failure-details';
+    for (const failure of recent.slice(-15).reverse()) {
+      const row = document.createElement('li');
+      const origin = failure.projectId ? 'Project' : 'Personal';
+      row.textContent = `${origin} ${failure.conversationId}: ${failure.errorType}` +
+        (failure.resolvedAtMs ? ' (recovered)' : '');
+      list.appendChild(row);
+    }
+    disclosure.appendChild(list);
+    article.firstElementChild.appendChild(disclosure);
+  }
   return article;
 }
 
 async function render() {
-  const { settings, status } = await chrome.storage.local.get(['settings', 'status']);
+  el('extension-version').textContent = `v${chrome.runtime.getManifest().version}`;
+  const { settings, status, liveCaptureQueue } = await chrome.storage.local.get(['settings', 'status', 'liveCaptureQueue']);
+  const entries = Object.values(liveCaptureQueue ?? {});
+  const indexed = entries.filter(item => item.indexedAt).length;
+  el('live-capture').textContent = `Live capture: ${indexed} indexed in HSTRY, ${entries.length - indexed} waiting for indexing; ${entries.length} await canonical confirmation`;
+
   const merged = { ...DEFAULTS, ...settings, providers: { ...DEFAULTS.providers, ...settings?.providers } };
   el('api-detail').textContent = `http://127.0.0.1:${merged.port}`;
   el('schedule').textContent = `Every ${merged.intervalMinutes} minute${merged.intervalMinutes === 1 ? '' : 's'}`;
@@ -58,7 +81,7 @@ el('sync').addEventListener('click', async () => {
 });
 el('settings').addEventListener('click', () => chrome.runtime.openOptionsPage());
 el('retry').addEventListener('click', checkApi);
-chrome.storage.onChanged.addListener(changes => { if (changes.status || changes.settings) render(); });
+chrome.storage.onChanged.addListener(changes => { if (changes.status || changes.settings || changes.liveCaptureQueue) render(); });
 
 await render();
 await checkApi();

@@ -24,7 +24,7 @@ pub struct ReadArgs {
     /// Entire serialized response budget, including metadata (1000..1000000).
     #[arg(long, default_value_t = 3000)]
     pub max_chars: usize,
-    /// content or parts/N/input or parts/N/output, as returned by a read page.
+    /// content, visible parts/N/text, or tool parts/N/input or parts/N/output.
     #[arg(long)]
     pub field: Option<String>,
     /// Unicode character offset in one anchored field.
