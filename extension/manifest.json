@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "hstry sync",
-  "version": "0.4.23",
+  "version": "0.4.24",
   "description": "Capture ChatGPT personal and project conversations into the private local hstry archive.",
   "permissions": [
     "alarms",
@@ -22,7 +22,7 @@
     "default_title": "hstry sync",
     "default_popup": "popup.html"
   },
-  "version_name": "0.4.23 HSTRY stale-tab reinjection repair",
+  "version_name": "0.4.24 HSTRY reload reinjection fix",
   "content_scripts": [
     {
       "matches": [
