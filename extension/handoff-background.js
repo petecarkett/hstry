@@ -85,7 +85,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
 });
 
 // A runtime.reload() does not reinject content scripts into already-open
-// chats. Run once per installed version so stale DOM buttons get fresh handlers.
+// chats. Run once per loaded extension context, including same-version reloads.
 const CONTENT_VERSION_KEY = 'hstryTakeoverContentVersion';
 let contentRefresh;
 function refreshOpenChatScripts() {
@@ -93,7 +93,7 @@ function refreshOpenChatScripts() {
   contentRefresh = (async () => {
     if (!chrome.scripting?.executeScript) return;
     const version = chrome.runtime.getManifest().version;
-    const saved = await chrome.storage.local.get(CONTENT_VERSION_KEY);
+    const saved = await chrome.storage.session.get(CONTENT_VERSION_KEY);
     if (saved[CONTENT_VERSION_KEY] === version) return;
     const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
     // A suspended tab can leave executeScript pending indefinitely. Bound the
@@ -102,7 +102,7 @@ function refreshOpenChatScripts() {
       chrome.scripting.executeScript({ target: { tabId: tab.id },
         files: ['handoff-content.js'] })));
     await Promise.race([injections, new Promise(resolve => setTimeout(resolve, 3000))]);
-    await chrome.storage.local.set({ [CONTENT_VERSION_KEY]: version });
+    await chrome.storage.session.set({ [CONTENT_VERSION_KEY]: version });
   })().catch(() => {}).finally(() => { contentRefresh = null; });
   return contentRefresh;
 }
