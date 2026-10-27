@@ -29,7 +29,7 @@
   } catch { /* Session storage is optional; normal clicks still work. */ }
 
   const WARNING = /you(?:'|\u2019)ve\s+reached\s+the\s+maximum\s+length\s+for\s+this\s+conversation/i;
-  const WAIT_MS = 45_000;
+  let resumeWhenComposerReady = false;
   let started = false;
   let detectionTimer;
   let handoffStarted = false;
@@ -157,7 +157,8 @@
   }
 
   async function takeOverIfPending() {
-    if (handoffStarted || checkingHandoff) return;
+    if (handoffStarted || checkingHandoff ||
+        (resumeWhenComposerReady && !editableElement())) return;
     checkingHandoff = true;
     let result;
     try { result = await send({ type:'HSTRY_TAKEOVER_POLL' }); }
@@ -166,15 +167,17 @@
     if (!result?.ok || !result.found || handoffStarted) return;
     handoffStarted = true;
     const prompt = result.prompt;
-    const startedAt = Date.now();
     try {
-      let editor;
-      while (Date.now() - startedAt < WAIT_MS) {
-        editor = editableElement();
-        if (editor) break;
-        await pause(600);
+      const editor = editableElement();
+      if (!editor) {
+        // ChatGPT may render its composer after the page has loaded.
+        // Keep the pending handoff and resume on the existing DOM observer.
+        resumeWhenComposerReady = true;
+        handoffStarted = false;
+        scheduleWarningCheck();
+        return;
       }
-      if (!editor) throw new Error('ChatGPT composer did not load');
+      resumeWhenComposerReady = false;
       if (!enterPrompt(editor, prompt)) throw new Error('ChatGPT did not accept the takeover text');
       // Wait for ChatGPT to enable its native send control.
       let button;
@@ -201,7 +204,7 @@
   if (location.pathname === '/' || /^\/g\/g-p-[0-9a-f]{32}(?:-[a-z0-9-]+)?(?:\/project)?\/?$/i.test(location.pathname)) {
     let retries = 0;
     const poll = setInterval(() => {
-      if (handoffStarted || ++retries > 30) return clearInterval(poll);
+      if (handoffStarted || resumeWhenComposerReady || ++retries > 30) return clearInterval(poll);
       takeOverIfPending();
     }, 800);
     takeOverIfPending();
@@ -212,6 +215,10 @@
     clearTimeout(detectionTimer);
     detectionTimer = setTimeout(() => {
       detectLimit();
+      if (resumeWhenComposerReady && editableElement()) {
+        resumeWhenComposerReady = false;
+        void takeOverIfPending();
+      }
       if (document.getElementById('hstry-continue-chat')) observer?.disconnect();
     }, 700);
   }
