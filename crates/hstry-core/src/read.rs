@@ -99,6 +99,10 @@ pub struct ReadPage {
     pub version: i64,
     pub completeness: String,
     pub absence_is_global: bool,
+    /// Browser-observed turns awaiting authoritative ChatGPT reconciliation.
+    pub unverified_live_messages: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_live_observed_at: Option<String>,
     pub order: String,
     pub offset: usize,
     pub total: usize,
@@ -152,6 +156,17 @@ impl Database {
                 "Conversation changed; restart pagination with its new version".into(),
             ));
         }
+        let live = sqlx::query(
+            "SELECT COUNT(*) AS unverified, MAX(CAST(json_extract(metadata,'$.observedAt') AS INTEGER)) AS observed FROM messages WHERE conversation_id=? AND json_extract(metadata,'$.liveProvisional')=1"
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        let unverified_live_messages: i64 = live.get("unverified");
+        let latest_live_observed_at: Option<String> = live
+            .get::<Option<i64>, _>("observed")
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|time| time.to_rfc3339());
         let rows = sqlx::query(
             r#"
                 SELECT m.id, m.idx, m.role
@@ -255,6 +270,8 @@ impl Database {
             version,
             completeness: "unknown".into(),
             absence_is_global: false,
+            unverified_live_messages,
+            latest_live_observed_at,
             order: if anchor.is_some() {
                 "anchor_first"
             } else {

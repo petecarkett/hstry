@@ -19,9 +19,11 @@ globalThis.fetch = async url => {
     a: { account: { account_id: 'acct1', structure: 'personal' } },
   } });
   if (path === '/backend-api/gizmos/snorlax/sidebar') return Response.json({ items: [], cursor: null });
-  if (path === '/backend-api/conversations') return Response.json({
-    items: [{ id: conversationId, update_time: old }], total: 1,
-  });
+  if (path === '/backend-api/conversations') return Response.json(
+    new URL(url).searchParams.get('is_archived') === 'true'
+      ? { items: [], total: 0 }
+      : { items: [{ id: conversationId, update_time: old }], total: 1 }
+  );
   if (path === `/backend-api/conversation/${conversationId}`) return Response.json({
     id: conversationId, title: 'Test', create_time: old, update_time: old,
     current_node: messageId, mapping: {
@@ -35,8 +37,9 @@ globalThis.fetch = async url => {
   throw new Error(`Unexpected request ${path}`);
 };
 
-const run = () => syncChatGPT({
-  state: {},
+const run = (state = {}, pendingLiveConversationIds = []) => syncChatGPT({
+  state,
+  pendingLiveConversationIds,
   register: async () => {}, report: async () => {}, checkpoint: async () => {},
   push: async (_source, _adapter, convs) => {
     ingests++;
@@ -53,8 +56,15 @@ const run = () => syncChatGPT({
 });
 
 try {
-  await run();
+  const initial = await run();
   assert.equal(canonicalCalls, 1, 'successful canonical ingestion clears confirmed capture');
+  assert.equal(Object.keys(pending).length, 0);
+  const staleState = { accounts: { acct1: { lastSyncMs: Date.now(), projects: {} } } };
+  const stale = await run(staleState);
+  assert.equal(stale.conversations, 0, 'unchanged listing skips canonical reads without pending captures');
+  pending = appendLiveCapture({}, observed);
+  await run(staleState, [conversationId]);
+  assert.equal(canonicalCalls, 2, 'pending browser capture overrides stale listing timestamp');
   assert.equal(Object.keys(pending).length, 0);
   // Construct another pending message and assert a failed ingest cannot settle it.
   pending = appendLiveCapture({}, observed);
