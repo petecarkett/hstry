@@ -3,6 +3,7 @@ use hstry_core::db::{Database, SearchOptions};
 use hstry_core::ingest::ingest_batch;
 use hstry_core::live::{LiveCapture, ingest_live_capture};
 use hstry_core::parsed::ParsedConversation;
+use hstry_core::read::ReadOptions;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -33,6 +34,14 @@ async fn live_turns_search_and_merge_without_duplicates() -> Result<()> {
         "unchanged"
     );
     let id = db.get_conversation_id(source, conversation).await?.unwrap();
+    let live_page = db.read_page(id, ReadOptions::default()).await?;
+    assert_eq!(live_page.completeness, "unknown");
+    assert_eq!(live_page.unverified_live_messages, 1);
+    assert_eq!(
+        live_page.latest_live_observed_at,
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(live.observed_at)
+            .map(|time| time.to_rfc3339())
+    );
     let stored = db
         .get_conversation_by_reference(Some(source), Some(conversation), None, None, None)
         .await?
@@ -100,6 +109,10 @@ async fn live_turns_search_and_merge_without_duplicates() -> Result<()> {
     assert_eq!(messages[0].idx, 0);
     assert_eq!(messages[0].client_id.as_deref(), Some(message));
     assert_eq!(messages[0].content, "distinctive canonical needle final");
+    let canonical_page = db.read_page(id, ReadOptions::default()).await?;
+    assert_eq!(canonical_page.unverified_live_messages, 0);
+    assert_eq!(canonical_page.latest_live_observed_at, None);
+    assert_eq!(canonical_page.completeness, "unknown");
     let hits = db.search("distinctive", SearchOptions::default()).await?;
     assert_eq!(hits.len(), 1, "no extra provisional search result");
     // A partial canonical detail can know the exact project ID but not its

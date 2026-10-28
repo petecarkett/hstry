@@ -524,6 +524,7 @@ export async function syncChatGPT({
   report = async () => {},
   checkpoint = async () => {},
   onCanonicalIngest = async () => {},
+  pendingLiveConversationIds = [],
 }) {
   await report({ phase: 'discovering' });
   const queueDiscovery = async (error, endpoint = 'discovery') => {
@@ -689,6 +690,7 @@ export async function syncChatGPT({
     sourceRoutes: pending.scopes.map(scope => ({ accountId: scope.accountId,
       sourceId: scope.sourceId, projectId: scope.projectId,
       projectName: scope.projectName })) };
+  const pendingLive = new Set(pendingLiveConversationIds);
   const paceMinutes = () => paceMs(newState) / 60_000;
   const outstanding = () => unresolvedFailureCount({ ...newState, pending });
   const clearDeferredStatus = () => {
@@ -958,8 +960,10 @@ export async function syncChatGPT({
       const retryDueMs = previousFailure?.nextRetryAtMs ??
         (previousFailure?.lastFailedAtMs ?? 0) + RETRY_BASE_MS;
       // A listed conversation cannot bypass a targeted retry's cooldown.
-      const needsDetail = (!since || !updatedMs || updatedMs > since) &&
-        (!previousFailure || Date.now() >= retryDueMs);
+      // ChatGPT may leave the listing timestamp unchanged after new visible
+      // turns. Outstanding browser captures require canonical reconciliation.
+      const needsDetail = (!since || !updatedMs || updatedMs > since ||
+        pendingLive.has(item.id)) && (!previousFailure || Date.now() >= retryDueMs);
       if (needsDetail) {
         try {
           const headers = authHeaders(token, scope.accountId);

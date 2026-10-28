@@ -378,7 +378,12 @@ async function runSync(
           push,
           register,
           report,
-          ...(name === 'chatgpt' ? { onCanonicalIngest: settleLiveCapture } : {}),
+          ...(name === 'chatgpt' ? {
+            onCanonicalIngest: settleLiveCapture,
+            pendingLiveConversationIds: [...new Set(Object.values(
+              (await chrome.storage.local.get(LIVE_KEY))[LIVE_KEY] ?? {}
+            ).map(item => item.conversationId).filter(Boolean))],
+          } : {}),
           checkpoint: async state => {
             entry.state = state;
             entry.lastDeferredHttpStatus = state.pending?.lastDeferredHttpStatus ??
