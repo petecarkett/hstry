@@ -27,7 +27,7 @@ const editor = {
 const sendButton = {
   disabled: false,
   getBoundingClientRect: () => ({ width: 42, height: 42 }),
-  click: () => { composerSends++; },
+  click: () => { composerSends++; editorValue = ''; },
 };
 const context = {
   document: {
@@ -41,6 +41,7 @@ const context = {
       return [];
     },
     createElement: () => { bannerCount++; return {}; },
+    addEventListener() {},
     createRange: () => ({ selectNodeContents() {} }),
     execCommand: (cmd, _ui, text) => {
       assert.equal(cmd, 'insertText');
@@ -109,7 +110,7 @@ ready = true;
 observerCallback(); // The React composer arrives after the initial page load.
 flushTimers();
 await settle();
-assert.equal(editorValue, 'HSTRY recovery fixture prompt');
+assert.equal(editorValue, '', 'native submit clears the input');
 assert.equal(composerSends, 1);
 assert.equal(finished, true);
 assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_DONE']);

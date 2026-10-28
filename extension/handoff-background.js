@@ -1,6 +1,8 @@
 import { parseConversationUrl, takeoverPrompt } from './handoff-core.js';
 
 const PREFIX = 'hstryTakeoverTab:';
+const SOURCE_PREFIX = 'hstryTakeoverSource:';
+const activeStarts = new Map();
 const MAX_AGE_MS = 30 * 60_000;
 const TYPE = 'HSTRY_TAKEOVER_';
 
@@ -19,25 +21,55 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'HSTRY_TAKEOVER_START') {
-    return replyAsync(sendResponse, (async () => {
-      const parsed = parseConversationUrl(sender.url || senderTab.url || '');
-      if (!parsed) throw new Error('Open an existing ChatGPT conversation first.');
-      if (parseConversationUrl(senderTab.url || '')?.id !== parsed.id) {
-        throw new Error('Conversation changed during takeover; try again.');
+    const parsed = parseConversationUrl(sender.url || senderTab.url || '');
+    if (!parsed || parseConversationUrl(senderTab.url || '')?.id !== parsed.id) {
+      sendResponse({ ok: false, error: 'Open the original ChatGPT conversation first.' });
+      return false;
+    }
+    const current = activeStarts.get(parsed.id);
+    if (current) return replyAsync(sendResponse, current);
+    const task = (async () => {
+      const sourceKey = SOURCE_PREFIX + parsed.id;
+      const prior = (await chrome.storage.local.get(sourceKey))[sourceKey];
+      if (prior?.status === 'completed') {
+        return { existing: true, completed: true, tabId: prior.tabId };
+      }
+      if (Number.isInteger(prior?.tabId)) {
+        const tab = await chrome.tabs.get(prior.tabId).catch(() => null);
+        if (tab?.url?.startsWith('https://chatgpt.com/')) {
+          return { existing: true, tabId: tab.id };
+        }
       }
       const entries = Object.values((await chrome.storage.local.get('liveCaptureQueue')).liveCaptureQueue || {});
       const pending = entries.filter(v => v && !v.indexedAt &&
         (v.conversationId === parsed.id || v.conversation_id === parsed.id)).length;
-      const tab = await chrome.tabs.create({ url: parsed.landing, active: true });
-      if (!Number.isInteger(tab.id)) throw new Error('New ChatGPT tab was not created.');
-      await chrome.storage.session.set({ [PREFIX + tab.id]: {
-        original: parsed.original, project: parsed.project,
-        prompt: takeoverPrompt(parsed.original, pending),
-        createdAt: Date.now(), sourceTabId: senderTab.id,
-      } });
-      chrome.tabs.sendMessage(tab.id, { type: 'HSTRY_TAKEOVER_WAKE' }).catch(() => {});
-      return { tabId: tab.id, pendingCaptures: pending };
-    })());
+      let tab;
+      try {
+        tab = await chrome.tabs.create({ url: parsed.landing, active: true });
+        if (!Number.isInteger(tab.id)) throw new Error('New ChatGPT tab was not created.');
+        await chrome.storage.session.set({ [PREFIX + tab.id]: {
+          original: parsed.original, project: parsed.project,
+          prompt: takeoverPrompt(parsed.original, pending),
+          createdAt: Date.now(), sourceTabId: senderTab.id,
+        } });
+        await chrome.storage.local.set({ [sourceKey]: {
+          status: 'started', tabId: tab.id, startedAt: Date.now(),
+        } });
+        chrome.tabs.sendMessage(tab.id, { type: 'HSTRY_TAKEOVER_WAKE' }).catch(() => {});
+        return { tabId: tab.id, pendingCaptures: pending };
+      } catch (error) {
+        if (Number.isInteger(tab?.id)) {
+          await chrome.storage.session.remove(PREFIX + tab.id).catch(() => {});
+          await chrome.tabs.remove(tab.id).catch(() => {});
+        }
+        throw error;
+      }
+    })();
+    activeStarts.set(parsed.id, task);
+    void task.finally(() => {
+      if (activeStarts.get(parsed.id) === task) activeStarts.delete(parsed.id);
+    }).catch(() => {});
+    return replyAsync(sendResponse, task);
   }
 
   if (msg.type === 'HSTRY_TAKEOVER_POLL' || msg.type === 'HSTRY_TAKEOVER_DONE') {
@@ -53,10 +85,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (current.protocol !== 'https:' || !['chatgpt.com', 'chat.openai.com'].includes(current.hostname)) {
         throw new Error('Takeover destination is not ChatGPT.');
       }
+      const original = parseConversationUrl(record.original);
+      if (!original) throw new Error('Stored takeover source is invalid.');
+      const sourceKey = SOURCE_PREFIX + original.id;
       if (msg.type === 'HSTRY_TAKEOVER_DONE') {
+        await chrome.storage.local.set({ [sourceKey]: {
+          status: 'completed', tabId: senderTab.id, completedAt: Date.now(),
+        } });
         await chrome.storage.session.remove(key);
         return { found: false, completed: true };
       }
+      const receipt = (await chrome.storage.local.get(sourceKey))[sourceKey];
+      if (receipt?.status === 'completed') return { found: false, completed: true };
       return { found: true, prompt: record.prompt, original: record.original };
     })());
   }

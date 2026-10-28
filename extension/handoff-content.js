@@ -4,8 +4,14 @@
   // A page can outlive an extension reload. Old booleans must not block
   // the new version from replacing an orphaned click handler.
   const version = chrome.runtime.getManifest().version;
-  if (window.__hstryOneclickInstalled === version) return;
-  window.__hstryOneclickInstalled = version;
+  const previous = window.__hstryOneclickInstalled;
+  try {
+    if (previous?.version === version && previous.isLive?.()) return;
+  } catch { /* An earlier extension context may already be invalidated. */ }
+  window.__hstryOneclickInstalled = { version, isLive: () => {
+    try { return !!chrome.runtime?.id && chrome.runtime.getManifest().version === version; }
+    catch { return false; }
+  } };
   // A prior extension instance can leave an orphaned DOM button behind.
   // Replace it so its invalidated click handler can no longer be invoked.
   document.getElementById('hstry-continue-chat')?.remove();
@@ -30,11 +36,28 @@
 
   const WARNING = /you(?:'|\u2019)ve\s+reached\s+the\s+maximum\s+length\s+for\s+this\s+conversation/i;
   let resumeWhenComposerReady = false;
+  let submittedPath = null;
   let started = false;
   let detectionTimer;
   let handoffStarted = false;
   let checkingHandoff = false;
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  // Only newly reached limits after a real user submission auto-continue.
+  // Existing expired chats opened after an update retain their manual button.
+  document.addEventListener('click', event => {
+    if (event.target?.closest?.('button[data-testid="send-button"], '+
+        'button[aria-label="Send prompt"], button[aria-label="Send message"], '+
+        'button[aria-label="Send"]')) submittedPath = location.pathname;
+  }, true);
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey &&
+        !event.metaKey && !event.altKey && !event.isComposing &&
+        event.target?.closest?.('#prompt-textarea, [data-testid="prompt-textarea"], '+
+          '[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"]')) {
+      submittedPath = location.pathname;
+    }
+  }, true);
 
   const send = msg => new Promise((resolve, reject) => {
     try {
@@ -46,14 +69,14 @@
     } catch (err) { reject(err); }
   });
 
-  async function startTakeover(btn) {
+  async function startTakeover(btn, automatic = false) {
     if (btn.disabled) return;
     btn.disabled = true;
     btn.textContent = 'Opening continuation...';
     try {
-      const result = await send({ type: 'HSTRY_TAKEOVER_START' });
+      const result = await send({ type: 'HSTRY_TAKEOVER_START', automatic });
       if (!result?.ok) throw new Error(result?.error || 'Unable to open the new chat');
-      btn.textContent = 'Opened continuation tab';
+      btn.textContent = result.existing ? 'Continuation already opened' : 'Opened continuation tab';
     } catch (err) {
       btn.disabled = false;
       btn.textContent = 'Continue with HSTRY';
@@ -103,7 +126,11 @@
     native.insertAdjacentElement('afterend', btn);
     if (resumePending) {
       resumePending = false;
+      submittedPath = null;
       void startTakeover(btn);
+    } else if (submittedPath === location.pathname) {
+      submittedPath = null;
+      void startTakeover(btn, true);
     }
   }
 
@@ -188,6 +215,17 @@
       }
       if (!button) throw new Error('Takeover text is ready; send it manually');
       button.click();
+      // A native click alone is not a successful submission. Keep the handoff
+      // pending if ChatGPT leaves the instruction in the composer.
+      let submitted = false;
+      for (let i = 0; i < 40; i++) {
+        if (!(editor.value || editor.textContent || '').includes(prompt.slice(0, 32))) {
+          submitted = true;
+          break;
+        }
+        await pause(250);
+      }
+      if (!submitted) throw new Error('Takeover text remains in the composer; send it manually');
       await send({ type:'HSTRY_TAKEOVER_DONE' });
     } catch (e) {
       fallbackBanner('HSTRY takeover: ' + String(e.message || e) +
