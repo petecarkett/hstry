@@ -21,8 +21,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'HSTRY_TAKEOVER_START') {
-    const parsed = parseConversationUrl(sender.url || senderTab.url || '');
-    if (!parsed || parseConversationUrl(senderTab.url || '')?.id !== parsed.id) {
+    // ChatGPT uses SPA navigation: sender.url can remain the frame's original
+    // URL after the active tab has moved to another conversation.
+    const parsed = parseConversationUrl(senderTab.url || '');
+    if (!parsed || !/^https:\/\/chatgpt\.com(?:\/|$)/.test(sender.url || '')) {
       sendResponse({ ok: false, error: 'Open the original ChatGPT conversation first.' });
       return false;
     }

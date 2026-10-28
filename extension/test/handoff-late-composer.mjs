@@ -50,6 +50,7 @@ const context = {
     },
   },
   location: { pathname: '/' },
+  addEventListener() {},
   sessionStorage: { getItem: () => null, removeItem: () => {} },
   HTMLTextAreaElement: class TextArea {},
   getSelection: () => ({ removeAllRanges() {}, addRange() {} }),

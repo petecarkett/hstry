@@ -37,6 +37,7 @@
   const WARNING = /you(?:'|\u2019)ve\s+reached\s+the\s+maximum\s+length\s+for\s+this\s+conversation/i;
   let resumeWhenComposerReady = false;
   let submittedPath = null;
+  let autoAttemptedPath = null;
   let started = false;
   let detectionTimer;
   let handoffStarted = false;
@@ -99,10 +100,21 @@
     }
   }
 
+  function autoContinue(btn) {
+    if (autoAttemptedPath === location.pathname) return;
+    const active = document.visibilityState === 'visible' && document.hasFocus();
+    if (submittedPath === location.pathname || active) {
+      autoAttemptedPath = location.pathname;
+      submittedPath = null;
+      void startTakeover(btn, true);
+    }
+  }
+
   function detectLimit() {
-    if (document.getElementById('hstry-continue-chat')) return;
     if (!/\/c\/[0-9a-f-]{36}/i.test(location.pathname)) return;
     if (!WARNING.test(document.body?.textContent || '')) return;
+    const existing = document.getElementById('hstry-continue-chat');
+    if (existing) { autoContinue(existing); return; }
     const native = [...document.querySelectorAll('button, a')].find(node =>
       /start new chat/i.test(node.textContent || ''));
     if (!native) return;
@@ -128,9 +140,8 @@
       resumePending = false;
       submittedPath = null;
       void startTakeover(btn);
-    } else if (submittedPath === location.pathname) {
-      submittedPath = null;
-      void startTakeover(btn, true);
+    } else {
+      autoContinue(btn);
     }
   }
 
@@ -257,9 +268,10 @@
         resumeWhenComposerReady = false;
         void takeOverIfPending();
       }
-      if (document.getElementById('hstry-continue-chat')) observer?.disconnect();
     }, 700);
   }
+  window.addEventListener('focus', scheduleWarningCheck);
+  document.addEventListener('visibilitychange', scheduleWarningCheck);
   if (document.body) {
     observer = new MutationObserver(scheduleWarningCheck);
     observer.observe(document.body, { childList: true, subtree: true });
