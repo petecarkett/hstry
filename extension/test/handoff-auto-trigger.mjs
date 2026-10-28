@@ -6,7 +6,9 @@ const script = readFileSync(new URL('../handoff-content.js', import.meta.url), '
 const warning = "You've reached the maximum length for this conversation. You can keep talking by starting a new chat.";
 const path = '/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/6add53d9-4c88-83ed-a57d-6a602a257293';
 
-function mount(initialWarning, previous = null) {
+function mount(initialWarning, previous = null, active = false) {
+  let visible = active;
+  let focused = active;
   let reachedLimit = initialWarning;
   let button = null;
   let clickButton = null;
@@ -15,6 +17,7 @@ function mount(initialWarning, previous = null) {
   const timers = new Map();
   let nextTimer = 0;
   let observer;
+  let observing = false;
   const panel = { get textContent() { return warning; }, parentElement: null };
   const native = {
     textContent: 'Start new chat',
@@ -23,6 +26,8 @@ function mount(initialWarning, previous = null) {
   };
   const document = {
     body: { get textContent() { return reachedLimit ? warning : ''; }, append() {} },
+    get visibilityState() { return visible ? 'visible' : 'hidden'; },
+    hasFocus: () => focused,
     getElementById(id) { return id === 'hstry-continue-chat' ? button : null; },
     querySelectorAll(query) { return query === 'button, a' ? [native] : []; },
     createElement() {
@@ -36,10 +41,11 @@ function mount(initialWarning, previous = null) {
   const location = { pathname: path, reload() { throw Error('reload unexpected'); } };
   const context = {
     document, location,
+    addEventListener(type, handler) { events.set(`window:${type}`, handler); },
     chrome: {
       runtime: {
         id: 'hstry-extension',
-        getManifest: () => ({ version: '0.4.26' }),
+        getManifest: () => ({ version: '0.4.28' }),
         lastError: null,
         onMessage: { addListener() {} },
         sendMessage(message, done) {
@@ -54,7 +60,8 @@ function mount(initialWarning, previous = null) {
     setInterval() { return 1; }, clearInterval() {},
     MutationObserver: class {
       constructor(callback) { observer = callback; }
-      observe() {} disconnect() {}
+      observe() { observing = true; }
+      disconnect() { observing = false; }
     },
   };
   context.window = context;
@@ -69,7 +76,9 @@ function mount(initialWarning, previous = null) {
   return {
     sent,
     get button() { return button; },
-    flush, mutate() { observer(); },
+    flush, mutate() { if (observing) observer(); },
+    redrawPanel() { button = null; if (observing) observer(); },
+    focus() { visible = true; focused = true; events.get('window:focus')?.(); },
     setLimited(value = true) { reachedLimit = value; },
     setPath(value) { location.pathname = value; },
     submitByClick() {
@@ -97,6 +106,26 @@ existing.manualClick();
 await tick();
 assert.equal(existing.sent.length, 1);
 assert.equal(existing.sent[0].automatic, false);
+
+const alreadyFull = mount(true, null, true);
+alreadyFull.flush();
+await tick();
+assert.equal(alreadyFull.sent.length, 1, 'focused, already-full chat must automatically continue');
+assert.equal(alreadyFull.sent[0].automatic, true);
+alreadyFull.redrawPanel();
+alreadyFull.flush();
+await tick();
+assert.ok(alreadyFull.button, 'React redraw must restore the takeover button');
+assert.equal(alreadyFull.sent.length, 1, 'React redraw must not create a second continuation');
+
+const asleep = mount(true);
+asleep.flush();
+await tick();
+assert.equal(asleep.sent.length, 0, 'inactive expired tab must not auto-open');
+asleep.focus();
+asleep.flush();
+await tick();
+assert.equal(asleep.sent.length, 1, 'returning to expired tab triggers one continuation');
 
 const current = mount(false);
 current.flush();
@@ -133,11 +162,11 @@ changedChat.flush();
 await tick();
 assert.equal(changedChat.sent.length, 0, 'activity in another conversation is not a trigger');
 
-const obsolete = mount(true, { version: '0.4.26', isLive: () => false });
+const obsolete = mount(true, { version: '0.4.28', isLive: () => false });
 obsolete.flush();
 assert.ok(obsolete.button, 'stale same-version context must be replaced');
-const live = mount(true, { version: '0.4.26', isLive: () => true });
+const live = mount(true, { version: '0.4.28', isLive: () => true });
 live.flush();
 assert.equal(live.button, null, 'healthy same-version handler remains installed');
 
-console.log('PASS automatic continuation is event-driven, scoped and nonduplicating');
+console.log('PASS automatic continuation handles already-full focused chats, SPA and DOM redraws without duplicates');

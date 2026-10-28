@@ -10,7 +10,7 @@ const on = { addListener() {} };
 
 globalThis.chrome = {
   runtime: {
-    id: 'test-hstry-extension', getManifest: () => ({ version: '0.4.26' }),
+    id: 'test-hstry-extension', getManifest: () => ({ version: '0.4.28' }),
     onInstalled: on, onMessage: { addListener(fn) { listener = fn; } },
   },
   tabs: {
@@ -48,22 +48,26 @@ globalThis.chrome = {
 };
 await import(new URL('../handoff-background.js?test=first', import.meta.url));
 
-const send = (url, type, tabId, automatic = false) => new Promise(resolve => {
-  const sender = { id: chrome.runtime.id, frameId: 0, url, tab: { id: tabId, url } };
+const send = (url, type, tabId, automatic = false, frameUrl = url) => new Promise(resolve => {
+  const sender = { id: chrome.runtime.id, frameId: 0, url: frameUrl, tab: { id: tabId, url } };
   const keepOpen = listener({ type, automatic }, sender, resolve);
   assert.equal(keepOpen, true);
 });
 
 const [first, same] = await Promise.all([
-  send(original, 'HSTRY_TAKEOVER_START', 1, true),
+  send(original, 'HSTRY_TAKEOVER_START', 1, true, 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood'),
   send(original, 'HSTRY_TAKEOVER_START', 2, true),
 ]);
 assert.equal(first.ok, true);
 assert.equal(first.tabId, same.tabId);
-assert.equal(createCount, 1, 'two source tabs must not create two continuations');
+assert.equal(createCount, 1, 'SPA frame URL must not reject a valid current tab or create duplicates');
 assert.ok(first.tabId > 0);
 assert.equal(tabs.get(first.tabId).url,
   'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood');
+
+const invalid = await send('https://chatgpt.com/', 'HSTRY_TAKEOVER_START', 1, true, original);
+assert.equal(invalid.ok, false, 'landing tab cannot impersonate a source conversation');
+assert.equal(createCount, 1);
 
 const repeated = await send(original, 'HSTRY_TAKEOVER_START', 1, false);
 assert.equal(repeated.ok, true);
