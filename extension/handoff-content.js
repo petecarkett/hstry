@@ -72,12 +72,21 @@
 
   async function startTakeover(btn, automatic = false) {
     if (btn.disabled) return;
+    const editor = editableElement();
+    const hasDraft = !!(editor?.value || editor?.textContent || '').trim();
+    const hasFiles = [...document.querySelectorAll('input[type="file"]')]
+      .some(input => input.files?.length);
+    if (hasDraft || hasFiles || document.querySelector?.(
+      '[aria-label="Remove attachment"], [data-testid="attachment-preview"]')) {
+      fallbackBanner('HSTRY paused: save or send the unsent draft or attachment before continuing.');
+      return;
+    }
     btn.disabled = true;
     btn.textContent = 'Opening continuation...';
     try {
       const result = await send({ type: 'HSTRY_TAKEOVER_START', automatic });
       if (!result?.ok) throw new Error(result?.error || 'Unable to open the new chat');
-      btn.textContent = result.existing ? 'Continuation already opened' : 'Opened continuation tab';
+      btn.textContent = result.existing ? 'Continuation already opened' : 'Continuing in this tab';
     } catch (err) {
       btn.disabled = false;
       btn.textContent = 'Continue with HSTRY';
