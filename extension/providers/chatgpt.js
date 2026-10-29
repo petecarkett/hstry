@@ -506,6 +506,15 @@ function toParsedConversation(detail, item, scope) {
   };
 }
 
+const isNonRetryableAccess = failure =>
+  failure?.accessVerification?.code === 'conversation_inaccessible' &&
+  failure.accessVerification.canRetry === false;
+
+const isIgnoredConversation = (state, id, scope) =>
+  (state?.ignoredFailures ?? []).some(record =>
+    record.conversationId === id && record.accountKey === scope.accountKey &&
+    (record.projectId ?? null) === (scope.projectId ?? null));
+
 function unresolvedFailureCount(state) {
   const records = Array.isArray(state?.failureDetails) ? state.failureDetails : [];
   return Math.max(
@@ -724,6 +733,7 @@ export async function syncChatGPT({
       failure.accountId = scope.accountId;
       failure.sourceId = scope.sourceId;
     }
+    if (isNonRetryableAccess(failure)) delete failure.nextRetryAtMs;
   }
   let total = 0;
   let thisRun = 0;
@@ -768,7 +778,8 @@ export async function syncChatGPT({
   // retry time BEFORE fetching so a killed worker cannot hammer one timeout.
   const now = Date.now();
   const failure = !scanTurn && failureDetails.find(detail =>
-    !detail.resolvedAtMs && detail.sourceId &&
+    !detail.resolvedAtMs && detail.sourceId && !isNonRetryableAccess(detail) &&
+    !isIgnoredConversation(newState, detail.conversationId, detail) &&
     (detail.nextRetryAtMs ??
       ((detail.lastFailedAtMs ?? 0) + RETRY_BASE_MS)) <= now);
   if (failure) {
@@ -834,6 +845,13 @@ export async function syncChatGPT({
         delete failure.lastTransportError;
       }
       failure.lastFailedAtMs = Date.now();
+      if (error.code === 'conversation_inaccessible' && error.canRetry === false) {
+        failure.accessVerification = {
+          code: error.code, canRetry: false,
+          source: 'ChatGPT conversation detail', verifiedAtMs: Date.now(),
+        };
+        delete failure.nextRetryAtMs;
+      }
       await checkpointNow();
       log(`chatgpt: targeted retry of ${failure.conversationId} failed: ${failure.errorType}`);
     }
@@ -962,8 +980,10 @@ export async function syncChatGPT({
       // A listed conversation cannot bypass a targeted retry's cooldown.
       // ChatGPT may leave the listing timestamp unchanged after new visible
       // turns. Outstanding browser captures require canonical reconciliation.
-      const needsDetail = (!since || !updatedMs || updatedMs > since ||
-        pendingLive.has(item.id)) && (!previousFailure || Date.now() >= retryDueMs);
+      const needsDetail = !isIgnoredConversation(newState, item.id, itemScope) &&
+        !isNonRetryableAccess(previousFailure) &&
+        (!since || !updatedMs || updatedMs > since || pendingLive.has(item.id)) &&
+        (!previousFailure || Date.now() >= retryDueMs);
       if (needsDetail) {
         try {
           const headers = authHeaders(token, scope.accountId);
@@ -997,7 +1017,12 @@ export async function syncChatGPT({
               sourceId: scope.sourceId, errorType: reason,
               attempts: (previous?.attempts ?? 0) + 1,
               lastFailedAtMs: Date.now(), resolvedAtMs: null,
-              nextRetryAtMs: Date.now() + retryDelayMs((previous?.attempts ?? 0) + 1),
+              ...(err.code === 'conversation_inaccessible' && err.canRetry === false
+                ? { accessVerification: {
+                  code: err.code, canRetry: false,
+                  source: 'ChatGPT conversation detail', verifiedAtMs: Date.now(),
+                } }
+                : { nextRetryAtMs: Date.now() + retryDelayMs((previous?.attempts ?? 0) + 1) }),
             });
             pending.scopeTrackedFailures = (pending.scopeTrackedFailures ?? 0) + 1;
           } else {

@@ -340,7 +340,9 @@ async function runSync(
     selected.map(async ([name, provider]) => {
       const entry = {
         ...(status[name] ?? {}),
-        ...(full && name === onlyProvider ? { state: {} } : {}),
+        ...(full && name === onlyProvider ? { state: {
+          ignoredFailures: status[name]?.state?.ignoredFailures ?? [],
+        } } : {}),
         lastRunMs: Date.now(),
         trigger,
         running: true,
@@ -402,8 +404,13 @@ async function runSync(
         // A saved batch is not a completed sync across all project scopes.
         if (!result.hasMore && !result.failures) entry.lastSuccessMs = Date.now();
         entry.lastCount = result.conversations;
+        const inaccessible = (entry.state?.failureDetails ?? []).filter(failure =>
+          !failure.resolvedAtMs && failure.accessVerification?.code ===
+          'conversation_inaccessible' && failure.accessVerification.canRetry === false).length;
         entry.lastError = result.failures
-          ? `${result.failures} conversation request(s) failed; they will be retried on the next poll`
+          ? inaccessible === result.failures
+            ? `${inaccessible} conversation(s) inaccessible; account access is required`
+            : `${result.failures} conversation(s) unresolved; ${inaccessible} inaccessible, others retryable`
           : null;
         entry.running = false;
         entry.continuationPending = Boolean(result.hasMore);

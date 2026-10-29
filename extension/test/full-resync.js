@@ -14,7 +14,11 @@ const stored = {
   },
   status: {
     chatgpt: {
-      state: { accounts: { default: { lastSyncMs: oldWatermark } } },
+      state: {
+        accounts: { default: { lastSyncMs: oldWatermark } },
+        ignoredFailures: [{ conversationId: 'user-deleted-project-chat',
+          accountKey: 'default', projectId: 'g-p-deleted', ignoredReason: 'user-deleted' }],
+      },
       lastRunMs: 1,
     },
     claude: { state: { sentinel: 'untouched' }, lastRunMs: 2 },
@@ -34,7 +38,15 @@ globalThis.chrome = {
     create: async () => {},
     onAlarm: { addListener: () => {} },
   },
+  tabs: {
+    query: async () => [],
+    onUpdated: { addListener: () => {} },
+    onActivated: { addListener: () => {} },
+    onRemoved: { addListener: () => {} },
+  },
+  scripting: {}, // Avoid session-based pacing in the isolated full-sync fixture.
   runtime: {
+    getManifest: () => ({ version: '0.4.30' }),
     onInstalled: { addListener: () => {} },
     onStartup: { addListener: () => {} },
     onMessage: { addListener: listener => (messageListener = listener) },
@@ -72,6 +84,8 @@ globalThis.fetch = async (url, init = {}) => {
   }
   if (parsed.pathname === '/backend-api/gizmos/snorlax/sidebar') return Response.json({ items: [], cursor: null });
   if (parsed.pathname === '/backend-api/conversations') {
+    if (parsed.searchParams.get('is_archived') === 'true')
+      return Response.json({ total: 0, items: [] });
     return Response.json({
       total: 1,
       items: [{ id: 'full-sync-conversation', update_time: nowSeconds }],
@@ -118,13 +132,30 @@ const response = await new Promise(resolve => {
 });
 assert.deepEqual(response, { ok: true });
 
-for (let attempt = 0; attempt < 100 && stored.status.chatgpt.running !== false; attempt++) {
-  await new Promise(resolve => setTimeout(resolve, 5));
+async function awaitIdle() {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (stored.status.chatgpt.running === false) return;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  throw new Error('HSTRY did not finish the scheduled fixture batch');
 }
-
-assert.equal(stored.status.chatgpt.running, false);
+await awaitIdle();
 assert.equal(stored.status.chatgpt.trigger, 'full');
+// A full scan now yields after each detail; drive its existing continuation
+// rather than falsely assuming a single service-worker invocation completes it.
+for (let i = 0; stored.status.chatgpt.state.pending && i < 8; i++) {
+  stored.status.chatgpt.nextAllowedAtMs = 0;
+  const ack = await new Promise(resolve => messageListener({ type: 'syncNow' }, {}, resolve));
+  assert.deepEqual(ack, { ok: true });
+  await awaitIdle();
+}
+assert.equal(stored.status.chatgpt.state.pending, undefined);
+assert.equal(stored.status.chatgpt.running, false);
 assert.equal(stored.status.chatgpt.lastError, null);
+assert.deepEqual(stored.status.chatgpt.state.ignoredFailures, [{
+  conversationId: 'user-deleted-project-chat', accountKey: 'default',
+  projectId: 'g-p-deleted', ignoredReason: 'user-deleted',
+}], 'full resync must not lose explicit deleted-conversation exclusions');
 assert.notEqual(
   stored.status.chatgpt.state.accounts.default.lastSyncMs,
   oldWatermark,
@@ -138,8 +169,9 @@ assert.deepEqual(stored.status.gemini, {
   state: { sentinel: 'stale-run' },
   lastRunMs: 3,
   running: false,
-  lastError: 'Previous sync was interrupted. Run it again.',
+  lastError: 'Previous sync was interrupted before a saved checkpoint.',
   progress: { phase: 'failed' },
+  continuationPending: false,
 });
 assert.ok(
   requests.some(request => request.pathname === '/backend-api/conversation/full-sync-conversation'),
