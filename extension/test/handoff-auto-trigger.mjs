@@ -6,7 +6,7 @@ const script = readFileSync(new URL('../handoff-content.js', import.meta.url), '
 const warning = "You've reached the maximum length for this conversation. You can keep talking by starting a new chat.";
 const path = '/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/6add53d9-4c88-83ed-a57d-6a602a257293';
 
-function mount(initialWarning, previous = null, active = false) {
+function mount(initialWarning, previous = null, active = false, draft = '') {
   let visible = active;
   let focused = active;
   let reachedLimit = initialWarning;
@@ -29,10 +29,17 @@ function mount(initialWarning, previous = null, active = false) {
     get visibilityState() { return visible ? 'visible' : 'hidden'; },
     hasFocus: () => focused,
     getElementById(id) { return id === 'hstry-continue-chat' ? button : null; },
-    querySelectorAll(query) { return query === 'button, a' ? [native] : []; },
+    querySelectorAll(query) {
+      if (query === 'button, a') return [native];
+      if (draft && query.startsWith('#prompt-textarea')) return [{
+        textContent: draft, hasAttribute: () => false,
+        getBoundingClientRect: () => ({ width: 350, height: 45 }),
+      }];
+      return [];
+    },
     createElement() {
       return {
-        style: {}, disabled: false,
+        style: {}, disabled: false, setAttribute() {},
         addEventListener(type, handler) { if (type === 'click') clickButton = handler; },
       };
     },
@@ -106,6 +113,12 @@ existing.manualClick();
 await tick();
 assert.equal(existing.sent.length, 1);
 assert.equal(existing.sent[0].automatic, false);
+
+const withDraft = mount(true, null, true, 'A message I have not sent');
+withDraft.flush();
+await tick();
+assert.equal(withDraft.sent.length, 0, 'unsent text must not be lost to same-tab navigation');
+assert.equal(withDraft.button.disabled, false, 'manual retry remains possible after saving draft');
 
 const alreadyFull = mount(true, null, true);
 alreadyFull.flush();

@@ -38,32 +38,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       if (Number.isInteger(prior?.tabId)) {
         const tab = await chrome.tabs.get(prior.tabId).catch(() => null);
-        if (tab?.url?.startsWith('https://chatgpt.com/')) {
+        // Reuse a previous continuation, including one opened by older builds.
+        // If the same source tab never navigated, allow a safe retry in place.
+        if (tab?.url?.startsWith('https://chatgpt.com/') &&
+            !(tab.id === senderTab.id && parseConversationUrl(tab.url)?.id === parsed.id)) {
           return { existing: true, tabId: tab.id };
         }
       }
       const entries = Object.values((await chrome.storage.local.get('liveCaptureQueue')).liveCaptureQueue || {});
       const pending = entries.filter(v => v && !v.indexedAt &&
         (v.conversationId === parsed.id || v.conversation_id === parsed.id)).length;
-      let tab;
+      const tabId = senderTab.id;
       try {
-        tab = await chrome.tabs.create({ url: parsed.landing, active: true });
-        if (!Number.isInteger(tab.id)) throw new Error('New ChatGPT tab was not created.');
-        await chrome.storage.session.set({ [PREFIX + tab.id]: {
+        const current = await chrome.tabs.get(tabId);
+        if (parseConversationUrl(current.url || '')?.id !== parsed.id) {
+          throw new Error('Original conversation changed before takeover.');
+        }
+        // Navigate the original tab only after storing the full handoff.
+        // Its browser history retains the source conversation for Back.
+        await chrome.storage.session.set({ [PREFIX + tabId]: {
           original: parsed.original, project: parsed.project,
           prompt: takeoverPrompt(parsed.original, pending),
-          createdAt: Date.now(), sourceTabId: senderTab.id,
+          createdAt: Date.now(), sourceTabId: tabId,
         } });
         await chrome.storage.local.set({ [sourceKey]: {
-          status: 'started', tabId: tab.id, startedAt: Date.now(),
+          status: 'started', tabId, startedAt: Date.now(),
         } });
-        chrome.tabs.sendMessage(tab.id, { type: 'HSTRY_TAKEOVER_WAKE' }).catch(() => {});
-        return { tabId: tab.id, pendingCaptures: pending };
+        await chrome.tabs.update(tabId, { url: parsed.landing });
+        return { tabId, pendingCaptures: pending };
       } catch (error) {
-        if (Number.isInteger(tab?.id)) {
-          await chrome.storage.session.remove(PREFIX + tab.id).catch(() => {});
-          await chrome.tabs.remove(tab.id).catch(() => {});
-        }
+        // Do not close the user's tab. Failed navigation leaves the source in
+        // place and clears both receipts so the same tab can be retried.
+        await chrome.storage.session.remove(PREFIX + tabId).catch(() => {});
+        await chrome.storage.local.remove(sourceKey).catch(() => {});
         throw error;
       }
     })();
@@ -83,12 +90,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.storage.session.remove(key);
         return { found: false };
       }
-      const current = new URL(sender.url || senderTab.url);
+      const current = new URL(senderTab.url || sender.url);
       if (current.protocol !== 'https:' || !['chatgpt.com', 'chat.openai.com'].includes(current.hostname)) {
         throw new Error('Takeover destination is not ChatGPT.');
       }
       const original = parseConversationUrl(record.original);
       if (!original) throw new Error('Stored takeover source is invalid.');
+      if (msg.type === 'HSTRY_TAKEOVER_POLL') {
+        const landing = new URL(original.landing).pathname.replace(/\/$/, '') || '/';
+        const path = current.pathname.replace(/\/$/, '') || '/';
+        if (path !== landing && !(original.project && path === landing + '/project')) {
+          return { found: false };
+        }
+      }
       const sourceKey = SOURCE_PREFIX + original.id;
       if (msg.type === 'HSTRY_TAKEOVER_DONE') {
         await chrome.storage.local.set({ [sourceKey]: {
