@@ -71,6 +71,13 @@ export async function fetchJson(url, init = {}, { retries = 5, baseDelayMs = 100
     if (!res.ok) {
       const error = new Error(`${init.method ?? 'GET'} ${url} -> ${res.status}`);
       error.status = res.status;
+      if (res.status === 404) {
+        const detail = (await res.json().catch(() => null))?.detail;
+        if (detail?.code === 'conversation_inaccessible' && detail.can_retry === false) {
+          error.code = detail.code;
+          error.canRetry = false;
+        }
+      }
       throw error;
     }
     return res.json();

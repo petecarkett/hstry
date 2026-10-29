@@ -23,11 +23,15 @@ function providerCard(name, entry, enabled) {
     disclosure.appendChild(summary);
     const list = document.createElement('ul');
     list.className = 'failure-details';
-    for (const failure of recent.slice(-15).reverse()) {
+    const ordered = [...recent].sort((a, b) =>
+      Number(Boolean(a.resolvedAtMs)) - Number(Boolean(b.resolvedAtMs)) ||
+      (b.lastFailedAtMs ?? 0) - (a.lastFailedAtMs ?? 0));
+    for (const failure of ordered.slice(0, 15)) {
       const row = document.createElement('li');
       const origin = failure.projectId ? 'Project' : 'Personal';
       row.textContent = `${origin} ${failure.conversationId}: ${failure.errorType}` +
-        (failure.resolvedAtMs ? ' (recovered)' : '');
+        (failure.resolvedAtMs ? ' (recovered)' :
+          failure.accessVerification?.canRetry === false ? ' (inaccessible; access required)' : '');
       list.appendChild(row);
     }
     disclosure.appendChild(list);

@@ -2,11 +2,12 @@
 // Usage: bun extension/test/chatgpt-completeness.js
 
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { syncChatGPT } from '../providers/chatgpt.js';
 
-const detail = await Bun.file(
-  new URL('./fixtures/chatgpt-broken-chain.json', import.meta.url)
-).json();
+const detail = JSON.parse(await readFile(
+  new URL('./fixtures/chatgpt-broken-chain.json', import.meta.url), 'utf8'
+));
 
 const realFetch = globalThis.fetch;
 globalThis.fetch = async url => {
@@ -22,6 +23,8 @@ globalThis.fetch = async url => {
         },
       },
     };
+  } else if (pathname === '/backend-api/gizmos/snorlax/sidebar') {
+    fixture = { items: [], cursor: null };
   } else if (pathname === '/backend-api/conversations') {
     fixture = {
       total: 1,
