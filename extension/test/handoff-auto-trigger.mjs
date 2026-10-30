@@ -6,7 +6,7 @@ const script = readFileSync(new URL('../handoff-content.js', import.meta.url), '
 const warning = "You've reached the maximum length for this conversation. You can keep talking by starting a new chat.";
 const path = '/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/6add53d9-4c88-83ed-a57d-6a602a257293';
 
-function mount(initialWarning, previous = null, active = false, draft = '') {
+function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning) {
   let visible = active;
   let focused = active;
   let reachedLimit = initialWarning;
@@ -18,14 +18,14 @@ function mount(initialWarning, previous = null, active = false, draft = '') {
   let nextTimer = 0;
   let observer;
   let observing = false;
-  const panel = { get textContent() { return warning; }, parentElement: null };
+  const panel = { get textContent() { return screenText; }, parentElement: null };
   const native = {
     textContent: 'Start new chat',
     parentElement: panel,
     insertAdjacentElement(_position, element) { button = element; },
   };
   const document = {
-    body: { get textContent() { return reachedLimit ? warning : ''; }, append() {} },
+    body: { get textContent() { return reachedLimit ? screenText : ''; }, append() {} },
     get visibilityState() { return visible ? 'visible' : 'hidden'; },
     hasFocus: () => focused,
     getElementById(id) { return id === 'hstry-continue-chat' ? button : null; },
@@ -52,7 +52,7 @@ function mount(initialWarning, previous = null, active = false, draft = '') {
     chrome: {
       runtime: {
         id: 'hstry-extension',
-        getManifest: () => ({ version: '0.4.28' }),
+        getManifest: () => ({ version: '0.4.32' }),
         lastError: null,
         onMessage: { addListener() {} },
         sendMessage(message, done) {
@@ -113,6 +113,25 @@ existing.manualClick();
 await tick();
 assert.equal(existing.sent.length, 1);
 assert.equal(existing.sent[0].automatic, false);
+
+const terminal = mount(true, null, true, '', 'Unknown error Start new chat');
+terminal.flush();
+await tick();
+assert.ok(terminal.button, 'native Unknown error panel must offer HSTRY recovery');
+assert.equal(terminal.sent.length, 0, 'generic errors must not auto-open a new chat');
+terminal.manualClick();
+await tick();
+assert.equal(terminal.sent.length, 1, 'manual recovery uses existing HSTRY takeover');
+assert.equal(terminal.sent[0].automatic, false, 'error takeover requires an explicit click');
+terminal.redrawPanel();
+terminal.flush();
+await tick();
+assert.equal(terminal.sent.length, 1, 're-render cannot auto-repeat error takeover');
+
+const strayError = mount(true, null, true, '', 'Unknown error');
+strayError.flush();
+await tick();
+assert.equal(strayError.button, null, 'unrelated errors without a paired new-chat panel are ignored');
 
 const withDraft = mount(true, null, true, 'A message I have not sent');
 withDraft.flush();
@@ -175,10 +194,10 @@ changedChat.flush();
 await tick();
 assert.equal(changedChat.sent.length, 0, 'activity in another conversation is not a trigger');
 
-const obsolete = mount(true, { version: '0.4.28', isLive: () => false });
+const obsolete = mount(true, { version: '0.4.32', isLive: () => false });
 obsolete.flush();
 assert.ok(obsolete.button, 'stale same-version context must be replaced');
-const live = mount(true, { version: '0.4.28', isLive: () => true });
+const live = mount(true, { version: '0.4.32', isLive: () => true });
 live.flush();
 assert.equal(live.button, null, 'healthy same-version handler remains installed');
 
