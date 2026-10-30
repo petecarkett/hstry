@@ -506,6 +506,72 @@ function toParsedConversation(detail, item, scope) {
   };
 }
 
+
+// Preserve non-selected ChatGPT reply/edit branches without changing the
+// canonical active conversation or reindexing its existing messages.
+// HSTRY already models forks as child conversations; each alternate leaf gets
+// a deterministic external ID and only its non-active suffix is stored.
+function toParsedConversations(detail, item, scope) {
+  const primary = toParsedConversation(detail, item, scope);
+  if (!primary) return [];
+  const mapping = detail?.mapping ?? {};
+  const active = new Set();
+  const activePath = [];
+  let key = detail?.current_node;
+  while (key && mapping[key] && !active.has(key)) {
+    active.add(key);
+    activePath.push(key);
+    key = mapping[key].parent;
+  }
+  // If the active chain is broken/cyclic, linearize() already retained every
+  // readable mapping node; do not manufacture uncertain fork relationships.
+  if (key || active.size === 0) return [primary];
+
+  const activeMessageIdx = new Map();
+  for (const activeKey of activePath.reverse()) {
+    if (extractMessage(mapping[activeKey])) {
+      activeMessageIdx.set(activeKey, activeMessageIdx.size);
+    }
+  }
+
+  const hasChildren = new Set(Object.values(mapping).map(node => node?.parent).filter(Boolean));
+  const forks = [];
+  for (const leaf of Object.keys(mapping).sort()) {
+    if (active.has(leaf) || hasChildren.has(leaf)) continue;
+    const suffix = [];
+    const visited = new Set();
+    let ancestor = leaf;
+    while (ancestor && mapping[ancestor] && !active.has(ancestor) && !visited.has(ancestor)) {
+      visited.add(ancestor);
+      suffix.push(mapping[ancestor]);
+      ancestor = mapping[ancestor].parent;
+    }
+    if (ancestor && !active.has(ancestor)) continue;
+    const messages = suffix.reverse().map(extractMessage).filter(Boolean);
+    if (!messages.length) continue;
+
+    // Anchor the fork to the closest user/assistant node on the active path.
+    let anchor = ancestor;
+    while (anchor && mapping[anchor] && !activeMessageIdx.has(anchor)) {
+      anchor = mapping[anchor].parent;
+    }
+    forks.push({
+      ...primary,
+      externalId: `${item.id}:alternate:${leaf}`,
+      parentExternalId: item.id,
+      parentMessageIdx: activeMessageIdx.get(anchor) ?? null,
+      forkType: 'fork',
+      title: `${primary.title ?? 'ChatGPT conversation'} (alternate branch)`,
+      messages,
+      metadata: {
+        ...primary.metadata, parentConversationId: item.id,
+        alternateLeafId: leaf, alternateBranch: true,
+      },
+    });
+  }
+  return [primary, ...forks];
+}
+
 const isNonRetryableAccess = failure =>
   failure?.accessVerification?.code === 'conversation_inaccessible' &&
   failure.accessVerification.canRetry === false;
@@ -817,9 +883,9 @@ export async function syncChatGPT({
       usedLongRead = Boolean(slowDetail);
       const detail = slowDetail ?? await fetchChatGPTJson(
         `${BASE}/backend-api/conversation/${failure.conversationId}`, { headers });
-      conv = toParsedConversation(detail, item, retryScope);
+      conv = toParsedConversations(detail, item, retryScope);
       confirmed = canonicalMessages(detail);
-      if (!conv) throw new Error('Conversation has no readable messages');
+      if (!conv.length) throw new Error('Conversation has no readable messages');
       pending.rateLimitStreak = 0;
     } catch (error) {
       if (error instanceof NotLoggedInError) {
@@ -855,8 +921,8 @@ export async function syncChatGPT({
       await checkpointNow();
       log(`chatgpt: targeted retry of ${failure.conversationId} failed: ${failure.errorType}`);
     }
-    if (conv) {
-      total += await push(failure.sourceId, 'chatgpt-web', [conv]);
+    if (conv?.length) {
+      total += await push(failure.sourceId, 'chatgpt-web', conv);
       await onCanonicalIngest({ conversationId: failure.conversationId, confirmed });
       healthyRead();
       failure.resolvedAtMs = Date.now();
@@ -989,7 +1055,7 @@ export async function syncChatGPT({
           const headers = authHeaders(token, scope.accountId);
           if (itemScope.projectId) headers['chatgpt-project-id'] = itemScope.projectId;
           const detail = await fetchChatGPTJson(`${BASE}/backend-api/conversation/${item.id}`, { headers });
-          conv = toParsedConversation(detail, item, itemScope);
+          conv = toParsedConversations(detail, item, itemScope);
           confirmed = canonicalMessages(detail);
           pending.rateLimitStreak = 0;
         } catch (err) {
@@ -1034,8 +1100,8 @@ export async function syncChatGPT({
       }
       // The API acknowledges one stored conversation before cursor advancement.
       // A failed local ingest leaves the current item eligible for retry.
-      if (conv) {
-        total += await push(scope.sourceId, 'chatgpt-web', [conv]);
+      if (conv?.length) {
+        total += await push(scope.sourceId, 'chatgpt-web', conv);
         await onCanonicalIngest({ conversationId: item.id, confirmed });
         healthyRead();
         const recovered = failureDetails.find(detail =>
