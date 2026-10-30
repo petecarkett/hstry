@@ -120,16 +120,16 @@
   }
 
   function detectLimit() {
-    if (!/\\/c\\/[0-9a-f-]{36}/i.test(location.pathname)) return;
+    if (!/\/c\/[0-9a-f-]{36}/i.test(location.pathname)) return;
     const pageText = document.body?.textContent || '';
-    if (!WARNING.test(pageText) && !/\\bunknown error\\b/i.test(pageText)) return;
+    if (!WARNING.test(pageText) && !/\bunknown error\b/i.test(pageText)) return;
     const native = [...document.querySelectorAll('button, a')].find(node =>
       /start new chat/i.test(node.textContent || ''));
     if (!native) return;
     // A generic error is not proof that the conversation has reached its limit.
     // Offer a manual recovery only when it shares the native new-chat panel.
     const terminalError = text =>
-      /\\bunknown error\\b/i.test(text) && /start new chat/i.test(text);
+      /\bunknown error\b/i.test(text) && /start new chat/i.test(text);
     let panel = native.parentElement;
     for (let i = 0; i < 5 && panel && !WARNING.test(panel.textContent || '') &&
         !terminalError(panel.textContent || ''); i++) {
