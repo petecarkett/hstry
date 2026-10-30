@@ -120,23 +120,31 @@
   }
 
   function detectLimit() {
-    if (!/\/c\/[0-9a-f-]{36}/i.test(location.pathname)) return;
-    if (!WARNING.test(document.body?.textContent || '')) return;
-    const existing = document.getElementById('hstry-continue-chat');
-    if (existing) { autoContinue(existing); return; }
+    if (!/\\/c\\/[0-9a-f-]{36}/i.test(location.pathname)) return;
+    const pageText = document.body?.textContent || '';
+    if (!WARNING.test(pageText) && !/\\bunknown error\\b/i.test(pageText)) return;
     const native = [...document.querySelectorAll('button, a')].find(node =>
       /start new chat/i.test(node.textContent || ''));
     if (!native) return;
+    // A generic error is not proof that the conversation has reached its limit.
+    // Offer a manual recovery only when it shares the native new-chat panel.
+    const terminalError = text =>
+      /\\bunknown error\\b/i.test(text) && /start new chat/i.test(text);
     let panel = native.parentElement;
-    for (let i = 0; i < 5 && panel && !WARNING.test(panel.textContent || ''); i++) {
+    for (let i = 0; i < 5 && panel && !WARNING.test(panel.textContent || '') &&
+        !terminalError(panel.textContent || ''); i++) {
       panel = panel.parentElement;
     }
     if (!panel || (panel.textContent || '').length > 1500) return;
+    const explicitLimit = WARNING.test(panel.textContent || '');
+    if (!explicitLimit && !terminalError(panel.textContent || '')) return;
+    const existing = document.getElementById('hstry-continue-chat');
+    if (existing) { if (explicitLimit) autoContinue(existing); return; }
     const btn = document.createElement('button');
     btn.id = 'hstry-continue-chat';
     btn.type = 'button';
     btn.textContent = 'Continue with HSTRY';
-    btn.title = 'Open a new chat and resume from your HSTRY archive';
+    btn.title = 'Continue in this tab from your HSTRY archive';
     btn.style.cssText = 'margin:8px 8px 8px 0;padding:9px 16px;border-radius:24px;'+
       'border:1px solid #7d9e88;background:#305e46;color:#fff;cursor:pointer;'+
       'font:inherit;font-size:14px;';
@@ -149,7 +157,7 @@
       resumePending = false;
       submittedPath = null;
       void startTakeover(btn);
-    } else {
+    } else if (explicitLimit) {
       autoContinue(btn);
     }
   }
