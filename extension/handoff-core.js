@@ -28,7 +28,8 @@ export function parseConversationUrl(input) {
   };
 }
 
-export function takeoverPrompt(originalUrl, pendingCaptures = 0) {
+export function takeoverPrompt(originalUrl, pendingCaptures = 0,
+                              failedMessage = '', missingAttachments = false) {
   const parsed = parseConversationUrl(originalUrl);
   if (!parsed) throw new Error('Not a supported ChatGPT conversation URL');
   return `Continue the unfinished work from this existing ChatGPT conversation, which reached the conversation-length limit:
@@ -40,5 +41,6 @@ Reconstruct the latest verified task, decisions, completed work, remaining block
 
 ${pendingCaptures ? `WARNING: ${pendingCaptures} live capture(s) may still be waiting for local HSTRY indexing. Verify the latest conversation state; do not assume the archive is complete.` : 'Verify that HSTRY contains the latest messages; if it does not, identify the gap without inventing missing context.'}
 
+${failedMessage ? `The latest submitted user message was rejected by ChatGPT with conversation_too_large and may be absent from HSTRY. Address it after recovering prior context:\n${JSON.stringify(failedMessage)}\n` : ''}${missingAttachments ? 'The rejected submission included attachments that cannot be transferred automatically. Ask the user to reattach them.\n' : ''}
 This is a continuation, not a new project. Continue work after retrieving the evidence; do not stop at a handoff summary.`;
 }

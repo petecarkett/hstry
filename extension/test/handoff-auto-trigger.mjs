@@ -6,7 +6,7 @@ const script = readFileSync(new URL('../handoff-content.js', import.meta.url), '
 const warning = "You've reached the maximum length for this conversation. You can keep talking by starting a new chat.";
 const path = '/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/6add53d9-4c88-83ed-a57d-6a602a257293';
 
-function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning) {
+function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning, hasNative = true) {
   let visible = active;
   let focused = active;
   let reachedLimit = initialWarning;
@@ -25,12 +25,13 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     insertAdjacentElement(_position, element) { button = element; },
   };
   const document = {
-    body: { get textContent() { return reachedLimit ? screenText : ''; }, append() {} },
+    body: { get textContent() { return reachedLimit ? screenText : ''; },
+      append(element) { if (element.id === 'hstry-continue-chat') button = element; } },
     get visibilityState() { return visible ? 'visible' : 'hidden'; },
     hasFocus: () => focused,
     getElementById(id) { return id === 'hstry-continue-chat' ? button : null; },
     querySelectorAll(query) {
-      if (query === 'button, a') return [native];
+      if (query === 'button, a') return hasNative ? [native] : [];
       if (draft && query.startsWith('#prompt-textarea')) return [{
         textContent: draft, hasAttribute: () => false,
         getBoundingClientRect: () => ({ width: 350, height: 45 }),
@@ -52,7 +53,7 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     chrome: {
       runtime: {
         id: 'hstry-extension',
-        getManifest: () => ({ version: '0.4.32' }),
+        getManifest: () => ({ version: '0.4.33' }),
         lastError: null,
         onMessage: { addListener() {} },
         sendMessage(message, done) {
@@ -100,6 +101,9 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
       });
     },
     manualClick() { clickButton({ preventDefault() {} }); },
+    serverError(detail) {
+      events.get('window:hstry:conversation-too-large')?.({ detail });
+    },
   };
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -184,6 +188,40 @@ await tick();
 assert.equal(keyboard.sent.length, 1, 'Enter submission triggers automatic handoff');
 assert.equal(keyboard.sent[0].automatic, true);
 
+const serverOnly = mount(false, null, true, '', '', false);
+serverOnly.flush();
+serverOnly.serverError({ path, failedMessage: 'now?', includesAttachments: false });
+await tick();
+assert.ok(serverOnly.button, 'exact server rejection offers recovery without native error panel');
+assert.equal(serverOnly.sent.length, 1, 'server rejection triggers continuation');
+assert.equal(serverOnly.sent[0].automatic, true);
+assert.equal(serverOnly.sent[0].failedMessage, 'now?', 'rejected user text is carried');
+serverOnly.serverError({ path, failedMessage: 'now?', includesAttachments: false });
+serverOnly.flush();
+await tick();
+assert.equal(serverOnly.sent.length, 1, 'repeated server errors cannot duplicate takeover');
+
+const staleResponse = mount(false, null, true, '', '', false);
+staleResponse.serverError({ path: '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+  failedMessage: 'wrong conversation' });
+assert.equal(staleResponse.sent.length, 0, 'responses from another tab route are ignored');
+assert.equal(staleResponse.button, null);
+
+const failedAttachment = mount(false, null, true, '', '', false);
+failedAttachment.serverError({ path, failedMessage: 'look', includesAttachments: true });
+await tick();
+assert.equal(failedAttachment.sent.length, 0, 'attachment rejection never auto-navigates');
+assert.ok(failedAttachment.button, 'manual recovery remains available');
+failedAttachment.manualClick();
+await tick();
+assert.equal(failedAttachment.sent[0].missingAttachments, true);
+
+const failedOversized = mount(false, null, true, '', '', false);
+failedOversized.serverError({ path, oversized: true });
+failedOversized.manualClick();
+await tick();
+assert.equal(failedOversized.sent.length, 0, 'overlong rejected text is never discarded silently');
+
 const changedChat = mount(false);
 changedChat.flush();
 changedChat.submitByClick();
@@ -194,10 +232,10 @@ changedChat.flush();
 await tick();
 assert.equal(changedChat.sent.length, 0, 'activity in another conversation is not a trigger');
 
-const obsolete = mount(true, { version: '0.4.32', isLive: () => false });
+const obsolete = mount(true, { version: '0.4.33', isLive: () => false });
 obsolete.flush();
 assert.ok(obsolete.button, 'stale same-version context must be replaced');
-const live = mount(true, { version: '0.4.32', isLive: () => true });
+const live = mount(true, { version: '0.4.33', isLive: () => true });
 live.flush();
 assert.equal(live.button, null, 'healthy same-version handler remains installed');
 
