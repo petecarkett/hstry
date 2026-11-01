@@ -644,6 +644,8 @@ export async function syncChatGPT({
   if (tokenInfo.fetched) return queueNext(state ?? {});
   const token = tokenInfo.token;
   let pending = state?.pending?.scopes ? { ...state.pending } : null;
+  // Historical 429 retries inflated detected without advancing processed.
+  if (pending) pending.detected = pending.processed;
   if (!pending && pacedMode) {
     const discovery = state?.discovery ?? {
       accounts: null, accountIndex: 0, scopes: [], cursor: null,
@@ -1024,7 +1026,6 @@ export async function syncChatGPT({
       if (!item || typeof item.id !== 'string' || !item.id) {
         throw new Error('ChatGPT conversation entry is missing its ID');
       }
-      pending.detected++;
       await report({ phase: 'importing', detected: pending.detected,
         processed: pending.processed, failed: pending.failures });
       let conv = null;
@@ -1110,6 +1111,8 @@ export async function syncChatGPT({
         );
         if (recovered) recovered.resolvedAtMs = Date.now();
       }
+      // Count only completed entries; a 429 or interrupted ingest retries this index.
+      pending.detected++;
       pending.processed++;
       pending.pageIndex = index + 1;
       if (needsDetail) thisRun++;
