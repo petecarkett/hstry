@@ -13,7 +13,7 @@ const tabs = new Map([
   [4, { id: 4, url: other }],
   [5, { id: 5, url: another }],
 ]);
-let listener, updates = 0, creates = 0, failSessionWrite = false, failNavigation = false;
+let listener, onUpdated, injected = [], updates = 0, creates = 0, failSessionWrite = false, failNavigation = false;
 const on = { addListener() {} };
 
 globalThis.chrome = {
@@ -22,7 +22,7 @@ globalThis.chrome = {
     onInstalled: on, onMessage: { addListener(fn) { listener = fn; } },
   },
   tabs: {
-    onUpdated: on, onActivated: on, onRemoved: on,
+    onUpdated: { addListener(fn) { onUpdated = fn; } }, onActivated: on, onRemoved: on,
     query: async () => [],
     async create() { creates++; throw Error('same-tab continuation must never create a tab'); },
     async get(id) {
@@ -39,7 +39,7 @@ globalThis.chrome = {
     },
     async sendMessage() {},
   },
-  scripting: { async executeScript() {} },
+  scripting: { async executeScript(options) { injected.push(options); } },
   storage: {
     local: {
       async get(key) { return { [key]: local.get(key) }; },
@@ -57,6 +57,17 @@ globalThis.chrome = {
   },
 };
 await import(new URL('../handoff-background.js?test=first', import.meta.url));
+onUpdated(4, { status: 'loading' }, { id: 4, url: other });
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(injected.length, 0, 'the observer must not reinject during incomplete loads');
+onUpdated(4, { status: 'complete' }, { id: 4, url: other });
+await new Promise(resolve => setImmediate(resolve));
+assert.deepEqual(injected.map(x => [x.target.tabId, x.world, x.files[0]]),
+  [[4, 'MAIN', 'handoff-network.js']],
+  'a completed ChatGPT navigation must restore the main-world fetch observer');
+onUpdated(4, { status: 'complete' }, { id: 4, url: 'https://example.com/' });
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(injected.length, 1, 'unrelated websites must never be injected');
 
 const send = (url, type, tabId, automatic = false, frameUrl = url, extra = {}) => new Promise(resolve => {
   const sender = { id: chrome.runtime.id, frameId: 0, url: frameUrl, tab: { id: tabId, url } };
