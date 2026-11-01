@@ -39,7 +39,7 @@ Use the connected HSTRY_Private_History expand tool with that FULL URL as conver
 
 Reconstruct the latest verified task, decisions, completed work, remaining blockers and project state. Resume the unfinished work using the existing SSOT, Ponytail, ownership/release rules and minimal regression-safe changes. Do not recreate tasks, duplicate completed work, or claim deployment without evidence.
 
-${pendingCaptures ? `WARNING: ${pendingCaptures} live capture(s) may still be waiting for local HSTRY indexing. Verify the latest conversation state; do not assume the archive is complete.` : 'Verify that HSTRY contains the latest messages; if it does not, identify the gap without inventing missing context.'}
+${pendingCaptures ? `WARNING: ${pendingCaptures} live capture(s) are not verified by canonical history. They may be indexed only as provisional observations; do not assume the archive is complete.` : 'Verify that HSTRY contains the latest messages; if it does not, identify the gap without inventing missing context.'}
 
 ${failedMessage ? `The latest submitted user message was rejected by ChatGPT with conversation_too_large and may be absent from HSTRY. Address it after recovering prior context:\n${JSON.stringify(failedMessage)}\n` : ''}${missingAttachments ? 'The rejected submission included attachments that cannot be transferred automatically. Ask the user to reattach them.\n' : ''}
 This is a continuation, not a new project. Continue work after retrieving the evidence; do not stop at a handoff summary.`;

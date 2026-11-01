@@ -46,7 +46,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
       }
       const entries = Object.values((await chrome.storage.local.get('liveCaptureQueue')).liveCaptureQueue || {});
-      const pending = entries.filter(v => v && !v.indexedAt &&
+      // Indexed live captures are still provisional until canonical history
+      // confirms and removes them from this queue.
+      const pending = entries.filter(v => v &&
         (v.conversationId === parsed.id || v.conversation_id === parsed.id)).length;
       if (msg.failedMessage !== undefined &&
           (typeof msg.failedMessage !== 'string' || msg.failedMessage.length > 8000)) {
@@ -126,6 +128,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changes, tab) => {
   if (changes.status === 'complete' && tab?.url?.startsWith('https://chatgpt.com/')) {
+    // ChatGPT can replace window.fetch after document_start. Reinstall the
+    // existing idempotent observer once the page finishes initializing.
+    void chrome.scripting.executeScript({ target: { tabId },
+      files: ['handoff-network.js'], world: 'MAIN' }).catch(() => {});
     chrome.tabs.sendMessage(tabId, { type: 'HSTRY_TAKEOVER_WAKE' }).catch(() => {});
   }
 });

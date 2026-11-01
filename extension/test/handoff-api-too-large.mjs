@@ -100,4 +100,41 @@ const rejectedFetch = mount(() => Promise.reject(new Error('offline')));
 await assert.rejects(rejectedFetch.context.fetch('/backend-api/f/conversation', request), /offline/);
 await settle();
 assert.equal(rejectedFetch.events.length, 0, 'observer cannot swallow request errors');
+// ChatGPT pages older conversation turns through a different, successful GET.
+const older = mount(async () => result(200, { messages: [
+  { id: '00000000-0000-0000-0000-000000000006', author: { role: 'user' },
+    content: { content_type: 'text', parts: ['earlier user'] } },
+  { id: '00000000-0000-0000-0000-000000000007', author: { role: 'assistant' },
+    content: { content_type: 'text', parts: ['earlier assistant'] } },
+  { id: '00000000-0000-0000-0000-000000000008', author: { role: 'tool' },
+    content: { content_type: 'text', parts: ['private tool response'] } },
+] }));
+const pagedUrl = '/backend-api/conversations/11111111-2222-4333-8444-555555555555/messages?before=older&num_turns=10';
+const nativeResponse = await older.context.fetch(pagedUrl);
+assert.equal(nativeResponse.status, 200, 'the page observer must not consume the browser response');
+assert.equal((await nativeResponse.json()).messages.length, 3);
+await settle();
+const captures = older.events.filter(event => event.type === 'hstry:native-conversation-page');
+assert.equal(captures.length, 1, 'native history page must reach HSTRY without an extra request');
+assert.deepEqual(captures[0].detail.turns.map(turn => turn.content),
+  ['earlier user', 'earlier assistant'], 'tool/hidden data is excluded');
+const repeated = older.context.fetch;
+vm.runInNewContext(script, older.context, { filename: 'handoff-network.js' });
+assert.equal(older.context.fetch, repeated, 'observer reinjection must remain idempotent');
+
+const unrelatedNative = mount(async () => result(200, { messages: [{ id: '00000000-0000-0000-0000-000000000009',
+  author: { role: 'user' }, content: { content_type: 'text', parts: ['unrelated'] } }] }));
+await unrelatedNative.context.fetch('/backend-api/conversations/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee?num_turns=10');
+await settle();
+assert.equal(unrelatedNative.events.length, 0, 'never attach another chat to the active tab');
+
+const throttledNative = mount(async () => result(429, { messages: [{
+  id: '00000000-0000-0000-0000-000000000009',
+  author: { role: 'user' }, content: { content_type: 'text', parts: ['must ignore'] },
+}] }));
+await throttledNative.context.fetch(pagedUrl);
+await settle();
+assert.equal(throttledNative.events.length, 0,
+  'a throttled native history response is never treated as recovered');
+
 console.log('PASS exact ChatGPT server rejection observed without changing fetch or reading unrelated errors');
