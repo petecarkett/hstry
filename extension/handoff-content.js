@@ -35,6 +35,10 @@
   } catch { /* Session storage is optional; normal clicks still work. */ }
 
   const WARNING = /you(?:'|\u2019)ve\s+reached\s+the\s+maximum\s+length\s+for\s+this\s+conversation/i;
+  let serverLimitPath = null;
+  let rejectedMessage = '';
+  let rejectedHasAttachments = false;
+  let rejectedTooLong = false;
   let resumeWhenComposerReady = false;
   let submittedPath = null;
   let autoAttemptedPath = null;
@@ -72,6 +76,14 @@
 
   async function startTakeover(btn, automatic = false) {
     if (btn.disabled) return;
+    if (serverLimitPath === location.pathname && rejectedTooLong) {
+      fallbackBanner('HSTRY paused: the rejected message could not be preserved safely. Copy it before continuing.');
+      return;
+    }
+    if (serverLimitPath === location.pathname && rejectedHasAttachments && automatic) {
+      fallbackBanner('HSTRY paused: the rejected submission contained attachments. Reattach them manually before continuing.');
+      return;
+    }
     const editor = editableElement();
     const hasDraft = !!(editor?.value || editor?.textContent || '').trim();
     const hasFiles = [...document.querySelectorAll('input[type="file"]')]
@@ -84,7 +96,9 @@
     btn.disabled = true;
     btn.textContent = 'Opening continuation...';
     try {
-      const result = await send({ type: 'HSTRY_TAKEOVER_START', automatic });
+      const result = await send({ type: 'HSTRY_TAKEOVER_START', automatic,
+        failedMessage: serverLimitPath === location.pathname ? rejectedMessage : '',
+        missingAttachments: serverLimitPath === location.pathname && rejectedHasAttachments });
       if (!result?.ok) throw new Error(result?.error || 'Unable to open the new chat');
       btn.textContent = result.existing ? 'Continuation already opened' : 'Continuing in this tab';
     } catch (err) {
@@ -121,23 +135,24 @@
 
   function detectLimit() {
     if (!/\/c\/[0-9a-f-]{36}/i.test(location.pathname)) return;
+    const serverLimit = serverLimitPath === location.pathname;
     const pageText = document.body?.textContent || '';
-    if (!WARNING.test(pageText) && !/\bunknown error\b/i.test(pageText)) return;
+    if (!serverLimit && !WARNING.test(pageText) && !/\bunknown error\b/i.test(pageText)) return;
     const native = [...document.querySelectorAll('button, a')].find(node =>
       /start new chat/i.test(node.textContent || ''));
-    if (!native) return;
-    // A generic error is not proof that the conversation has reached its limit.
-    // Offer a manual recovery only when it shares the native new-chat panel.
+    if (!native && !serverLimit) return;
+    // Generic errors remain manual; only a native length warning or exact
+    // server rejection permits automatic continuation.
     const terminalError = text =>
       /\bunknown error\b/i.test(text) && /start new chat/i.test(text);
-    let panel = native.parentElement;
+    let panel = native?.parentElement || null;
     for (let i = 0; i < 5 && panel && !WARNING.test(panel.textContent || '') &&
         !terminalError(panel.textContent || ''); i++) {
       panel = panel.parentElement;
     }
-    if (!panel || (panel.textContent || '').length > 1500) return;
-    const explicitLimit = WARNING.test(panel.textContent || '');
-    if (!explicitLimit && !terminalError(panel.textContent || '')) return;
+    if (!serverLimit && (!panel || (panel.textContent || '').length > 1500)) return;
+    const explicitLimit = serverLimit || WARNING.test(panel?.textContent || '');
+    if (!explicitLimit && !terminalError(panel?.textContent || '')) return;
     const existing = document.getElementById('hstry-continue-chat');
     if (existing) { if (explicitLimit) autoContinue(existing); return; }
     const btn = document.createElement('button');
@@ -152,7 +167,11 @@
       event.preventDefault();
       void startTakeover(btn);
     });
-    native.insertAdjacentElement('afterend', btn);
+    if (native) native.insertAdjacentElement('afterend', btn);
+    else {
+      btn.style.cssText += 'position:fixed;right:20px;bottom:85px;z-index:999999;';
+      document.body.append(btn);
+    }
     if (resumePending) {
       resumePending = false;
       submittedPath = null;
@@ -287,6 +306,18 @@
       }
     }, 700);
   }
+  window.addEventListener('hstry:conversation-too-large', event => {
+    const detail = event?.detail;
+    if (!detail || detail.path !== location.pathname ||
+        !/\/c\/[0-9a-f-]{36}/i.test(detail.path)) return;
+    serverLimitPath = detail.path;
+    rejectedMessage = typeof detail.failedMessage === 'string' &&
+      detail.failedMessage.length <= 8000 ? detail.failedMessage : '';
+    rejectedHasAttachments = detail.includesAttachments === true;
+    rejectedTooLong = detail.oversized === true ||
+      (typeof detail.failedMessage === 'string' && detail.failedMessage.length > 8000);
+    detectLimit();
+  });
   window.addEventListener('focus', scheduleWarningCheck);
   document.addEventListener('visibilitychange', scheduleWarningCheck);
   if (document.body) {

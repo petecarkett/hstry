@@ -48,6 +48,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const entries = Object.values((await chrome.storage.local.get('liveCaptureQueue')).liveCaptureQueue || {});
       const pending = entries.filter(v => v && !v.indexedAt &&
         (v.conversationId === parsed.id || v.conversation_id === parsed.id)).length;
+      if (msg.failedMessage !== undefined &&
+          (typeof msg.failedMessage !== 'string' || msg.failedMessage.length > 8000)) {
+        throw new Error('Rejected message is too large for a safe handoff.');
+      }
       const tabId = senderTab.id;
       try {
         const current = await chrome.tabs.get(tabId);
@@ -58,7 +62,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Its browser history retains the source conversation for Back.
         await chrome.storage.session.set({ [PREFIX + tabId]: {
           original: parsed.original, project: parsed.project,
-          prompt: takeoverPrompt(parsed.original, pending),
+          prompt: takeoverPrompt(parsed.original, pending,
+            msg.failedMessage || '', msg.missingAttachments === true),
           createdAt: Date.now(), sourceTabId: tabId,
         } });
         await chrome.storage.local.set({ [sourceKey]: {
@@ -130,9 +135,14 @@ chrome.tabs.onUpdated.addListener((tabId, changes, tab) => {
 chrome.tabs.onActivated.addListener(({ tabId }) => {
   void chrome.tabs.get(tabId).then(tab => {
     if (!tab.url?.startsWith('https://chatgpt.com/')) return;
-    return chrome.scripting.executeScript({
-      target: { tabId }, files: ['handoff-content.js'],
-    });
+    return Promise.all([
+      chrome.scripting.executeScript({
+        target: { tabId }, files: ['handoff-network.js'], world: 'MAIN',
+      }),
+      chrome.scripting.executeScript({
+        target: { tabId }, files: ['handoff-content.js'],
+      }),
+    ]);
   }).catch(() => {});
 });
 
@@ -154,9 +164,12 @@ function refreshOpenChatScripts() {
     const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
     // A suspended tab can leave executeScript pending indefinitely. Bound the
     // refresh; future navigations receive the manifest content script normally.
-    const injections = Promise.allSettled(tabs.filter(tab => Number.isInteger(tab.id)).map(tab =>
+    const injections = Promise.allSettled(tabs.filter(tab => Number.isInteger(tab.id)).flatMap(tab => [
       chrome.scripting.executeScript({ target: { tabId: tab.id },
-        files: ['handoff-content.js'] })));
+        files: ['handoff-network.js'], world: 'MAIN' }),
+      chrome.scripting.executeScript({ target: { tabId: tab.id },
+        files: ['handoff-content.js'] }),
+    ]));
     await Promise.race([injections, new Promise(resolve => setTimeout(resolve, 3000))]);
     await chrome.storage.session.set({ [CONTENT_VERSION_KEY]: version });
   })().catch(() => {}).finally(() => { contentRefresh = null; });

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 // does not. Reinject once per extension load, not once per manifest version.
 const session = new Map();
 let injections = 0;
+const injected = [];
 const on = { addListener() {} };
 globalThis.chrome = {
   runtime: { getManifest: () => ({ version: '0.4.23' }), onMessage: on, onInstalled: on },
@@ -11,7 +12,7 @@ globalThis.chrome = {
     onUpdated: on, onActivated: on, onRemoved: on,
     query: async () => [{ id: 42, url: 'https://chatgpt.com/c/test' }],
   },
-  scripting: { executeScript: async () => { injections++; } },
+  scripting: { executeScript: async options => { injections++; injected.push(options); } },
   storage: {
     local: { get: async () => ({ hstryTakeoverContentVersion: '0.4.23' }) },
     session: {
@@ -28,13 +29,16 @@ async function boot(n) {
 }
 
 await boot(1);
-assert.equal(injections, 1, 'first load must not trust stale local version markers');
+assert.equal(injections, 2, 'first load injects both network observer and handoff');
+assert.equal(injected[0].world, 'MAIN', 'network observer uses page-world fetch');
+assert.deepEqual(injected.slice(0, 2).map(x => x.files[0]),
+  ['handoff-network.js', 'handoff-content.js']);
 assert.equal(session.get('hstryTakeoverContentVersion'), '0.4.23');
 
 await boot(2);
-assert.equal(injections, 1, 'service worker restart must not repeat tab-wide injection');
+assert.equal(injections, 2, 'service worker restart must not repeat tab-wide injection');
 
 session.clear(); // Chrome clears storage.session on extension reload, even without a version bump.
 await boot(3);
-assert.equal(injections, 2, 'same-version reload must replace orphaned content scripts');
+assert.equal(injections, 4, 'same-version reload must replace both observers');
 console.log('PASS same-version reload reinjects; ordinary worker restart does not');

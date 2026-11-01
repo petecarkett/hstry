@@ -58,14 +58,15 @@ globalThis.chrome = {
 };
 await import(new URL('../handoff-background.js?test=first', import.meta.url));
 
-const send = (url, type, tabId, automatic = false, frameUrl = url) => new Promise(resolve => {
+const send = (url, type, tabId, automatic = false, frameUrl = url, extra = {}) => new Promise(resolve => {
   const sender = { id: chrome.runtime.id, frameId: 0, url: frameUrl, tab: { id: tabId, url } };
-  const keepOpen = listener({ type, automatic }, sender, resolve);
+  const keepOpen = listener({ type, automatic, ...extra }, sender, resolve);
   assert.equal(keepOpen, true);
 });
 
 const [first, same] = await Promise.all([
-  send(original, 'HSTRY_TAKEOVER_START', 1, true, landing),
+  send(original, 'HSTRY_TAKEOVER_START', 1, true, landing,
+    { failedMessage: 'now?', missingAttachments: true }),
   send(original, 'HSTRY_TAKEOVER_START', 2, true),
 ]);
 assert.equal(first.ok, true);
@@ -76,6 +77,10 @@ assert.equal(creates, 0, 'no second tab is ever created');
 assert.equal(tabs.get(1).url, landing, 'source tab navigated to same-project landing');
 assert.equal(tabs.get(2).url, original, 'unrelated duplicate source tab was left untouched');
 assert.ok(session.get('hstryTakeoverTab:1')?.prompt.includes(original));
+assert.ok(session.get('hstryTakeoverTab:1')?.prompt.includes('now?'),
+  'failed user message must survive same-tab navigation');
+assert.match(session.get('hstryTakeoverTab:1')?.prompt, /reattach them/,
+  'failed attachment cannot be silently treated as restored');
 
 const invalid = await send('https://chatgpt.com/', 'HSTRY_TAKEOVER_START', 1, true, original);
 assert.equal(invalid.ok, false, 'a landing page cannot impersonate the source');
@@ -113,6 +118,11 @@ const afterRestart = await send(original, 'HSTRY_TAKEOVER_START', 2, true);
 assert.equal(afterRestart.existing, true);
 assert.equal(afterRestart.completed, true);
 assert.equal(updates, 1, 'completed handoff cannot navigate again after restart');
+
+const invalidMessage = await send(another, 'HSTRY_TAKEOVER_START', 5,
+  true, another, { failedMessage: 'x'.repeat(8001) });
+assert.equal(invalidMessage.ok, false, 'oversized rejected text is not truncated');
+assert.equal(tabs.get(5).url, another, 'invalid payload cannot navigate source');
 
 const initialUrl = tabs.get(4).url;
 failSessionWrite = true;
