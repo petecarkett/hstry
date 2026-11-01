@@ -1024,7 +1024,6 @@ export async function syncChatGPT({
       if (!item || typeof item.id !== 'string' || !item.id) {
         throw new Error('ChatGPT conversation entry is missing its ID');
       }
-      pending.detected++;
       await report({ phase: 'importing', detected: pending.detected,
         processed: pending.processed, failed: pending.failures });
       let conv = null;
@@ -1110,6 +1109,8 @@ export async function syncChatGPT({
         );
         if (recovered) recovered.resolvedAtMs = Date.now();
       }
+      // Count only completed entries; a 429 or interrupted ingest retries this index.
+      pending.detected++;
       pending.processed++;
       pending.pageIndex = index + 1;
       if (needsDetail) thisRun++;

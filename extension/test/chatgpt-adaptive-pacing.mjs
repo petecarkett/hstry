@@ -102,6 +102,8 @@ try {
   assert.equal(rateLimited.state.healthyReads, 0);
   assert(rateLimited.retryAfterMinutes >= 5);
   assert.equal(rateLimited.state.pending.pageIndex, 25);
+  assert.equal(rateLimited.state.pending.detected, rateLimited.state.pending.processed,
+    'a rate-limited item must not inflate the detected count');
   assert(rateLimited.state.pending.cachedPage?.items.length === 26);
   const pagesBefore429Retry = listCalls;
 
@@ -109,6 +111,8 @@ try {
   assert.equal(second429.state.paceMs, 192_000, 'repeated 429 slows down again');
   assert.equal(listCalls, pagesBefore429Retry, '429 retry reuses the same saved page');
   assert.equal(second429.state.pending.pageIndex, 25);
+  assert.equal(second429.state.pending.detected, rateLimited.state.pending.detected,
+    'repeated 429s must not count the same item again');
 
   newDetailStatus = 200;
   const success = await sync(second429.state);
@@ -117,6 +121,8 @@ try {
   assert.equal(success.retryAfterMinutes, 3.2);
   assert.equal(success.state.healthyReads, 1);
   assert.equal(success.state.pending.rateLimitStreak, 0);
+  assert.equal(success.state.pending.detected, success.state.pending.processed,
+    'recovered item must be counted exactly once');
   assert.deepEqual(ingested.slice(-1), ['fresh']);
   assert.equal(listCalls, pagesBefore429Retry);
 
