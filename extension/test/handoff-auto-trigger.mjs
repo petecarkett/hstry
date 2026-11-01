@@ -18,7 +18,11 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
   let nextTimer = 0;
   let observer;
   let observing = false;
-  const panel = { get textContent() { return screenText; }, parentElement: null };
+  const panel = {
+    get textContent() { return screenText; },
+    get innerText() { return screenText.replace('errorStart', 'error\nStart'); },
+    parentElement: null,
+  };
   const native = {
     textContent: 'Start new chat',
     parentElement: panel,
@@ -53,7 +57,7 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     chrome: {
       runtime: {
         id: 'hstry-extension',
-        getManifest: () => ({ version: '0.4.33' }),
+        getManifest: () => ({ version: '0.4.34' }),
         lastError: null,
         onMessage: { addListener() {} },
         sendMessage(message, done) {
@@ -131,6 +135,20 @@ terminal.redrawPanel();
 terminal.flush();
 await tick();
 assert.equal(terminal.sent.length, 1, 're-render cannot auto-repeat error takeover');
+
+// Real ChatGPT renders separate text elements with no separator in DOM textContent.
+// E.g. textContent='Unknown errorStart new chat', innerText='Unknown error\nStart new chat'.
+const realPanel = mount(true, null, true, '', 'Unknown errorStart new chat');
+realPanel.flush();
+await tick();
+assert.ok(realPanel.button, 'real adjacent DOM text must expose manual HSTRY recovery');
+assert.equal(realPanel.sent.length, 0, 'generic errors must not launch automatically');
+
+const unrelatedPanel = mount(true, null, true, '', 'Unknown errorsStart new chat');
+unrelatedPanel.flush();
+await tick();
+assert.equal(unrelatedPanel.button, null,
+  'similar but nonmatching errors must not trigger HSTRY recovery');
 
 const strayError = mount(true, null, true, '', 'Unknown error');
 strayError.flush();
@@ -232,10 +250,10 @@ changedChat.flush();
 await tick();
 assert.equal(changedChat.sent.length, 0, 'activity in another conversation is not a trigger');
 
-const obsolete = mount(true, { version: '0.4.33', isLive: () => false });
+const obsolete = mount(true, { version: '0.4.34', isLive: () => false });
 obsolete.flush();
 assert.ok(obsolete.button, 'stale same-version context must be replaced');
-const live = mount(true, { version: '0.4.33', isLive: () => true });
+const live = mount(true, { version: '0.4.34', isLive: () => true });
 live.flush();
 assert.equal(live.button, null, 'healthy same-version handler remains installed');
 
