@@ -137,7 +137,7 @@
     if (!/\/c\/[0-9a-f-]{36}/i.test(location.pathname)) return;
     const serverLimit = serverLimitPath === location.pathname;
     const pageText = document.body?.textContent || '';
-    if (!serverLimit && !WARNING.test(pageText) && !/\bunknown error/i.test(pageText)) return;
+    if (!serverLimit && !WARNING.test(pageText) && !/unknown error/i.test(pageText)) return;
     const native = [...document.querySelectorAll('button, a')].find(node =>
       /start new chat/i.test(node.textContent || ''));
     if (!native && !serverLimit) return;

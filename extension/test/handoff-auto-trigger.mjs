@@ -6,7 +6,7 @@ const script = readFileSync(new URL('../handoff-content.js', import.meta.url), '
 const warning = "You've reached the maximum length for this conversation. You can keep talking by starting a new chat.";
 const path = '/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/6add53d9-4c88-83ed-a57d-6a602a257293';
 
-function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning, hasNative = true) {
+function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning, hasNative = true, precedingText = '') {
   let visible = active;
   let focused = active;
   let reachedLimit = initialWarning;
@@ -29,7 +29,7 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     insertAdjacentElement(_position, element) { button = element; },
   };
   const document = {
-    body: { get textContent() { return reachedLimit ? screenText : ''; },
+    body: { get textContent() { return reachedLimit ? precedingText + screenText : ''; },
       append(element) { if (element.id === 'hstry-continue-chat') button = element; } },
     get visibilityState() { return visible ? 'visible' : 'hidden'; },
     hasFocus: () => focused,
@@ -57,7 +57,7 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     chrome: {
       runtime: {
         id: 'hstry-extension',
-        getManifest: () => ({ version: '0.4.34' }),
+        getManifest: () => ({ version: '0.4.36' }),
         lastError: null,
         onMessage: { addListener() {} },
         sendMessage(message, done) {
@@ -143,6 +143,15 @@ realPanel.flush();
 await tick();
 assert.ok(realPanel.button, 'real adjacent DOM text must expose manual HSTRY recovery');
 assert.equal(realPanel.sent.length, 0, 'generic errors must not launch automatically');
+
+// ChatGPT may join the previous message with the error panel in body.textContent.
+const adjacentPreviousMessage = mount(true, null, true, '', 'Unknown errorStart new chat', true, 'keep going');
+adjacentPreviousMessage.flush();
+await tick();
+assert.ok(adjacentPreviousMessage.button,
+  'recovery button must appear when previous message directly precedes native error');
+assert.equal(adjacentPreviousMessage.sent.length, 0,
+  'generic errors must still require a manual click');
 
 const unrelatedPanel = mount(true, null, true, '', 'Unknown errorsStart new chat');
 unrelatedPanel.flush();
@@ -250,10 +259,10 @@ changedChat.flush();
 await tick();
 assert.equal(changedChat.sent.length, 0, 'activity in another conversation is not a trigger');
 
-const obsolete = mount(true, { version: '0.4.34', isLive: () => false });
+const obsolete = mount(true, { version: '0.4.36', isLive: () => false });
 obsolete.flush();
 assert.ok(obsolete.button, 'stale same-version context must be replaced');
-const live = mount(true, { version: '0.4.34', isLive: () => true });
+const live = mount(true, { version: '0.4.36', isLive: () => true });
 live.flush();
 assert.equal(live.button, null, 'healthy same-version handler remains installed');
 
