@@ -160,18 +160,26 @@ function refreshOpenChatScripts() {
     if (!chrome.scripting?.executeScript) return;
     const version = chrome.runtime.getManifest().version;
     const saved = await chrome.storage.session.get(CONTENT_VERSION_KEY);
-    if (saved[CONTENT_VERSION_KEY] === version) return;
-    const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
-    // A suspended tab can leave executeScript pending indefinitely. Bound the
-    // refresh; future navigations receive the manifest content script normally.
+    const refreshed = saved[CONTENT_VERSION_KEY] === version;
+    // After a worker restart, the current tab may still lack its content script.
+    // Recheck only active chats; a version change still refreshes all open chats.
+    const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*',
+      ...(refreshed ? { active: true } : {}) });
     const injections = Promise.allSettled(tabs.filter(tab => Number.isInteger(tab.id)).flatMap(tab => [
       chrome.scripting.executeScript({ target: { tabId: tab.id },
         files: ['handoff-network.js'], world: 'MAIN' }),
       chrome.scripting.executeScript({ target: { tabId: tab.id },
         files: ['handoff-content.js'] }),
     ]));
-    await Promise.race([injections, new Promise(resolve => setTimeout(resolve, 3000))]);
-    await chrome.storage.session.set({ [CONTENT_VERSION_KEY]: version });
+    // Do not certify a sweep when a suspended tab timed out or rejected injection.
+    let timeout;
+    const results = await Promise.race([injections, new Promise(resolve => {
+      timeout = setTimeout(() => resolve(null), 3000);
+    })]);
+    clearTimeout(timeout);
+    if (!refreshed && results?.every(result => result.status === 'fulfilled')) {
+      await chrome.storage.session.set({ [CONTENT_VERSION_KEY]: version });
+    }
   })().catch(() => {}).finally(() => { contentRefresh = null; });
   return contentRefresh;
 }
