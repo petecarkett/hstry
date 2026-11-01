@@ -16,7 +16,7 @@ let finished = false;
 let bannerCount = 0;
 let editorValue = '';
 
-// ChatGPT currently uses a ProseMirror div[contenteditable][role=textbox].
+// ChatGPT uses a ProseMirror div[contenteditable][data-composer-markdown].
 const editor = {
   get textContent() { return editorValue; },
   set textContent(value) { editorValue = value; },
@@ -34,7 +34,7 @@ const context = {
     body: { textContent: '' },
     getElementById: () => null,
     querySelectorAll: selector => {
-      if (selector.startsWith('#prompt-textarea') && selector.includes('[contenteditable="true"][role="textbox"]')) return ready ? [editor] : [];
+      if (selector.startsWith('#prompt-textarea') && selector.includes('[contenteditable="true"][data-composer-markdown]')) return ready ? [editor] : [];
       if (selector.startsWith('button[data-testid="send-button"]')) {
         return editorValue ? [sendButton] : [];
       }

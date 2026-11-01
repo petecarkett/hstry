@@ -6,7 +6,7 @@ const script = readFileSync(new URL('../handoff-content.js', import.meta.url), '
 const warning = "You've reached the maximum length for this conversation. You can keep talking by starting a new chat.";
 const path = '/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/6add53d9-4c88-83ed-a57d-6a602a257293';
 
-function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning, hasNative = true, precedingText = '') {
+function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning, hasNative = true, precedingText = '', unrelatedEditorText = '', hasAttachment = false) {
   let visible = active;
   let focused = active;
   let reachedLimit = initialWarning;
@@ -34,12 +34,21 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     get visibilityState() { return visible ? 'visible' : 'hidden'; },
     hasFocus: () => focused,
     getElementById(id) { return id === 'hstry-continue-chat' ? button : null; },
+    querySelector: () => hasAttachment ? {} : null,
     querySelectorAll(query) {
       if (query === 'button, a') return hasNative ? [native] : [];
-      if (draft && query.startsWith('#prompt-textarea')) return [{
-        textContent: draft, hasAttribute: () => false,
-        getBoundingClientRect: () => ({ width: 350, height: 45 }),
-      }];
+      if (query === 'input[type="file"]') return hasAttachment ? [{ files: [{}] }] : [];
+      if (query.startsWith('#prompt-textarea')) {
+        const field = text => ({
+          textContent: text, hasAttribute: () => false,
+          getBoundingClientRect: () => ({ width: 350, height: 45 }),
+        });
+        return [
+          ...(unrelatedEditorText && query.includes(', [contenteditable="true"][role="textbox"]')
+            ? [field(unrelatedEditorText)] : []),
+          ...(draft ? [field(draft)] : []),
+        ];
+      }
       return [];
     },
     createElement() {
@@ -57,7 +66,7 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     chrome: {
       runtime: {
         id: 'hstry-extension',
-        getManifest: () => ({ version: '0.4.36' }),
+        getManifest: () => ({ version: '0.4.38' }),
         lastError: null,
         onMessage: { addListener() {} },
         sendMessage(message, done) {
@@ -93,15 +102,17 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     focus() { visible = true; focused = true; events.get('window:focus')?.(); },
     setLimited(value = true) { reachedLimit = value; },
     setPath(value) { location.pathname = value; },
-    submitByClick() {
-      events.get('click')({ target: { closest: selector =>
+    submitByClick(trusted = true) {
+      events.get('click')({ isTrusted: trusted, target: { closest: selector =>
         selector.includes('send-button') ? {} : null } });
     },
-    submitByEnter() {
+    submitByEnter(trusted = true, writingBlock = false) {
       events.get('keydown')({
-        key: 'Enter', shiftKey: false, ctrlKey: false, metaKey: false,
+        isTrusted: trusted, key: 'Enter', shiftKey: false, ctrlKey: false, metaKey: false,
         altKey: false, isComposing: false,
-        target: { closest: selector => selector.includes('contenteditable') ? {} : null },
+        target: { closest: selector => writingBlock
+          ? (selector.includes(', [contenteditable="true"][role="textbox"]') ? {} : null)
+          : (selector.includes('data-composer-markdown') ? {} : null) },
       });
     },
     manualClick() { clickButton({ preventDefault() {} }); },
@@ -152,6 +163,84 @@ assert.ok(adjacentPreviousMessage.button,
   'recovery button must appear when previous message directly precedes native error');
 assert.equal(adjacentPreviousMessage.sent.length, 0,
   'generic errors must still require a manual click');
+
+// A writing block is editable but is not the ChatGPT message composer.
+const separateWritingBlock = mount(true, null, true, '', 'Unknown errorStart new chat',
+  true, '', 'Agent Handoff: a long document already in the conversation');
+separateWritingBlock.flush();
+await tick();
+separateWritingBlock.manualClick();
+await tick();
+assert.equal(separateWritingBlock.sent.length, 1,
+  'a separate writing block must not prevent continuing with an empty composer');
+
+// A fresh, trusted message whose response displays the native terminal panel
+// should recover automatically; stale errors remain manual above.
+const freshTerminal = mount(false, null, true, '', 'Unknown errorStart new chat');
+freshTerminal.flush();
+freshTerminal.submitByClick();
+freshTerminal.setLimited();
+freshTerminal.mutate();
+freshTerminal.flush();
+await tick();
+assert.ok(freshTerminal.button, 'new terminal error exposes recovery');
+assert.equal(freshTerminal.sent.length, 1, 'fresh terminal error auto-continues once');
+assert.equal(freshTerminal.sent[0].automatic, true);
+freshTerminal.redrawPanel();
+freshTerminal.flush();
+await tick();
+assert.equal(freshTerminal.sent.length, 1, 'error-panel redraw cannot create a second continuation');
+
+const freshKeyboardTerminal = mount(false, null, true, '', 'Unknown errorStart new chat');
+freshKeyboardTerminal.flush();
+freshKeyboardTerminal.submitByEnter();
+freshKeyboardTerminal.setLimited();
+freshKeyboardTerminal.mutate();
+freshKeyboardTerminal.flush();
+await tick();
+assert.equal(freshKeyboardTerminal.sent.length, 1, 'trusted Enter submission auto-recovers');
+
+const programmaticTerminal = mount(false, null, true, '', 'Unknown errorStart new chat');
+programmaticTerminal.flush();
+programmaticTerminal.submitByClick(false);
+programmaticTerminal.setLimited();
+programmaticTerminal.mutate();
+programmaticTerminal.flush();
+await tick();
+assert.ok(programmaticTerminal.button, 'programmatic send keeps manual recovery');
+assert.equal(programmaticTerminal.sent.length, 0, 'programmatic HSTRY send cannot start a recovery loop');
+
+const writingBlockEnter = mount(false, null, true, '', 'Unknown errorStart new chat');
+writingBlockEnter.flush();
+writingBlockEnter.submitByEnter(true, true);
+writingBlockEnter.setLimited();
+writingBlockEnter.mutate();
+writingBlockEnter.flush();
+await tick();
+assert.equal(writingBlockEnter.sent.length, 0, 'writing-block Enter is not a ChatGPT submission');
+
+const draftOnError = mount(false, null, true, 'unsent text', 'Unknown errorStart new chat');
+draftOnError.flush();
+draftOnError.submitByClick();
+draftOnError.setLimited();
+draftOnError.mutate();
+draftOnError.flush();
+await tick();
+assert.ok(draftOnError.button && !draftOnError.button.disabled,
+  'unsafe automatic attempt preserves the manual button');
+assert.equal(draftOnError.sent.length, 0, 'actual unsent draft prevents automatic navigation');
+
+const attachedTerminal = mount(false, null, true, '', 'Unknown errorStart new chat',
+  true, '', '', true);
+attachedTerminal.flush();
+attachedTerminal.submitByClick();
+attachedTerminal.setLimited();
+attachedTerminal.mutate();
+attachedTerminal.flush();
+await tick();
+assert.ok(attachedTerminal.button && !attachedTerminal.button.disabled,
+  'attachments preserve the manual recovery button');
+assert.equal(attachedTerminal.sent.length, 0, 'attachment cannot be discarded by automatic navigation');
 
 const unrelatedPanel = mount(true, null, true, '', 'Unknown errorsStart new chat');
 unrelatedPanel.flush();
@@ -259,10 +348,10 @@ changedChat.flush();
 await tick();
 assert.equal(changedChat.sent.length, 0, 'activity in another conversation is not a trigger');
 
-const obsolete = mount(true, { version: '0.4.36', isLive: () => false });
+const obsolete = mount(true, { version: '0.4.38', isLive: () => false });
 obsolete.flush();
 assert.ok(obsolete.button, 'stale same-version context must be replaced');
-const live = mount(true, { version: '0.4.36', isLive: () => true });
+const live = mount(true, { version: '0.4.38', isLive: () => true });
 live.flush();
 assert.equal(live.button, null, 'healthy same-version handler remains installed');
 

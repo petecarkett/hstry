@@ -48,18 +48,20 @@
   let checkingHandoff = false;
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-  // Only newly reached limits after a real user submission auto-continue.
-  // Existing expired chats opened after an update retain their manual button.
+  // Only a real user submission may automatically recover a generic error.
+  // Programmatic HSTRY handoff sends and historical errors stay manual.
   document.addEventListener('click', event => {
-    if (event.target?.closest?.('button[data-testid="send-button"], '+
+    if (event.isTrusted && event.target?.closest?.('button[data-testid="send-button"], '+
         'button[aria-label="Send prompt"], button[aria-label="Send message"], '+
         'button[aria-label="Send"]')) submittedPath = location.pathname;
   }, true);
   document.addEventListener('keydown', event => {
-    if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey &&
+    if (event.isTrusted && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey &&
         !event.metaKey && !event.altKey && !event.isComposing &&
         event.target?.closest?.('#prompt-textarea, [data-testid="prompt-textarea"], '+
-          '[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"]')) {
+          '[contenteditable="true"][data-composer-markdown], '+
+          '[data-composer-body] [contenteditable="true"][role="textbox"], '+
+          'textarea[placeholder*="Message"]')) {
       submittedPath = location.pathname;
     }
   }, true);
@@ -141,8 +143,8 @@
     const native = [...document.querySelectorAll('button, a')].find(node =>
       /start new chat/i.test(node.textContent || ''));
     if (!native && !serverLimit) return;
-    // Generic errors remain manual; only a native length warning or exact
-    // server rejection permits automatic continuation.
+    // Only generic terminal errors following a trusted submission may auto-continue.
+    // Existing errors and programmatic submissions remain manual.
     // DOM textContent joins adjacent labels ('Unknown errorStart new chat').
     // Rendered innerText preserves the visual line break between the labels.
     const terminalError = node => {
@@ -156,9 +158,10 @@
     }
     if (!serverLimit && (!panel || (panel.textContent || '').length > 1500)) return;
     const explicitLimit = serverLimit || WARNING.test(panel?.textContent || '');
+    const newTerminalError = !explicitLimit && submittedPath === location.pathname && terminalError(panel);
     if (!explicitLimit && !terminalError(panel)) return;
     const existing = document.getElementById('hstry-continue-chat');
-    if (existing) { if (explicitLimit) autoContinue(existing); return; }
+    if (existing) { if (explicitLimit || newTerminalError) autoContinue(existing); return; }
     const btn = document.createElement('button');
     btn.id = 'hstry-continue-chat';
     btn.type = 'button';
@@ -180,7 +183,7 @@
       resumePending = false;
       submittedPath = null;
       void startTakeover(btn);
-    } else if (explicitLimit) {
+    } else if (explicitLimit || newTerminalError) {
       autoContinue(btn);
     }
   }
@@ -188,8 +191,9 @@
   function editableElement() {
     const matches = document.querySelectorAll(
       '#prompt-textarea, [data-testid="prompt-textarea"], '+
-      '[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"], '+
-      '[contenteditable="true"][data-placeholder]');
+      '[contenteditable="true"][data-composer-markdown], '+
+      '[data-composer-body] [contenteditable="true"][role="textbox"], '+
+      'textarea[placeholder*="Message"], [contenteditable="true"][data-placeholder]');
     return [...matches].find(el => el.getBoundingClientRect().width > 0 &&
       el.getBoundingClientRect().height > 0 && !el.hasAttribute('disabled')) || null;
   }
