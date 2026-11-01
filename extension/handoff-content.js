@@ -137,22 +137,26 @@
     if (!/\/c\/[0-9a-f-]{36}/i.test(location.pathname)) return;
     const serverLimit = serverLimitPath === location.pathname;
     const pageText = document.body?.textContent || '';
-    if (!serverLimit && !WARNING.test(pageText) && !/\bunknown error\b/i.test(pageText)) return;
+    if (!serverLimit && !WARNING.test(pageText) && !/\bunknown error/i.test(pageText)) return;
     const native = [...document.querySelectorAll('button, a')].find(node =>
       /start new chat/i.test(node.textContent || ''));
     if (!native && !serverLimit) return;
     // Generic errors remain manual; only a native length warning or exact
     // server rejection permits automatic continuation.
-    const terminalError = text =>
-      /\bunknown error\b/i.test(text) && /start new chat/i.test(text);
+    // DOM textContent joins adjacent labels ('Unknown errorStart new chat').
+    // Rendered innerText preserves the visual line break between the labels.
+    const terminalError = node => {
+      const text = node?.innerText || node?.textContent || '';
+      return /\bunknown error\b/i.test(text) && /start new chat/i.test(text);
+    };
     let panel = native?.parentElement || null;
     for (let i = 0; i < 5 && panel && !WARNING.test(panel.textContent || '') &&
-        !terminalError(panel.textContent || ''); i++) {
+        !terminalError(panel); i++) {
       panel = panel.parentElement;
     }
     if (!serverLimit && (!panel || (panel.textContent || '').length > 1500)) return;
     const explicitLimit = serverLimit || WARNING.test(panel?.textContent || '');
-    if (!explicitLimit && !terminalError(panel?.textContent || '')) return;
+    if (!explicitLimit && !terminalError(panel)) return;
     const existing = document.getElementById('hstry-continue-chat');
     if (existing) { if (explicitLimit) autoContinue(existing); return; }
     const btn = document.createElement('button');
