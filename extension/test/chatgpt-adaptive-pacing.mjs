@@ -115,7 +115,9 @@ try {
     'repeated 429s must not count the same item again');
 
   newDetailStatus = 200;
-  const success = await sync(second429.state);
+  const legacyCheckpoint = structuredClone(second429.state);
+  legacyCheckpoint.pending.detected += 400; // Legacy 429 retries inflated this count.
+  const success = await sync(legacyCheckpoint);
   assert.equal(success.state.paceMs, 192_000,
     'one success does not prematurely restore the higher request rate');
   assert.equal(success.retryAfterMinutes, 3.2);

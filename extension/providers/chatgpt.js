@@ -644,6 +644,8 @@ export async function syncChatGPT({
   if (tokenInfo.fetched) return queueNext(state ?? {});
   const token = tokenInfo.token;
   let pending = state?.pending?.scopes ? { ...state.pending } : null;
+  // Historical 429 retries inflated detected without advancing processed.
+  if (pending) pending.detected = pending.processed;
   if (!pending && pacedMode) {
     const discovery = state?.discovery ?? {
       accounts: null, accountIndex: 0, scopes: [], cursor: null,
