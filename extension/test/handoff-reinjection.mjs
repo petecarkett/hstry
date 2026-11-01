@@ -5,14 +5,31 @@ import assert from 'node:assert/strict';
 const session = new Map();
 let injections = 0;
 const injected = [];
+const queries = [];
+let blockedTab = 43;
+const tabs = [
+  { id: 42, active: true, url: 'https://chatgpt.com/c/test' },
+  { id: 43, active: false, url: 'https://chatgpt.com/c/other' },
+];
+// Accelerate only the bounded production timeout; preserve regular test delays.
+const nativeSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (fn, ms, ...args) =>
+  nativeSetTimeout(fn, ms === 3000 ? 10 : ms, ...args);
 const on = { addListener() {} };
 globalThis.chrome = {
   runtime: { getManifest: () => ({ version: '0.4.23' }), onMessage: on, onInstalled: on },
   tabs: {
     onUpdated: on, onActivated: on, onRemoved: on,
-    query: async () => [{ id: 42, url: 'https://chatgpt.com/c/test' }],
+    query: async filters => {
+      queries.push(filters);
+      return filters.active ? tabs.filter(tab => tab.active) : tabs;
+    },
   },
-  scripting: { executeScript: async options => { injections++; injected.push(options); } },
+  scripting: { executeScript: options => {
+    injections++; injected.push(options);
+    if (options.target.tabId === blockedTab) return new Promise(() => {});
+    return Promise.resolve();
+  } },
   storage: {
     local: { get: async () => ({ hstryTakeoverContentVersion: '0.4.23' }) },
     session: {
@@ -29,16 +46,26 @@ async function boot(n) {
 }
 
 await boot(1);
-assert.equal(injections, 2, 'first load injects both network observer and handoff');
+assert.equal(injections, 4, 'first sweep attempts both scripts in each open chat');
 assert.equal(injected[0].world, 'MAIN', 'network observer uses page-world fetch');
 assert.deepEqual(injected.slice(0, 2).map(x => x.files[0]),
   ['handoff-network.js', 'handoff-content.js']);
+assert.equal(session.has('hstryTakeoverContentVersion'), false,
+  'a suspended tab must not mark the entire sweep complete');
+
+blockedTab = null;
+await boot(2);
+assert.equal(injections, 8, 'unfinished sweep retries on the next worker start');
 assert.equal(session.get('hstryTakeoverContentVersion'), '0.4.23');
 
-await boot(2);
-assert.equal(injections, 2, 'service worker restart must not repeat tab-wide injection');
-
-session.clear(); // Chrome clears storage.session on extension reload, even without a version bump.
 await boot(3);
-assert.equal(injections, 4, 'same-version reload must replace both observers');
-console.log('PASS same-version reload reinjects; ordinary worker restart does not');
+assert.equal(injections, 10, 'worker restart repairs the active tab even with a saved version');
+assert.equal(queries.at(-1).active, true, 'completed sweep skips inactive tabs');
+assert.deepEqual(injected.slice(-2).map(x => x.target.tabId), [42, 42]);
+
+session.clear(); // Chrome clears session storage on extension reload.
+await boot(4);
+assert.equal(injections, 14, 'same-version reload must replace observers across open tabs');
+assert.equal(session.get('hstryTakeoverContentVersion'), '0.4.23');
+globalThis.setTimeout = nativeSetTimeout;
+console.log('PASS partial sweep retries; active tab recovers after worker restart and reload');
