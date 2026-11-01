@@ -56,6 +56,7 @@ assert.equal(Object.keys(canonicalMessages({ mapping: { m: { id: messageId, mess
 // Content script simulation: no ChatGPT API requests, only local extension
 // messages after DOM changes. The existing page's older turns are baseline.
 const captured = [];
+const events = new Map();
 const timers = [];
 let observer;
 const makeTurn = (id, role, content) => ({
@@ -75,6 +76,7 @@ const elements = [
 const fake = {
   location: { pathname: `/g/${projectId}-1hood/c/${conversationId}` },
   document: { documentElement: {}, title: 'Test chat', querySelectorAll: () => elements },
+  addEventListener: (type, callback) => events.set(type, callback),
   chrome: { runtime: { sendMessage: async msg => { captured.push(msg); return { ok: true }; } } },
   setTimeout: fn => { timers.push(fn); return timers.length; },
   clearTimeout: () => {},
@@ -102,6 +104,21 @@ observer([]);
 await trigger();
 assert.equal(captured.length, 3);
 assert.equal(captured[2].capture.content, 'completed reply');
+const nativeListener = events.get('hstry:native-conversation-page');
+assert.equal(typeof nativeListener, 'function', 'native history pages must be observed');
+nativeListener({ detail: { conversationId, turns: [
+  { messageId: '00000000-0000-0000-0000-000000000001', role: 'user', content: 'old 1' },
+  { messageId: '00000000-0000-0000-0000-000000000005', role: 'user', content: 'older history' },
+  { messageId, role: 'user', content: 'hello live' },
+] } });
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(captured.length, 5, 'native pages recover unseen history and initially skipped DOM messages');
+assert.equal(captured.at(-1).capture.content, 'older history');
+nativeListener({ detail: { conversationId, turns: [
+  { messageId: '00000000-0000-0000-0000-000000000005', role: 'user', content: 'older history' },
+] } });
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(captured.length, 5, 'the same native page cannot duplicate captures');
 vm.runInNewContext(script, fake);
 assert.equal(timers.length, 0, 'double injection is blocked');
 console.log('PASS live capture: URL/security/size validation, durable dedupe, canonical reconciliation, DOM observer, no duplicate injection');

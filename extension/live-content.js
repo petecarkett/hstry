@@ -5,6 +5,7 @@
   globalThis.__hstryLiveCaptureInitialized = true;
   const msgId = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   const seen = new Map();
+  const skippedBaseline = new Set();
   const pending = new Map();
   let lastConversation = null;
   let observerTimer = null;
@@ -56,6 +57,7 @@
     if (initial) {
       lastConversation = route.conversationId;
       seen.clear();
+      skippedBaseline.clear();
     }
     const messages = [...document.querySelectorAll('[data-chatgpt-search-message-ids]')]
       .map(node => visibleMessage(node, route)).filter(Boolean);
@@ -64,10 +66,12 @@
       const key = `${msg.conversationId}:${msg.messageId}`;
       if (initial && i < messages.length - 2) {
         seen.set(key, msg.content);
+        skippedBaseline.add(key);
         continue;
       }
       if (seen.get(key) === msg.content) continue;
       seen.set(key, msg.content);
+      skippedBaseline.delete(key);
       pending.set(key, msg);
     }
     flush();
@@ -77,8 +81,32 @@
     clearTimeout(observerTimer);
     observerTimer = setTimeout(scan, 1200);
   }
+  // Native history pages can disappear from the virtualized DOM immediately.
+  // Listen before DOM readiness so even the first successful page is retained.
+  globalThis.addEventListener('hstry:native-conversation-page', event => {
+    const route = currentRoute();
+    if (!route || event.detail?.conversationId !== route.conversationId ||
+        !Array.isArray(event.detail.turns)) return;
+    for (const turn of event.detail.turns) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(turn?.messageId ?? '') ||
+          !['user', 'assistant'].includes(turn?.role) ||
+          typeof turn.content !== 'string' || !turn.content.trim() ||
+          turn.content.length > 500_000) continue;
+      const key = `${route.conversationId}:${turn.messageId}`;
+      if (seen.get(key) === turn.content && !skippedBaseline.has(key)) continue;
+      skippedBaseline.delete(key);
+      seen.set(key, turn.content);
+      pending.set(key, { ...route, ...turn, title: document.title });
+    }
+    flush();
+  });
+
   const observer = new MutationObserver(schedule);
-  observer.observe(document.documentElement, { childList: true, subtree: true,
-    characterData: true, attributes: true, attributeFilter: ['data-chatgpt-search-message-ids'] });
-  schedule();
+  function startObserver() {
+    if (!document.documentElement) { setTimeout(startObserver, 50); return; }
+    observer.observe(document.documentElement, { childList: true, subtree: true,
+      characterData: true, attributes: true, attributeFilter: ['data-chatgpt-search-message-ids'] });
+    schedule();
+  }
+  startObserver();
 })();

@@ -46,7 +46,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
       }
       const entries = Object.values((await chrome.storage.local.get('liveCaptureQueue')).liveCaptureQueue || {});
-      const pending = entries.filter(v => v && !v.indexedAt &&
+      // Indexed live captures are still provisional until canonical history
+      // confirms and removes them from this queue.
+      const pending = entries.filter(v => v &&
         (v.conversationId === parsed.id || v.conversation_id === parsed.id)).length;
       if (msg.failedMessage !== undefined &&
           (typeof msg.failedMessage !== 'string' || msg.failedMessage.length > 8000)) {

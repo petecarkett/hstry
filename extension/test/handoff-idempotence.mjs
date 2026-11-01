@@ -64,12 +64,21 @@ const send = (url, type, tabId, automatic = false, frameUrl = url, extra = {}) =
   assert.equal(keepOpen, true);
 });
 
+local.set('liveCaptureQueue', {
+  indexedProvisional: { conversationId: sourceId, indexedAt: 1234 },
+  waitingLocalIngest: { conversationId: sourceId },
+  unrelated: { conversationId: '11111111-1111-4111-8111-111111111111', indexedAt: 1234 },
+});
 const [first, same] = await Promise.all([
   send(original, 'HSTRY_TAKEOVER_START', 1, true, landing,
     { failedMessage: 'now?', missingAttachments: true }),
   send(original, 'HSTRY_TAKEOVER_START', 2, true),
 ]);
 assert.equal(first.ok, true);
+assert.equal(first.pendingCaptures, 2,
+  'locally indexed provisional messages remain unverified until canonical history');
+assert.match(session.get('hstryTakeoverTab:1').prompt, /2 live capture\(s\).*canonical history/i,
+  'handoff warns that provisional content is not the complete canonical transcript');
 assert.equal(first.tabId, 1, 'destination retains the original tab ID');
 assert.equal(same.tabId, first.tabId, 'two requests reuse one handoff');
 assert.equal(updates, 1, 'only the source tab navigates');
