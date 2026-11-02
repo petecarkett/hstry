@@ -1,4 +1,4 @@
-import { DEFAULT_PROVIDER_SETTINGS, badgeState, friendlyError, formatTime, normalizeSettings, progressDetail, providerState } from '../ui.js';
+import { DEFAULT_PROVIDER_SETTINGS, badgeState, friendlyError, formatTime, normalizeSettings, progressDetail, providerState, failureStatusMessage } from '../ui.js';
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -55,6 +55,12 @@ check('server header time is distinguished from client schedule', providerState(
   state: { serverRetryAfterUntilMs: Date.now() + 2 * 60_000 },
 }, true).detail.includes('server retry hint'), true);
 check('progress detail omits empty counters', progressDetail({ detected: 4, processed: 1 }), '4 detected · 1 processed');
+check('attempt count is not presented as distinct missing conversations', progressDetail({ detected: 50, processed: 20, failed: 96 }), '50 detected · 20 processed · 96 failed attempts');
+const inaccessible = Array.from({ length: 13 }, (_, i) => ({ conversationId: 'id-' + (i % 7), resolvedAtMs: null, accessVerification: {code:'conversation_inaccessible',canRetry:false} }));
+check('duplicate scopes do not inflate inaccessible conversation count', failureStatusMessage(13, inaccessible), '7 distinct inaccessible conversation(s) across 13 scope records; verify source access or retention');
+check('untracked attempts remain explicitly unresolved', failureStatusMessage(16, inaccessible), '16 unresolved failure records; 7 distinct inaccessible conversation(s), others remain retryable or untracked');
+check('resolved records do not inflate counts', failureStatusMessage(1, [{ ...inaccessible[0], resolvedAtMs: Date.now() }, inaccessible[0]]), '1 distinct inaccessible conversation(s) across 1 scope record; verify source access or retention');
+check('zero failures clears status message', failureStatusMessage(0, inaccessible), null);
 check('visible settings normalize before sync', normalizeSettings({
   port: '3434',
   token: ' hello ',

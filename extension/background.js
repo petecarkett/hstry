@@ -5,7 +5,7 @@ import './handoff-background.js';
 import { NotLoggedInError } from './lib/common.js';
 import { appendLiveCapture, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName } from './lib/live-capture.js';
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS } from './providers/index.js';
-import { badgeState } from './ui.js';
+import { badgeState, failureStatusMessage } from './ui.js';
 
 const DEFAULT_SETTINGS = {
   port: 41770,
@@ -404,14 +404,8 @@ async function runSync(
         // A saved batch is not a completed sync across all project scopes.
         if (!result.hasMore && !result.failures) entry.lastSuccessMs = Date.now();
         entry.lastCount = result.conversations;
-        const inaccessible = (entry.state?.failureDetails ?? []).filter(failure =>
-          !failure.resolvedAtMs && failure.accessVerification?.code ===
-          'conversation_inaccessible' && failure.accessVerification.canRetry === false).length;
-        entry.lastError = result.failures
-          ? inaccessible === result.failures
-            ? `${inaccessible} conversation(s) inaccessible; account access is required`
-            : `${result.failures} conversation(s) unresolved; ${inaccessible} inaccessible, others retryable`
-          : null;
+        entry.lastError = failureStatusMessage(result.failures,
+          entry.state?.failureDetails);
         entry.running = false;
         entry.continuationPending = Boolean(result.hasMore);
         entry.progress = {
