@@ -46,26 +46,26 @@ async function boot(n) {
 }
 
 await boot(1);
-assert.equal(injections, 4, 'first sweep attempts both scripts in each open chat');
+assert.equal(injections, 6, 'first sweep installs all three observers in each open chat');
 assert.equal(injected[0].world, 'MAIN', 'network observer uses page-world fetch');
-assert.deepEqual(injected.slice(0, 2).map(x => x.files[0]),
-  ['handoff-network.js', 'handoff-content.js']);
+assert.deepEqual(injected.slice(0, 3).map(x => x.files[0]),
+  ['handoff-network.js', 'handoff-content.js', 'live-content.js']);
 assert.equal(session.has('hstryTakeoverContentVersion'), false,
   'a suspended tab must not mark the entire sweep complete');
 
 blockedTab = null;
 await boot(2);
-assert.equal(injections, 8, 'unfinished sweep retries on the next worker start');
+assert.equal(injections, 12, 'unfinished sweep retries on the next worker start');
 assert.equal(session.get('hstryTakeoverContentVersion'), '0.4.23');
 
 await boot(3);
-assert.equal(injections, 10, 'worker restart repairs the active tab even with a saved version');
+assert.equal(injections, 15, 'worker restart repairs the active tab even with a saved version');
 assert.equal(queries.at(-1).active, true, 'completed sweep skips inactive tabs');
-assert.deepEqual(injected.slice(-2).map(x => x.target.tabId), [42, 42]);
+assert.deepEqual(injected.slice(-3).map(x => x.target.tabId), [42, 42, 42]);
 
 session.clear(); // Chrome clears session storage on extension reload.
 await boot(4);
-assert.equal(injections, 14, 'same-version reload must replace observers across open tabs');
+assert.equal(injections, 21, 'same-version reload must replace observers across open tabs');
 assert.equal(session.get('hstryTakeoverContentVersion'), '0.4.23');
 globalThis.setTimeout = nativeSetTimeout;
 console.log('PASS partial sweep retries; active tab recovers after worker restart and reload');

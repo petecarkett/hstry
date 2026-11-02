@@ -3,7 +3,7 @@ import './handoff-background.js';
 // new/updated conversations to a local hstry-api instance (POST /ingest).
 
 import { NotLoggedInError } from './lib/common.js';
-import { appendLiveCapture, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName } from './lib/live-capture.js';
+import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName } from './lib/live-capture.js';
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS } from './providers/index.js';
 import { badgeState, failureStatusMessage } from './ui.js';
 
@@ -100,13 +100,17 @@ async function flushLiveCaptures() {
   }
 }
 
-async function handleLiveCapture(raw, sender) {
-  if (sender.id !== chrome.runtime.id || sender.frameId !== 0) return { ok: false };
-  const item = validLiveCapture(raw, sender.tab?.url ?? '');
-  if (!item) return { ok: false };
+async function handleLiveCaptures(captures, sender) {
+  if (sender.id !== chrome.runtime.id || sender.frameId !== 0 ||
+      !Array.isArray(captures) || !captures.length || captures.length > 25) return { ok: false };
+  const items = captures.map(raw => validLiveCapture(raw, sender.tab?.url ?? ''));
+  if (items.some(item => !item) ||
+      (items.length > 1 && items.reduce((n, item) => n + item.content.length, 0) > 500_000)) {
+    return { ok: false };
+  }
   const settings = await getSettings();
   if (!settings.providers.chatgpt) return { ok: true, paused: true };
-  const pending = await updateLiveQueue(queue => appendLiveCapture(queue, item));
+  const pending = await updateLiveQueue(queue => appendLiveCaptures(queue, items));
   void flushLiveCaptures().catch(error => console.warn('[hstry-sync] live indexing deferred:', error));
   return { ok: true, pending };
 }
@@ -118,16 +122,6 @@ async function settleLiveCapture(canonical) {
   } catch (error) {
     console.warn('[hstry-sync] live capture reconciliation deferred:', error);
   }
-}
-
-async function ensureLiveCaptureObservers() {
-  try {
-    const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
-    await Promise.all(tabs.filter(t => Number.isInteger(t.id) && t.status === 'complete')
-      .map(tab => chrome.scripting.executeScript({
-        target: { tabId: tab.id }, files: ['live-content.js'],
-      }).catch(() => {})));
-  } catch (error) { console.warn('[hstry-sync] live observer bootstrap deferred:', error); }
 }
 
 async function getSettings() {
@@ -449,14 +443,12 @@ chrome.runtime.onInstalled.addListener(() => {
   void flushLiveCaptures();
   ensureAlarm();
   registerEnabledSources();
-  ensureLiveCaptureObservers();
 });
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create(LIVE_ALARM_NAME, { periodInMinutes: 1 });
   void flushLiveCaptures();
   ensureAlarm();
   registerEnabledSources();
-  ensureLiveCaptureObservers();
 });
 
 chrome.alarms.onAlarm.addListener(alarm => {
@@ -482,8 +474,8 @@ chrome.alarms.onAlarm.addListener(alarm => {
 chrome.action.onClicked.addListener(() => runSync('manual'));
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type === 'hstryLiveCapture') {
-    handleLiveCapture(message.capture, sender)
+  if (message?.type === 'hstryLiveCapture' || message?.type === 'hstryLiveCaptureBatch') {
+    handleLiveCaptures(message.type === 'hstryLiveCapture' ? [message.capture] : message.captures, sender)
       .then(sendResponse)
       .catch(error => {
         console.warn('[hstry-sync] live capture failed:', error);

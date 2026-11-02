@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
-import { appendLiveCapture, canonicalMessages, confirmLiveCapture, conversationFromUrl, validLiveCapture, resolveLiveOwner, resolveLiveProjectName } from '../lib/live-capture.js';
+import { appendLiveCapture, appendLiveCaptures, canonicalMessages, confirmLiveCapture, conversationFromUrl, validLiveCapture, resolveLiveOwner, resolveLiveProjectName } from '../lib/live-capture.js';
 
 const conversationId = '6addfdd2-81e0-83eb-b37c-97d7b316d6b8';
 const projectId = 'g-p-6818bc97551c8191865a07d09f7b3678';
@@ -44,6 +44,8 @@ assert.equal(validLiveCapture({ ...raw, url }, 'https://evil.example/c/other'), 
 assert.equal(validLiveCapture({ ...raw, url: 'https://evil.example/c/other' }, url), null);
 const initial = appendLiveCapture({}, value);
 assert.strictEqual(appendLiveCapture(initial, value), initial, 'dedupe identical content');
+assert.strictEqual(appendLiveCaptures(initial, [value, value]), initial,
+  'an unchanged batch does not rewrite the durable queue');
 const edit = appendLiveCapture(initial, { ...value, content: 'hello live again' });
 assert.equal(Object.keys(edit).length, 1);
 assert.notStrictEqual(edit, initial);
@@ -56,6 +58,7 @@ assert.equal(Object.keys(canonicalMessages({ mapping: { m: { id: messageId, mess
 // Content script simulation: no ChatGPT API requests, only local extension
 // messages after DOM changes. The existing page's older turns are baseline.
 const captured = [];
+const sentBatches = [];
 const events = new Map();
 const timers = [];
 let observer;
@@ -73,14 +76,24 @@ const elements = [
   makeTurn(messageId, 'user', 'hello live'),
   makeTurn('00000000-0000-0000-0000-000000000004', 'assistant', 'reply'),
 ];
+let runtimeVersion = '0.4.45';
+const disconnected = [];
 const fake = {
   location: { pathname: `/g/${projectId}-1hood/c/${conversationId}` },
   document: { documentElement: {}, title: 'Test chat', querySelectorAll: () => elements },
   addEventListener: (type, callback) => events.set(type, callback),
-  chrome: { runtime: { sendMessage: async msg => { captured.push(msg); return { ok: true }; } } },
+  removeEventListener: (type, callback) => { if (events.get(type) === callback) events.delete(type); },
+  chrome: { runtime: { id: 'test-extension', getManifest: () => ({ version: runtimeVersion }),
+    sendMessage: async msg => {
+      sentBatches.push(msg);
+      for (const capture of msg.captures ?? [msg.capture]) {
+        captured.push({ type: msg.type, capture });
+      }
+      return { ok: true };
+    } } },
   setTimeout: fn => { timers.push(fn); return timers.length; },
   clearTimeout: () => {},
-  MutationObserver: class { constructor(callback) { observer = callback; } observe() {} },
+  MutationObserver: class { constructor(callback) { observer = callback; } observe() {} disconnect() { disconnected.push(this); } },
 };
 fake.globalThis = fake;
 const { readFileSync } = await import('node:fs');
@@ -95,7 +108,9 @@ const trigger = async () => {
 };
 await trigger();
 assert.deepEqual(captured.map(item => item.capture.messageId), [messageId, '00000000-0000-0000-0000-000000000004']);
-assert(captured.every(x => x.type === 'hstryLiveCapture'));
+assert(captured.every(x => x.type === 'hstryLiveCaptureBatch'));
+assert.equal(sentBatches.length, 1, 'initial live observations use one batch');
+assert.equal(sentBatches[0].captures.length, 2);
 observer([]);
 await trigger();
 assert.equal(captured.length, 2, 'unchanged content never re-sent');
@@ -119,6 +134,54 @@ nativeListener({ detail: { conversationId, turns: [
 ] } });
 await new Promise(resolve => setImmediate(resolve));
 assert.equal(captured.length, 5, 'the same native page cannot duplicate captures');
+const batchStart = sentBatches.length;
+const burst = Array.from({ length: 53 }, (_, i) => ({
+  messageId: '00000000-0000-0000-0000-' + String(i + 100).padStart(12, '0'),
+  role: 'user', content: 'historical turn ' + i,
+}));
+nativeListener({ detail: { conversationId, turns: burst } });
+await new Promise(resolve => setImmediate(resolve));
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(captured.length, 58, 'every observed native message is retained');
+assert.deepEqual(sentBatches.slice(batchStart).map(b => b.captures.length), [25, 25, 3],
+  '53 native observations use only three bounded durable batches');
+
+const largeStart = sentBatches.length;
+const largeTurns = Array.from({ length: 2 }, (_, i) => ({
+  messageId: '00000000-0000-0000-0000-' + String(i + 200).padStart(12, '0'),
+  role: 'user', content: 'x'.repeat(300_000) + i,
+}));
+nativeListener({ detail: { conversationId, turns: largeTurns } });
+await new Promise(resolve => setImmediate(resolve));
+await new Promise(resolve => setImmediate(resolve));
+assert.deepEqual(sentBatches.slice(largeStart).map(b => b.captures.length), [1, 1],
+  'large captures remain valid individually instead of exceeding batch byte budget');
+assert.equal(captured.length, 60);
+const installed = fake.__hstryLiveCaptureInitialized;
 vm.runInNewContext(script, fake);
+assert.equal(fake.__hstryLiveCaptureInitialized, installed, 'same-version reinjection is idempotent');
 assert.equal(timers.length, 0, 'double injection is blocked');
+const pendingId='00000000-0000-0000-0000-000000000333';
+installed.pending.set(conversationId+':'+pendingId, {...value, messageId:pendingId,
+  content:'interrupted capture remains durable until ACK'});
+runtimeVersion='0.4.46';
+vm.runInNewContext(script, fake);
+assert.notEqual(fake.__hstryLiveCaptureInitialized, installed,
+  'new manifest version replaces the prior content observer');
+assert(disconnected.length >= 1, 'old observer is disconnected');
+assert.equal(fake.__hstryLiveCaptureInitialized.pending, installed.pending,
+  'unacknowledged captures survive an extension content-script upgrade');
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(installed.pending.has(conversationId+':'+pendingId), false,
+  'new observer replays the inherited capture and ACKs it');
+const restarted = fake.__hstryLiveCaptureInitialized;
+vm.runInNewContext(script, fake);
+assert.equal(fake.__hstryLiveCaptureInitialized, restarted);
+restarted.stop();
+fake.__hstryLiveCaptureInitialized = true; // v0.4.44 used a legacy Boolean flag.
+runtimeVersion = '0.4.47';
+vm.runInNewContext(script, fake);
+assert.equal(fake.__hstryLiveCaptureInitialized.version, '0.4.47',
+  'new version upgrades old Boolean observer flag in already-open tabs');
+console.log('PASS live capture: bounded batches, versioned reinjection and pending recovery, URL validation, durable dedupe, canonical reconciliation, DOM observer');
 console.log('PASS live capture: URL/security/size validation, durable dedupe, canonical reconciliation, DOM observer, no duplicate injection');
