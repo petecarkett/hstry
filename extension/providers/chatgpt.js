@@ -27,6 +27,8 @@ const OVERLAP_MS = 5 * 60 * 1000;
 const CHUNK_SIZE = 1;
 const PAGES_PER_RUN = 1;
 const PACE_START_MS = 60_000;
+// Successful metadata steps need a short interval, not detail-read cooldown.
+const METADATA_PACE_MINUTES = 1;
 const PACE_MIN_MS = 30_000;
 const PACE_MAX_MS = 15 * 60_000;
 const PACE_HEALTHY_READS = 24;
@@ -697,7 +699,7 @@ export async function syncChatGPT({
       failed: nextState.pending?.failures ?? 0 });
     return { state: nextState, conversations: 0, hasMore: true,
       failures: unresolvedFailureCount(nextState),
-      retryAfterMinutes: paceMs(nextState) / 60_000 };
+      retryAfterMinutes: METADATA_PACE_MINUTES };
   };
   let tokenInfo;
   const authFailed = async (error, nextState) => {
@@ -1127,7 +1129,7 @@ export async function syncChatGPT({
       await report({ phase: 'queued', detected: pending.detected,
         processed: pending.processed, failed: pending.failures });
       return { state: { ...newState, pending: { ...pending } }, conversations: total,
-        hasMore: true, failures: outstanding(), retryAfterMinutes: paceMinutes() };
+        hasMore: true, failures: outstanding(), retryAfterMinutes: METADATA_PACE_MINUTES };
     }
     const { items, next } = page;
     // Inventory uses the already fetched listing: no additional ChatGPT calls.
@@ -1299,7 +1301,7 @@ export async function syncChatGPT({
       // Scanning historical pages is cheap but still bounded per service-worker run.
       if (pagesThisRun >= PAGES_PER_RUN) {
         return { state: { ...newState, pending: { ...pending } }, conversations: total,
-          hasMore: true, failures: outstanding(), retryAfterMinutes: paceMinutes() };
+          hasMore: true, failures: outstanding(), retryAfterMinutes: METADATA_PACE_MINUTES };
       }
       continue;
     }
