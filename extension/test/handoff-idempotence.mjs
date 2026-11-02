@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { recordedContinuations } from '../handoff-core.js';
 
 const original = 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/6add53d9-4c88-83ed-a57d-6a602a257293';
 const landing = 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood';
@@ -97,6 +98,9 @@ assert.equal(creates, 0, 'no second tab is ever created');
 assert.equal(tabs.get(1).url, landing, 'source tab navigated to same-project landing');
 assert.equal(tabs.get(2).url, original, 'unrelated duplicate source tab was left untouched');
 assert.ok(session.get('hstryTakeoverTab:1')?.prompt.includes(original));
+assert.equal(session.get('hstryTakeoverTab:1')?.automatic,true,'automatic classification survives session navigation');
+assert.equal(local.get('hstryTakeoverSource:'+sourceId)?.automatic,true,'automatic start is durable');
+
 assert.ok(session.get('hstryTakeoverTab:1')?.prompt.includes('now?'),
   'failed user message must survive same-tab navigation');
 assert.match(session.get('hstryTakeoverTab:1')?.prompt, /reattach them/,
@@ -131,6 +135,10 @@ assert.equal(done.ok, true);
 assert.equal(done.completed, true);
 assert.equal(session.has('hstryTakeoverTab:1'), false);
 assert.equal(local.get('hstryTakeoverSource:' + sourceId)?.status, 'completed');
+assert.equal(local.get('hstryTakeoverSource:'+sourceId)?.automatic,true,'automatic completion keeps its origin');
+assert.equal(local.get('hstryTakeoverSource:'+sourceId)?.originalUrl,original);
+assert(Number.isFinite(local.get('hstryTakeoverSource:'+sourceId)?.startedAt));
+
 
 tabs.delete(1);
 await import(new URL('../handoff-background.js?test=restart', import.meta.url));
@@ -164,10 +172,27 @@ assert.equal(tabs.get(5).url, another, 'navigation failure leaves original chat 
 assert.equal(session.has('hstryTakeoverTab:5'), false);
 assert.equal(local.has('hstryTakeoverSource:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'), false);
 failNavigation = false;
-const retried = await send(another, 'HSTRY_TAKEOVER_START', 5, true);
+const retried = await send(another, 'HSTRY_TAKEOVER_START', 5, false);
 assert.equal(retried.ok, true);
 assert.equal(tabs.get(5).url, 'https://chatgpt.com/');
 assert.equal(updates, 3);
 assert.equal(creates, 0);
+assert.equal(local.get('hstryTakeoverSource:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')?.automatic,false,
+  'manual continuation is not mislabelled automatic');
+tabs.get(5).url = 'https://chatgpt.com/c/99999999-aaaa-4bbb-8ccc-dddddddddddd';
+const manualDone = await send(tabs.get(5).url, 'HSTRY_TAKEOVER_DONE', 5);
+assert.equal(manualDone.ok,true);
+const history = recordedContinuations(Object.fromEntries(local));
+assert.equal(history.automatic.length,1,'one successful auto continuation is recorded');
+assert.equal(history.manualCount,1,'manual continuation is excluded from auto count');
+assert.equal(history.legacyCount,0);
+assert.equal(history.automatic[0].id,sourceId);
+assert.equal(history.automatic[0].url,original);
+const legacy = recordedContinuations({'hstryTakeoverSource:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee':
+  {status:'completed',completedAt:Date.now()}});
+assert.equal(legacy.legacyCount,1,'older receipts must not be incorrectly labelled auto');
+assert(Number.isFinite(legacy.legacyLastAt), 'older completion time remains available');
+assert.equal(legacy.automatic.length,0);
+
 
 console.log('PASS same-tab project continuation, durable deduplication, source validation and failed navigation recovery');

@@ -28,6 +28,30 @@ export function parseConversationUrl(input) {
   };
 }
 
+// Each source chat has one existing durable completion receipt. Older receipts
+// cannot be retrospectively labelled automatic without evidence.
+export function recordedContinuations(receipts = {}) {
+  const automatic = [];
+  let manualCount = 0, legacyCount = 0, legacyLastAt = null;
+  for (const [key, record] of Object.entries(receipts)) {
+    if (!key.startsWith('hstryTakeoverSource:') || record?.status !== 'completed' ||
+        !Number.isFinite(record?.completedAt)) continue;
+    const id = key.slice('hstryTakeoverSource:'.length);
+    if (!CHAT_ID.test(id)) continue;
+    if (record.automatic === false) { manualCount++; continue; }
+    if (record.automatic !== true) {
+      legacyCount++;
+      legacyLastAt = Math.max(legacyLastAt ?? 0, record.completedAt);
+      continue;
+    }
+    const original = parseConversationUrl(record.originalUrl);
+    automatic.push({ id, completedAt: record.completedAt,
+      url: original?.id === id ? original.original : 'https://chatgpt.com/c/' + id });
+  }
+  automatic.sort((a, b) => b.completedAt - a.completedAt);
+  return { automatic, manualCount, legacyCount, legacyLastAt };
+}
+
 export function takeoverPrompt(originalUrl, pendingCaptures = 0,
                               failedMessage = '', missingAttachments = false) {
   const parsed = parseConversationUrl(originalUrl);
