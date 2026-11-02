@@ -54,10 +54,19 @@ export function resolveLiveProjectName(capture, status) {
   return names.size === 1 ? [...names][0] : null;
 }
 
+export function appendLiveCaptures(current, items) {
+  let next = current;
+  for (const item of items) {
+    const key = `${item.conversationId}:${item.messageId}`;
+    if (next[key]?.content === item.content && next[key]?.role === item.role) continue;
+    if (next === current) next = { ...current };
+    next[key] = item;
+  }
+  return next;
+}
+
 export function appendLiveCapture(current, item) {
-  const key = `${item.conversationId}:${item.messageId}`;
-  if (current[key]?.content === item.content && current[key]?.role === item.role) return current;
-  return { ...current, [key]: item };
+  return appendLiveCaptures(current, [item]);
 }
 
 export function confirmLiveCapture(current, { conversationId, confirmed }) {

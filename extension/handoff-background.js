@@ -185,6 +185,8 @@ function refreshOpenChatScripts() {
         files: ['handoff-network.js'], world: 'MAIN' }),
       chrome.scripting.executeScript({ target: { tabId: tab.id },
         files: ['handoff-content.js'] }),
+      chrome.scripting.executeScript({ target: { tabId: tab.id },
+        files: ['live-content.js'] }),
     ]));
     // Do not certify a sweep when a suspended tab timed out or rejected injection.
     let timeout;

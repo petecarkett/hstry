@@ -1,15 +1,37 @@
 // Page-local observer: no ChatGPT HTTP requests and no private credentials.
 // Observes new/changed visible turns, with a local durable queue in the worker.
 (() => {
-  if (globalThis.__hstryLiveCaptureInitialized) return;
-  globalThis.__hstryLiveCaptureInitialized = true;
+  const previous = globalThis.__hstryLiveCaptureInitialized;
+  const version = chrome.runtime.getManifest().version;
+  try { if (previous?.version === version && previous.isLive?.()) return; }
+  catch { /* A previous extension context can be invalidated. */ }
   const msgId = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   const seen = new Map();
   const skippedBaseline = new Set();
-  const pending = new Map();
+  let pending;
+  try { pending = previous?.pending instanceof Map ? previous.pending : new Map(); }
+  catch { pending = new Map(); }
   let lastConversation = null;
   let observerTimer = null;
+  let retryTimer = null;
+  let observer;
   let draining = false;
+  let active = true;
+  globalThis.__hstryLiveCaptureInitialized = {
+    version, pending,
+    isLive() {
+      try { return active && chrome.runtime.id && chrome.runtime.getManifest().version === version; }
+      catch { return false; }
+    },
+    stop() {
+      active = false;
+      observer?.disconnect();
+      clearTimeout(observerTimer);
+      clearTimeout(retryTimer);
+      globalThis.removeEventListener?.('hstry:native-conversation-page', onNativePage);
+    },
+  };
+  try { previous?.stop?.(); } catch { /* Old invalidated context. */ }
 
   function currentRoute() {
     const match = /^\/(?:g\/(g-p-[0-9a-f]{32})(?:-[^/]*)\/)?c\/([0-9a-f-]{36})(?:\/)?$/i.exec(location.pathname);
@@ -31,26 +53,37 @@
   }
 
   function flush() {
-    if (draining || pending.size === 0) return;
+    if (!active || draining || pending.size === 0) return;
     draining = true;
     const next = async () => {
-      while (pending.size) {
-        const [key, value] = pending.entries().next().value;
+      while (active && pending.size) {
+        const batch = [];
+        let size = 0;
+        for (const [key, value] of pending) {
+          if (batch.length >= 25 || (batch.length && size + value.content.length > 500_000)) break;
+          batch.push([key, value]);
+          size += value.content.length;
+        }
         let ok = false;
         try {
-          const res = await chrome.runtime.sendMessage({ type: 'hstryLiveCapture', capture: value });
+          const res = await chrome.runtime.sendMessage({
+            type: 'hstryLiveCaptureBatch', captures: batch.map(([, value]) => value),
+          });
           ok = res?.ok === true;
-        } catch { /* Worker may be restarting; the page retains its pending item. */ }
-        if (!ok) break;
-        if (pending.get(key) === value) pending.delete(key);
+        } catch { /* Worker may be restarting; the page retains its pending items. */ }
+        if (!active || !ok) break;
+        for (const [key, value] of batch) {
+          if (pending.get(key) === value) pending.delete(key);
+        }
       }
       draining = false;
-      if (pending.size) setTimeout(flush, 4000);
+      if (active && pending.size) retryTimer = setTimeout(flush, 4000);
     };
     void next();
   }
 
   function scan() {
+    if (!active) return;
     const route = currentRoute();
     if (!route) return;
     const initial = route.conversationId !== lastConversation;
@@ -78,12 +111,14 @@
   }
 
   function schedule() {
+    if (!active) return;
     clearTimeout(observerTimer);
     observerTimer = setTimeout(scan, 1200);
   }
   // Native history pages can disappear from the virtualized DOM immediately.
   // Listen before DOM readiness so even the first successful page is retained.
-  globalThis.addEventListener('hstry:native-conversation-page', event => {
+  function onNativePage(event) {
+    if (!active) return;
     const route = currentRoute();
     if (!route || event.detail?.conversationId !== route.conversationId ||
         !Array.isArray(event.detail.turns)) return;
@@ -99,14 +134,17 @@
       pending.set(key, { ...route, ...turn, title: document.title });
     }
     flush();
-  });
+  }
+  globalThis.addEventListener('hstry:native-conversation-page', onNativePage);
 
-  const observer = new MutationObserver(schedule);
+  observer = new MutationObserver(schedule);
   function startObserver() {
+    if (!active) return;
     if (!document.documentElement) { setTimeout(startObserver, 50); return; }
     observer.observe(document.documentElement, { childList: true, subtree: true,
       characterData: true, attributes: true, attributeFilter: ['data-chatgpt-search-message-ids'] });
     schedule();
   }
   startObserver();
+  flush();
 })();
