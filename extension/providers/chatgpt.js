@@ -1002,9 +1002,9 @@ export async function syncChatGPT({
     let confirmed = {};
     let usedLongRead = false;
     try {
-      // Third and later attempts use an existing ChatGPT tab when available;
-      // only one network request is sent and the saved retry cooldown remains.
-      const slowDetail = failure.errorType === 'TimeoutError' && failure.attempts >= 3
+      // After one worker-fetch timeout, prefer an existing ChatGPT tab.
+      // It avoids a second 25s worker timeout without adding a remote request.
+      const slowDetail = failure.errorType === 'TimeoutError' && failure.attempts >= 2
         ? await fetchSlowConversationInTab(failure.conversationId, headers) : null;
       usedLongRead = Boolean(slowDetail);
       const detail = slowDetail ?? await fetchChatGPTJson(
