@@ -14,6 +14,10 @@ import {
 
 const BASE = 'https://chatgpt.com';
 const PAGE_SIZE = 50;
+const NATIVE_TURNS = 50;
+const NATIVE_MAX_PAGES = 1000;
+const NATIVE_MAX_MESSAGES = 20_000;
+const CHAT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Refetch a little history on every run so near-simultaneous edits are not
 // missed between polls.
 const OVERLAP_MS = 5 * 60 * 1000;
@@ -65,7 +69,7 @@ const fetchChatGPTJson = (url, init = {}) =>
 // Only repeatedly timed-out conversations use a longer read. Chrome terminates
 // extension *service-worker* fetches after 30s, but an already-open ChatGPT tab
 // can fetch in its page context without restarting the import or opening a tab.
-async function fetchSlowConversationInTab(id, headers) {
+async function fetchSlowConversationInTab(id, headers, nativeUrl = null) {
   if (!globalThis.chrome?.tabs?.query || !chrome.scripting?.executeScript) return null;
   let tabs;
   try { tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' }); }
@@ -75,17 +79,19 @@ async function fetchSlowConversationInTab(id, headers) {
     throw error;
   }
   const tab = tabs.find(tab => Number.isInteger(tab.id) &&
-    tab.status === 'complete' && tab.url?.startsWith('https://chatgpt.com/'));
+    tab.status === 'complete' && tab.url?.startsWith('https://chatgpt.com/') &&
+    (!nativeUrl || new URL(tab.url).pathname.endsWith('/c/' + id)));
   if (!tab) return null;
   let results;
   try { results = await chrome.scripting.executeScript({
     target: { tabId: tab.id }, world: 'ISOLATED',
-    func: async (conversationId, auth) => {
+    func: async (conversationId, auth, nativeResource) => {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 120_000);
       try {
         const response = await fetch(
-          `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(conversationId)}`,
+          nativeResource ??
+            `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(conversationId)}`,
           { credentials: 'include', headers: auth, signal: controller.signal });
         if (!response.ok) return {
           status: response.status, retryAfter: response.headers.get('retry-after'),
@@ -97,7 +103,7 @@ async function fetchSlowConversationInTab(id, headers) {
         clearTimeout(timeout);
       }
     },
-    args: [id, headers],
+    args: [id, headers, nativeUrl],
   }); } catch (cause) {
     // A tab navigation or denied injection is not proof that ChatGPT data is
     // unavailable; retain the original TimeoutError for future recovery.
@@ -296,6 +302,13 @@ function projectContext(item, detail, scope) {
  * If ChatGPT returns a broken parent chain, preserve all message-bearing nodes
  * in deterministic chronological order rather than silently losing the prefix. */
 function linearize(detail) {
+  if (Array.isArray(detail?.messages)) {
+    if (detail.page_info?.has_previous_page !== false ||
+        detail.page_info?.has_next_page !== false) {
+      throw new Error('Incomplete ChatGPT selected-branch pagination');
+    }
+    return detail.messages.map(message => ({ id: message.id, message }));
+  }
   const mapping = detail?.mapping ?? {};
   const chain = [];
   const visited = new Set();
@@ -501,6 +514,7 @@ function toParsedConversation(detail, item, scope) {
     metadata: {
       url,
       ...(scope.accountId ? { accountId: scope.accountId } : {}),
+      ...(Array.isArray(detail?.messages) ? { selectedBranchOnly: true } : {}),
       ...(projectDeclared ? { projectId: project?.id ?? null, projectName: project?.name ?? null } : {}),
     },
   };
@@ -570,6 +584,59 @@ function toParsedConversations(detail, item, scope) {
     });
   }
   return [primary, ...forks];
+}
+
+// The new ChatGPT endpoint returns a *selected branch* in reverse page order.
+// Keep incomplete pages in the existing durable sync checkpoint; never ingest
+// one page as a canonical conversation or infer alternate branches.
+function appendNativePage(previous, page, conversationId) {
+  if (page?.conversation_id && page.conversation_id !== conversationId) {
+    throw new Error('ChatGPT paginated detail changed conversation identity');
+  }
+  if (!Array.isArray(page?.messages) ||
+      typeof page?.page_info?.has_previous_page !== 'boolean' ||
+      typeof page?.page_info?.has_next_page !== 'boolean') {
+    throw new Error('ChatGPT paginated detail has an unexpected page shape');
+  }
+  if (!page.messages.length && page.page_info.has_previous_page) {
+    throw new Error('ChatGPT paginated detail returned an empty unfinished page');
+  }
+  const pages = (previous?.pages ?? 0) + 1;
+  if (pages > NATIVE_MAX_PAGES) throw new Error('ChatGPT paginated detail exceeded page safety limit');
+  const cursor = page.page_info.has_previous_page ? page.page_info.start_cursor : null;
+  const seenCursors = previous?.seenCursors ?? [];
+  if (cursor && (!CHAT_ID.test(cursor) || seenCursors.includes(cursor))) {
+    throw new Error('ChatGPT paginated detail repeated or invalidated its cursor');
+  }
+  if (page.page_info.has_previous_page && !cursor) {
+    throw new Error('ChatGPT paginated detail omitted its older-page cursor');
+  }
+  const seen = new Set();
+  const read = page.messages.filter(message => {
+    const id = message?.id?.toLowerCase?.();
+    if (!CHAT_ID.test(id ?? '') || seen.has(id) ||
+        !['user', 'assistant'].includes(message?.author?.role)) return false;
+    seen.add(id);
+    return true;
+  }).map(message => ({ ...message, id: message.id.toLowerCase() }));
+  const messages = [...read, ...(previous?.messages ?? []).filter(message => !seen.has(message.id))];
+  if (messages.length > NATIVE_MAX_MESSAGES ||
+      JSON.stringify(messages).length > 64 * 1024 * 1024) {
+    throw new Error('ChatGPT paginated detail exceeded staged-message safety limit');
+  }
+  const header = previous?.header ?? Object.fromEntries(
+    ['title', 'create_time', 'update_time', 'gizmo_id', 'project_id', 'url']
+      .filter(key => Object.hasOwn(page, key)).map(key => [key, page[key]]));
+  return { conversationId, pages, messages, header,
+    seenCursors: cursor ? [...seenCursors, cursor] : seenCursors,
+    before: cursor, complete: !page.page_info.has_previous_page };
+}
+
+function assembledNativeDetail(stage) {
+  if (!stage?.complete) throw new Error('Cannot ingest partial ChatGPT history');
+  return { ...stage.header, messages: stage.messages,
+    // These flags describe our complete assembled active branch, not a fork graph.
+    page_info: { has_previous_page: false, has_next_page: false } };
 }
 
 const isNonRetryableAccess = failure =>
@@ -806,6 +873,18 @@ export async function syncChatGPT({
   let total = 0;
   let thisRun = 0;
   let pagesThisRun = 0;
+  const readNativePage = async (id, headers, stage) => {
+    if (stage?.complete) return stage;
+    const url = new URL(`${BASE}/backend-api/conversations/${encodeURIComponent(id)}`);
+    url.searchParams.set('num_turns', String(NATIVE_TURNS));
+    url.searchParams.set('include_has_versions', 'true');
+    if (stage?.before) url.searchParams.set('before', stage.before);
+    // Prefer a matching already-open ChatGPT tab for same-site cookies.
+    // Neither route makes a second remote request if the first one fails.
+    const tabPage = await fetchSlowConversationInTab(id, headers, url.toString());
+    const page = tabPage ?? await fetchChatGPTJson(url.toString(), { headers });
+    return appendNativePage(stage, page, id);
+  };
   const checkpointNow = async () => {
     const snapshot = { ...newState, pending: { ...pending } };
     await checkpoint(snapshot);
@@ -841,6 +920,49 @@ export async function syncChatGPT({
         pending.lastDeferredHttpStatus === 429));
   pending.retryYieldToScan = false;
   await checkpointNow();
+
+  // A user-requested recovery may use the same existing checkpoint and pace
+  // without moving the ongoing historic listing cursor or creating a new writer.
+  // The exact source/project identity must already exist in canonical discovery.
+  if (pending.priority && !pending.nativeDetail) {
+    const task = pending.priority;
+    const owner = pending.scopes.find(scope => !scope.archived &&
+      scope.sourceId === task.sourceId &&
+      (scope.projectId ?? null) === (task.projectId ?? null));
+    if (!CHAT_ID.test(task.conversationId ?? '') || !owner ||
+        isIgnoredConversation(newState, task.conversationId, owner) ||
+        task.stage && task.stage.conversationId !== task.conversationId) {
+      throw new Error('Invalid or unowned ChatGPT targeted recovery checkpoint');
+    }
+    const headers = authHeaders(token, owner.accountId);
+    if (owner.projectId) headers['chatgpt-project-id'] = owner.projectId;
+    let stage;
+    try { stage = await readNativePage(task.conversationId, headers, task.stage); }
+    catch (error) {
+      if (error instanceof NotLoggedInError) return renewAfter401(error);
+      if (error instanceof RateLimitedError) return deferRateLimit(error, 'targeted-native-detail');
+      throw error;
+    }
+    pending.priority = { ...task, stage };
+    await checkpointNow();
+    if (!stage.complete) {
+      healthyRead();
+      return { state: { ...newState, pending: { ...pending } }, conversations: total,
+        hasMore: true, failures: outstanding(), retryAfterMinutes: paceMinutes() };
+    }
+    const detail = assembledNativeDetail(stage);
+    const parsed = toParsedConversations(detail, { id: task.conversationId }, owner);
+    if (!parsed.length) throw new Error('Targeted paginated detail has no readable messages');
+    await register(owner.sourceId, 'chatgpt-web');
+    total += await push(owner.sourceId, 'chatgpt-web', parsed);
+    await onCanonicalIngest({ conversationId: task.conversationId,
+      confirmed: canonicalMessages(detail) });
+    delete pending.priority;
+    healthyRead();
+    await checkpointNow();
+    return { state: { ...newState, pending: { ...pending } }, conversations: total,
+      hasMore: true, failures: outstanding(), retryAfterMinutes: paceMinutes() };
+  }
 
   // At most one due retry per worker run. Persist the attempt and its next
   // retry time BEFORE fetching so a killed worker cannot hammer one timeout.
@@ -1055,13 +1177,48 @@ export async function syncChatGPT({
         try {
           const headers = authHeaders(token, scope.accountId);
           if (itemScope.projectId) headers['chatgpt-project-id'] = itemScope.projectId;
-          const detail = await fetchChatGPTJson(`${BASE}/backend-api/conversation/${item.id}`, { headers });
+          if (pending.nativeDetail && pending.nativeDetail.conversationId !== item.id) {
+            throw new Error('Saved ChatGPT detail checkpoint does not match listed conversation');
+          }
+          const useNative = (pending.nativeDetail?.conversationId === item.id) ||
+            (CHAT_ID.test(item.id) && pendingLive.has(item.id));
+          let detail;
+          if (useNative) {
+            const stage = pending.nativeDetail;
+            if (stage && (stage.scopeIndex !== pending.scopeIndex ||
+                stage.pageIndex !== pending.pageIndex || stage.conversationId !== item.id)) {
+              throw new Error('Saved ChatGPT pagination checkpoint points at a different conversation');
+            }
+            if (stage?.complete) {
+              detail = assembledNativeDetail(stage);
+            } else {
+              pending.nativeDetail = { ...await readNativePage(item.id, headers, stage),
+                scopeIndex: pending.scopeIndex, pageIndex: pending.pageIndex };
+              await checkpointNow();
+              if (!pending.nativeDetail.complete) {
+                healthyRead();
+                return { state: { ...newState, pending: { ...pending } },
+                  conversations: total, hasMore: true, failures: outstanding(),
+                  retryAfterMinutes: paceMinutes() };
+              }
+              detail = assembledNativeDetail(pending.nativeDetail);
+            }
+          } else {
+            detail = await fetchChatGPTJson(`${BASE}/backend-api/conversation/${item.id}`, { headers });
+          }
           conv = toParsedConversations(detail, item, itemScope);
+          if (!conv.length) throw new Error('ChatGPT detail has no readable messages');
           confirmed = canonicalMessages(detail);
           pending.rateLimitStreak = 0;
         } catch (err) {
           if (err instanceof NotLoggedInError) return renewAfter401(err);
           if (err instanceof RateLimitedError) return deferRateLimit(err, 'conversation-detail');
+          // A staged multi-page conversation cannot be skipped and silently
+          // promoted to a partial canonical transcript on a remote failure.
+          if (pending.nativeDetail?.conversationId === item.id) {
+            await checkpointNow();
+            throw err;
+          }
           pending.failures++;
           pending.scopeFailures++;
           const reason = failureType(err);
@@ -1104,6 +1261,7 @@ export async function syncChatGPT({
       if (conv?.length) {
         total += await push(scope.sourceId, 'chatgpt-web', conv);
         await onCanonicalIngest({ conversationId: item.id, confirmed });
+        delete pending.nativeDetail;
         healthyRead();
         const recovered = failureDetails.find(detail =>
           detail.conversationId === item.id && detail.projectId === (itemScope.projectId ?? null) &&

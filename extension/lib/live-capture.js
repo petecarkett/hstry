@@ -77,7 +77,12 @@ export function confirmLiveCapture(current, { conversationId, confirmed }) {
 
 export function canonicalMessages(detail) {
   const confirmed = {};
-  for (const [key, node] of Object.entries(detail?.mapping ?? {})) {
+  const nodes = Array.isArray(detail?.messages) &&
+      detail?.page_info?.has_previous_page === false &&
+      detail.page_info.has_next_page === false
+    ? detail.messages.map(message => [message.id, { message }])
+    : Object.entries(detail?.mapping ?? {});
+  for (const [key, node] of nodes) {
     const id = node?.message?.id ?? node?.id ?? key;
     if (!UUID.test(id)) continue;
     const content = node?.message?.content;
