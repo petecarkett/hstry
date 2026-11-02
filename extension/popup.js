@@ -1,4 +1,5 @@
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS, formatTime, providerState } from './ui.js';
+import { recordedContinuations } from './handoff-core.js';
 
 const DEFAULTS = { port: 41770, intervalMinutes: 15, providers: DEFAULT_PROVIDER_SETTINGS };
 const el = id => document.getElementById(id);
@@ -38,6 +39,34 @@ function providerCard(name, entry, enabled) {
     article.firstElementChild.appendChild(disclosure);
   }
   return article;
+}
+
+async function renderContinuationHistory() {
+  const keys = typeof chrome.storage.local.getKeys === 'function'
+    ? await chrome.storage.local.getKeys() : Object.keys(await chrome.storage.local.get(null));
+  const names = keys.filter(k => k.startsWith('hstryTakeoverSource:'));
+  const receipts = names.length ? await chrome.storage.local.get(names) : {};
+  const history = recordedContinuations(receipts);
+  const last = history.automatic[0];
+  const stamp = ms => new Date(ms).toLocaleString();
+  el('continuation-summary').textContent = last
+    ? 'Automatic continuations: ' + history.automatic.length + ' · last ' + stamp(last.completedAt)
+    : 'Automatic continuations: none confirmed yet';
+  el('continuation-legacy').textContent = history.legacyCount
+    ? history.legacyCount + ' earlier completed continuation(s) have no recorded mode; last completion ' +
+      stamp(history.legacyLastAt) + '.'
+    : '';
+  const rows = history.automatic.map(entry => {
+    const item = document.createElement('li');
+    const link = document.createElement('a');
+    link.href = entry.url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = stamp(entry.completedAt) + ' · ' + entry.id;
+    item.append(link);
+    return item;
+  });
+  el('continuation-list').replaceChildren(...rows);
 }
 
 async function render() {
@@ -85,7 +114,13 @@ el('sync').addEventListener('click', async () => {
 });
 el('settings').addEventListener('click', () => chrome.runtime.openOptionsPage());
 el('retry').addEventListener('click', checkApi);
-chrome.storage.onChanged.addListener(changes => { if (changes.status || changes.settings || changes.liveCaptureQueue) render(); });
+chrome.storage.onChanged.addListener(changes => {
+  if (changes.status || changes.settings || changes.liveCaptureQueue) render();
+  if (Object.keys(changes).some(key => key.startsWith('hstryTakeoverSource:'))) {
+    void renderContinuationHistory();
+  }
+});
 
 await render();
+await renderContinuationHistory();
 await checkApi();

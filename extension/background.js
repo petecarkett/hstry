@@ -369,8 +369,9 @@ async function runSync(
         await onStarted();
       }
       const report = async progress => {
+        // The existing checkpoints and final write persist progress. Writing
+        // every intermediate UI tick rewrites the entire saved scan state.
         entry.progress = { ...entry.progress, ...progress };
-        await setStatusEntry(name, entry);
       };
       const push = makePush(settings, async result => {
         await report({

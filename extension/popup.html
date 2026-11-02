@@ -15,6 +15,11 @@
       .connection-copy strong, .connection-copy span { display: block; }
       .connection-copy strong { font-size: 13px; }
       .connection-copy span { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+      .continuations { margin-top: 13px; font-size: 11px; color: var(--muted); }
+      .continuations summary { cursor: pointer; font-weight: 600; }
+      .continuations ul { max-height: 140px; overflow: auto; padding-left: 18px; }
+      .continuations li { margin: 7px 0; }
+      .continuations a { color: var(--accent); overflow-wrap: anywhere; }
       .providers { border-top: 1px solid var(--rule); margin-top: 19px; }
       .provider { display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 13px 0; border-bottom: 1px solid var(--rule); }
       .provider h2 { margin: 0; font-size: 13px; }
@@ -40,6 +45,11 @@
         <button id="retry" class="button-quiet">Check</button>
       </section>
       <p id="live-capture" role="status" style="font-size:11px;color:var(--muted);margin:14px 0 0"></p>
+      <details class="continuations">
+        <summary id="continuation-summary">Automatic continuations: checking…</summary>
+        <ul id="continuation-list"></ul>
+        <p id="continuation-legacy"></p>
+      </details>
       <div id="providers" class="providers"></div>
       <div class="actions"><button id="sync" class="button-primary">Sync now</button><button id="settings" class="button-secondary">Settings</button></div>
       <p id="notice" role="status"></p>

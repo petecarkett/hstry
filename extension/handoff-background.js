@@ -55,6 +55,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         throw new Error('Rejected message is too large for a safe handoff.');
       }
       const tabId = senderTab.id;
+      const startedAt = Date.now();
+      const automatic = msg.automatic === true;
       try {
         const current = await chrome.tabs.get(tabId);
         if (parseConversationUrl(current.url || '')?.id !== parsed.id) {
@@ -66,10 +68,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           original: parsed.original, project: parsed.project,
           prompt: takeoverPrompt(parsed.original, pending,
             msg.failedMessage || '', msg.missingAttachments === true),
-          createdAt: Date.now(), sourceTabId: tabId,
+          createdAt: startedAt, sourceTabId: tabId, automatic,
         } });
         await chrome.storage.local.set({ [sourceKey]: {
-          status: 'started', tabId, startedAt: Date.now(),
+          status: 'started', tabId, startedAt, automatic, originalUrl: parsed.original,
         } });
         await chrome.tabs.update(tabId, { url: parsed.landing });
         return { tabId, pendingCaptures: pending };
@@ -112,8 +114,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       const sourceKey = SOURCE_PREFIX + original.id;
       if (msg.type === 'HSTRY_TAKEOVER_DONE') {
+        const prior = (await chrome.storage.local.get(sourceKey))[sourceKey];
+        if (prior?.tabId != null && prior.tabId !== senderTab.id) {
+          throw new Error('Continuation receipt belongs to a different tab');
+        }
         await chrome.storage.local.set({ [sourceKey]: {
-          status: 'completed', tabId: senderTab.id, completedAt: Date.now(),
+          status: 'completed', tabId: senderTab.id,
+          startedAt: prior?.startedAt ?? record.createdAt,
+          completedAt: Date.now(), automatic: record.automatic === true,
+          originalUrl: original.original,
         } });
         await chrome.storage.session.remove(key);
         return { found: false, completed: true };
