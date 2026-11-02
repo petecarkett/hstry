@@ -74,13 +74,6 @@ try {
   assert.equal(shortDetailCalls, 1);
   assert.equal(first.state.failureDetails[0].attempts, 1);
 
-  // A second retry still uses the bounded 25-second fetch as before.
-  now = start + 31 * 60_000;
-  const second = await sync(first.state);
-  assert.equal(second.state.failureDetails[0].attempts, 2);
-  assert.equal(second.state.failureDetails[0].errorType, 'TimeoutError');
-  assert.equal(shortDetailCalls, 2);
-
   globalThis.chrome = {
     tabs: { query: async () => [{ id: 72, status: 'complete', url: 'https://chatgpt.com/c/test' }] },
     scripting: { executeScript: async options => {
@@ -95,13 +88,15 @@ try {
     } },
   };
 
-  // Third attempt routes through the existing tab, not the 25s worker fetch.
-  now += 61 * 60_000;
-  const recovered = await sync(second.state);
+  // The first retry after a single worker TimeoutError uses the longer
+  // already-open tab route without attempting a second short fetch.
+  now = start + 31 * 60_000;
+  const recovered = await sync(first.state);
   assert.equal(recovered.conversations, 1);
-  assert.equal(shortDetailCalls, 2);
+  assert.equal(shortDetailCalls, 1);
   assert.equal(longDetailCalls, 1);
   assert.equal(injected, 1);
+  assert.equal(recovered.state.failureDetails[0].attempts, 2);
   assert.equal(recovered.state.failureDetails[0].errorType, 'TimeoutError');
   assert(Number.isFinite(recovered.state.failureDetails[0].resolvedAtMs));
   assert.deepEqual(imported, ['healthy', 'large']);
@@ -109,20 +104,20 @@ try {
   // A 429 in the long-path is propagated into the existing persisted cooldown.
   browserOutcome = '429';
   const before429 = longDetailCalls;
-  const rateLimited = await sync(second.state);
+  const rateLimited = await sync(first.state);
   assert.equal(rateLimited.deferredHttpStatus, 429);
   assert.equal(rateLimited.state.serverRetryAfterUntilMs, now + 90_000);
   assert.equal(rateLimited.state.pending.retryYieldToScan, true);
   assert.equal(rateLimited.state.failureDetails[0].resolvedAtMs, null);
-  assert.equal(shortDetailCalls, 2, 'do not send a second immediate request after a 429');
+  assert.equal(shortDetailCalls, 1, 'do not send a second immediate request after a 429');
   assert.equal(longDetailCalls, before429 + 1);
 
   // If the user closes ChatGPT tabs, fall back to the bounded standard path.
   globalThis.chrome.tabs.query = async () => [];
   browserOutcome = 'success';
-  const noTab = await sync(second.state);
+  const noTab = await sync(first.state);
   assert.equal(noTab.state.failureDetails[0].errorType, 'TimeoutError');
-  assert.equal(shortDetailCalls, 3);
+  assert.equal(shortDetailCalls, 2);
   assert.equal(longDetailCalls, 2);
 
   // A tab closing during injection is not a conversation error, and cannot
@@ -133,13 +128,13 @@ try {
   globalThis.chrome.scripting.executeScript = async () => {
     throw new Error('The target tab was closed');
   };
-  const transport = await sync(second.state);
+  const transport = await sync(first.state);
   assert.equal(transport.state.failureDetails[0].errorType, 'TimeoutError');
   assert.match(transport.state.failureDetails[0].lastTransportError, /unavailable/);
-  assert.equal(shortDetailCalls, 3, 'failed injection must not send another request');
+  assert.equal(shortDetailCalls, 2, 'failed injection must not send another request');
   assert.equal(transport.state.failureDetails[0].resolvedAtMs, null);
 
-  console.log('PASS long timeout recovery: bounded first retries, existing tab fallback, 429 cooldown, no-tab fallback, no doubled requests');
+  console.log('PASS long timeout recovery: immediate second-attempt tab fallback, 429 cooldown, no-tab fallback, no doubled requests');
 } finally {
   globalThis.chrome = originalChrome;
   globalThis.fetch = originalFetch;
