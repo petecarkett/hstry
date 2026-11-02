@@ -24,6 +24,13 @@ globalThis.fetch = async url => {
       ? { items: [], total: 0 }
       : { items: [{ id: conversationId, update_time: old }], total: 1 }
   );
+  if (path === `/backend-api/conversations/${conversationId}`) return Response.json({
+    conversation_id: conversationId, title: 'Test', create_time: old, update_time: old,
+    messages: [{ id: messageId, author: { role: 'user' }, create_time: old,
+      content: { content_type: 'text', parts: ['hello live'] },
+    }],
+    page_info: { has_previous_page: false, has_next_page: false },
+  });
   if (path === `/backend-api/conversation/${conversationId}`) return Response.json({
     id: conversationId, title: 'Test', create_time: old, update_time: old,
     current_node: messageId, mapping: {
