@@ -26,6 +26,8 @@ const activeProviders = new Set();
 let statusWriteQueue = Promise.resolve();
 const LIVE_KEY = 'liveCaptureQueue';
 const LIVE_ALARM_NAME = 'hstry-live-index';
+// New captures index immediately; this alarm only retries transient local failures.
+const LIVE_RETRY_MINUTES = 5;
 let liveWriteQueue = Promise.resolve();
 
 function updateLiveQueue(change) {
@@ -439,13 +441,13 @@ async function runSync(
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create(LIVE_ALARM_NAME, { periodInMinutes: 1 });
+  chrome.alarms.create(LIVE_ALARM_NAME, { periodInMinutes: LIVE_RETRY_MINUTES });
   void flushLiveCaptures();
   ensureAlarm();
   registerEnabledSources();
 });
 chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create(LIVE_ALARM_NAME, { periodInMinutes: 1 });
+  chrome.alarms.create(LIVE_ALARM_NAME, { periodInMinutes: LIVE_RETRY_MINUTES });
   void flushLiveCaptures();
   ensureAlarm();
   registerEnabledSources();
