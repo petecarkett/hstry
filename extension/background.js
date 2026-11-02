@@ -50,6 +50,7 @@ async function flushLiveCaptures() {
       getStatus(), chrome.storage.local.get(LIVE_KEY),
     ]);
     let count = 0;
+    const indexed = [];
     for (const [key, item] of Object.entries(stored[LIVE_KEY] ?? {})) {
       if (count >= 25) break;
       const owner = resolveLiveOwner(item, status);
@@ -80,15 +81,20 @@ async function flushLiveCaptures() {
         // The capture is already durable. Retry on the next local-only alarm.
         break;
       }
-      await updateLiveQueue(queue => {
-        const current = queue[key];
-        if (!current || current.content !== item.content ||
-            current.observedAt !== item.observedAt) return queue;
-        return { ...queue, [key]: { ...current, indexedAt: Date.now(),
-          indexedSource: response.source,
-          ...(projectName ? { indexedProjectName: projectName } : {}) } };
-      });
+      indexed.push({ key, item, source: response.source, projectName });
     }
+    if (indexed.length) await updateLiveQueue(queue => {
+      let next = queue;
+      for (const { key, item, source, projectName } of indexed) {
+        const current = next[key];
+        if (!current || current.content !== item.content ||
+            current.observedAt !== item.observedAt) continue;
+        if (next === queue) next = { ...queue };
+        next[key] = { ...current, indexedAt: Date.now(), indexedSource: source,
+          ...(projectName ? { indexedProjectName: projectName } : {}) };
+      }
+      return next;
+    });
   } finally {
     liveFlushActive = false;
   }
