@@ -14,6 +14,7 @@ const store = {
 };
 let writes = 0;
 let calls = 0;
+const alarmCreates = [];
 let mode = {};
 const copy = value => structuredClone(value);
 globalThis.chrome = {
@@ -33,7 +34,9 @@ globalThis.chrome = {
     session: { get: async () => ({}), set: async () => {}, remove: async () => {} },
   },
   alarms: { onAlarm: register('alarm'), getAll: async () => [],
-    get: async () => null, create: async () => {} },
+    get: async () => null, create: async (name, info) => {
+      alarmCreates.push({ name, ...info });
+    } },
   action: { onClicked: register('clicked'), setBadgeText: async () => {},
     setBadgeBackgroundColor: async () => {} },
   tabs: { onUpdated: register('updated'), onActivated: register('activated'),
@@ -59,6 +62,13 @@ globalThis.fetch = async url => {
 try {
   await import('../background.js');
   assert.equal(typeof handlers.alarm, 'function');
+  handlers.installed();
+  handlers.startup();
+  await new Promise(resolve => setImmediate(resolve));
+  const retries = alarmCreates.filter(a => a.name === 'hstry-live-index');
+  assert.equal(retries.length, 2, 'new installs and browser startups schedule recovery');
+  assert(retries.every(a => a.periodInMinutes === 5),
+    'idle live-index retries every five minutes instead of reading a 4 MB queue every minute');
 
   const sampleQueue = () => Object.fromEntries(Array.from({ length: 25 }, (_, i) => {
     const messageId = '00000000-0000-0000-0000-' + String(i + 1).padStart(12, '0');
@@ -101,7 +111,26 @@ try {
   assert.equal(afterEdit[2].content, 'newer edit');
   assert.equal(afterEdit[2].indexedAt, undefined,
     'a concurrent edit cannot be acknowledged using stale content');
-  console.log('PASS live index: one durable queue write per batch, 409/failure replay, concurrent edit protection');
+
+  // A new observed turn still indexes immediately, independent of the alarm.
+  store.liveCaptureQueue = {};
+  mode = {};
+  writes = 0;
+  calls = 0;
+  const id = '00000000-0000-0000-0000-000000000111';
+  const capture = { conversationId: captureId, messageId: id,
+    role: 'user', content: 'immediate new turn', projectId: null,
+    url: 'https://chatgpt.com/c/' + captureId, title: 'Fixture' };
+  const accepted = await new Promise(resolve =>
+    handlers.message({ type: 'hstryLiveCaptureBatch', captures: [capture] },
+      { id: 'fixture-extension', frameId: 0, tab: { url: capture.url } }, resolve));
+  assert.equal(accepted.ok, true, 'durable queue accepts the real capture protocol');
+  for (let i=0;i<100 && !store.liveCaptureQueue[captureId+':'+id]?.indexedAt;i++) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(calls, 1, 'new capture goes to local ingest without waiting five minutes');
+  assert(store.liveCaptureQueue[captureId+':'+id].indexedAt);
+  console.log('PASS live index: five-minute idle safety poll, immediate new indexing, one durable batch write, 409/failure replay, concurrent edit protection');
 } finally {
   globalThis.chrome = originalChrome;
   globalThis.fetch = originalFetch;
