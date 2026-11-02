@@ -119,8 +119,23 @@ export function progressDetail(progress) {
   const parts = [`${detected} detected`, `${processed} processed`];
   if ((progress.created ?? 0) > 0) parts.push(`${progress.created} new`);
   if ((progress.updated ?? 0) > 0) parts.push(`${progress.updated} updated`);
-  if ((progress.failed ?? 0) > 0) parts.push(`${progress.failed} failed`);
+  if ((progress.failed ?? 0) > 0) parts.push(`${progress.failed} failed attempts`);
   return parts.join(' · ');
+}
+
+export function failureStatusMessage(total, details = []) {
+  if (!total) return null;
+  const inaccessible = details.filter(item => !item.resolvedAtMs &&
+    item.accessVerification?.code === 'conversation_inaccessible' &&
+    item.accessVerification.canRetry === false);
+  const distinct = new Set(inaccessible.map(item => item.conversationId).filter(Boolean)).size;
+  if (distinct && inaccessible.length === total) {
+    return `${distinct} distinct inaccessible conversation(s) across ${inaccessible.length} scope record${inaccessible.length === 1 ? '' : 's'}; verify source access or retention`;
+  }
+  if (distinct) {
+    return `${total} unresolved failure records; ${distinct} distinct inaccessible conversation(s), others remain retryable or untracked`;
+  }
+  return `${total} unresolved failure record(s); individual conversation status unavailable`;
 }
 
 export function friendlyError(error) {
