@@ -15,6 +15,7 @@ let composerSends = 0;
 let finished = false;
 let bannerCount = 0;
 let editorValue = '';
+let releaseFirstPoll;
 
 // ChatGPT uses a ProseMirror div[contenteditable][data-composer-markdown].
 const editor = {
@@ -76,9 +77,16 @@ const context = {
       lastError: null,
       sendMessage: (message, callback) => {
         sent.push(message.type);
-        queueMicrotask(() => callback(message.type === 'HSTRY_TAKEOVER_POLL'
+        const response = () => callback(message.type === 'HSTRY_TAKEOVER_POLL'
           ? { ok: true, found: true, prompt: 'HSTRY recovery fixture prompt' }
-          : { ok: true, completed: true }));
+          : { ok: true, completed: true });
+        // A congested Chrome worker can hold the FIRST storage response for
+        // minutes; this must not exhaust the landing retry window.
+        if (message.type === 'HSTRY_TAKEOVER_POLL' && !releaseFirstPoll) {
+          releaseFirstPoll = response;
+        } else {
+          queueMicrotask(response);
+        }
         if (message.type === 'HSTRY_TAKEOVER_DONE') finished = true;
       },
     },
@@ -101,22 +109,22 @@ assert.equal(composerSends, 0, 'must not send before composer exists');
 assert.equal(finished, false, 'pending handoff must not be acknowledged prematurely');
 assert.equal(bannerCount, 0, 'missing editor is recoverable, not a terminal error');
 
-pollTick(); // The pending handoff must keep its own lightweight readiness check.
-assert.equal(pollCancelled, false, 'do not stop the readiness poll before the composer exists');
-assert.equal(sent.length, 1);
-flushTimers(); // No editor yet.
-assert.equal(sent.length, 1);
-
-// React may keep changing the DOM for several minutes, so the warning
-// observer's 700 ms debounce never fires. Simulate 4 minutes of churn.
+// Even if the first storage response is delayed for four minutes, the
+// in-flight poll is still pending and must not exhaust the 24-second limit.
+assert.equal(typeof releaseFirstPoll, 'function');
 for (let n = 0; n < 300; n++) {
-  observerCallback();
+  observerCallback(); // Frequent React changes starve the DOM debounce.
   pollTick();
 }
-assert.equal(pollCancelled, false, 'composer readiness must outlive 4 minutes of DOM changes');
+assert.equal(pollCancelled, false, 'in-flight HSTRY response must keep its landing timer alive');
 assert.equal(composerSends, 0);
-assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL'],
-  'readiness checks must not repeat the session-storage poll or submit anything');
+assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL'], 'do not dispatch duplicate storage polls');
+releaseFirstPoll();
+await settle();
+pollTick();
+assert.equal(pollCancelled, false, 'composer readiness must outlive 4 minutes of DOM changes');
+flushTimers(); // No composer yet.
+assert.equal(sent.length, 1);
 ready = true;
 observerCallback(); // The debounce is still starved at the moment the editor mounts.
 pollTick(); // Dedicated readiness poll must resume without waiting for DOM to settle.
