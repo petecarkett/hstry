@@ -101,15 +101,25 @@ assert.equal(composerSends, 0, 'must not send before composer exists');
 assert.equal(finished, false, 'pending handoff must not be acknowledged prematurely');
 assert.equal(bannerCount, 0, 'missing editor is recoverable, not a terminal error');
 
-pollTick(); // Existing timer must stop once DOM readiness owns the wait.
-assert.equal(pollCancelled, true);
+pollTick(); // The pending handoff must keep its own lightweight readiness check.
+assert.equal(pollCancelled, false, 'do not stop the readiness poll before the composer exists');
 assert.equal(sent.length, 1);
 flushTimers(); // No editor yet.
 assert.equal(sent.length, 1);
 
+// React may keep changing the DOM for several minutes, so the warning
+// observer's 700 ms debounce never fires. Simulate 4 minutes of churn.
+for (let n = 0; n < 300; n++) {
+  observerCallback();
+  pollTick();
+}
+assert.equal(pollCancelled, false, 'composer readiness must outlive 4 minutes of DOM changes');
+assert.equal(composerSends, 0);
+assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL'],
+  'readiness checks must not repeat the session-storage poll or submit anything');
 ready = true;
-observerCallback(); // The React composer arrives after the initial page load.
-flushTimers();
+observerCallback(); // The debounce is still starved at the moment the editor mounts.
+pollTick(); // Dedicated readiness poll must resume without waiting for DOM to settle.
 await settle();
 assert.equal(editorValue, '', 'native submit clears the input');
 assert.equal(composerSends, 1);
