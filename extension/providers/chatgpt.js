@@ -651,6 +651,29 @@ const isIgnoredConversation = (state, id, scope) =>
     record.conversationId === id && record.accountKey === scope.accountKey &&
     (record.projectId ?? null) === (scope.projectId ?? null));
 
+// Recover known missing histories before older automatic handoff receipts.
+// The same checkpoint, source-owner checks and scan fairness govern both.
+export function nextNativeRecoveryPriority(state) {
+  const pending = state?.pending;
+  if (!Array.isArray(pending?.scopes) || pending.priority || pending.nativeDetail ||
+      pending.retryYieldToScan === true ||
+      (pending.retryYieldToScan == null && pending.rateLimitStreak >= 3 &&
+        pending.lastDeferredHttpStatus === 429) ||
+      (Number.isFinite(pending.lastPriorityProcessed) &&
+        pending.processed - pending.lastPriorityProcessed < 3)) return null;
+  const failure = (state.failureDetails ?? []).find(item =>
+    !item.resolvedAtMs && isNonRetryableAccess(item) &&
+    !item.accessVerification?.nativeCheckedAtMs &&
+    CHAT_ID.test(item.conversationId ?? '') &&
+    pending.scopes.some(scope => !scope.archived &&
+      scope.sourceId === item.sourceId && scope.accountKey === item.accountKey &&
+      (scope.projectId ?? null) === (item.projectId ?? null) &&
+      !isIgnoredConversation(state, item.conversationId, scope)));
+  return failure ? { conversationId: failure.conversationId,
+    sourceId: failure.sourceId, accountKey: failure.accountKey,
+    projectId: failure.projectId ?? null, kind: 'native-404' } : null;
+}
+
 function unresolvedFailureCount(state) {
   const records = Array.isArray(state?.failureDetails) ? state.failureDetails : [];
   return Math.max(
@@ -925,22 +948,9 @@ export async function syncChatGPT({
   // The legacy detail endpoint can return a terminal 404 while the native
   // paginated endpoint still has the canonical history. Test that once per
   // distinct inaccessible conversation without consuming another request.
-  if (!scanTurn && !pending.priority && !pending.nativeDetail &&
-      (!Number.isFinite(pending.lastPriorityProcessed) ||
-        pending.processed - pending.lastPriorityProcessed >= 3)) {
-    const candidate = failureDetails.find(failure =>
-      !failure.resolvedAtMs && isNonRetryableAccess(failure) &&
-      !failure.accessVerification?.nativeCheckedAtMs &&
-      CHAT_ID.test(failure.conversationId ?? '') &&
-      pending.scopes.some(scope => !scope.archived &&
-        scope.sourceId === failure.sourceId && scope.accountKey === failure.accountKey &&
-        (scope.projectId ?? null) === (failure.projectId ?? null) &&
-        !isIgnoredConversation(newState, failure.conversationId, scope)));
-    if (candidate) pending.priority = {
-      conversationId: candidate.conversationId, sourceId: candidate.sourceId,
-      accountKey: candidate.accountKey,
-      projectId: candidate.projectId ?? null, kind: 'native-404',
-    };
+  if (!scanTurn && !pending.priority && !pending.nativeDetail) {
+    const priority = nextNativeRecoveryPriority({ ...newState, pending });
+    if (priority) pending.priority = priority;
   }
   await checkpointNow();
 

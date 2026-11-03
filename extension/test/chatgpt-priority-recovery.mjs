@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { syncChatGPT } from '../providers/chatgpt.js';
+import { syncChatGPT, nextNativeRecoveryPriority } from '../providers/chatgpt.js';
 import { nextContinuationPriority } from '../lib/live-capture.js';
 
 const id = '11111111-2222-4333-8444-555555555555';
@@ -101,6 +101,24 @@ try {
     accessVerification: { code: 'conversation_inaccessible', canRetry: false },
     resolvedAtMs: null });
   state = { pending: pending(), failureDetails: [failure(projectOwner), failure(personal)] };
+  const nativeFirst = nextNativeRecoveryPriority(state);
+  assert.deepEqual(nativeFirst, { conversationId: inaccessible,
+    sourceId: projectOwner.sourceId, accountKey: projectOwner.accountKey,
+    projectId: project, kind: 'native-404' },
+  'verified terminal 404 must outrank completed automatic handoff receipts');
+  assert.deepEqual(nextContinuationPriority(queue, receipts, state), task,
+    'the competing automatic handoff remains independently eligible');
+  assert.equal(nextNativeRecoveryPriority({ ...state,
+    pending: { ...pending(), lastPriorityProcessed: 0 } }), null,
+  'three ordinary scan items must separate priorities');
+  assert.equal(nextNativeRecoveryPriority({ ...state,
+    ignoredFailures: [{ conversationId: inaccessible,
+      accountKey: projectOwner.accountKey, projectId: project }] })?.projectId,
+    null, 'ignored project must not be selected');
+  assert.equal(nextNativeRecoveryPriority({ ...state,
+    failureDetails: [ { ...failure(projectOwner), accessVerification: {
+      code: 'conversation_inaccessible', canRetry: false, nativeCheckedAtMs: Date.now() } } ] }),
+    null, 'already checked native terminal access must not be retried');
   const recovered = await run(state);
   assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
   assert.equal(ingests.length, 1);
