@@ -80,9 +80,10 @@ async function fetchSlowConversationInTab(id, headers, nativeUrl = null) {
     error.name = 'TabReadError';
     throw error;
   }
+  // The request carries its exact URL and account headers. A same-origin tab
+  // need not have the target conversation open to perform the long read.
   const tab = tabs.find(tab => Number.isInteger(tab.id) &&
-    tab.status === 'complete' && tab.url?.startsWith('https://chatgpt.com/') &&
-    (!nativeUrl || new URL(tab.url).pathname.endsWith('/c/' + id)));
+    tab.status === 'complete' && tab.url?.startsWith('https://chatgpt.com/'));
   if (!tab) return null;
   let results;
   try { results = await chrome.scripting.executeScript({
@@ -970,7 +971,7 @@ export async function syncChatGPT({
         return deferRateLimit(error, 'targeted-native-detail');
       }
       if (['continuation', 'native-404'].includes(task.kind) &&
-          (error.status === 404 || error.name === 'TimeoutError')) {
+          (error.status === 404 || ['TimeoutError', 'TabReadError'].includes(error.name))) {
         const now = Date.now();
         if (task.kind === 'native-404' && error.status === 404) {
           for (const failure of failureDetails) {
