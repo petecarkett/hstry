@@ -296,9 +296,23 @@
   // handoff destination; this does not create remote network traffic.
   if (location.pathname === '/' || /^\/g\/g-p-[0-9a-f]{32}(?:-[a-z0-9-]+)?(?:\/project)?\/?$/i.test(location.pathname)) {
     let retries = 0;
+    let composerWaits = 0;
     const poll = setInterval(() => {
-      if (handoffStarted || resumeWhenComposerReady || ++retries > 30) return clearInterval(poll);
-      takeOverIfPending();
+      if (handoffStarted) return clearInterval(poll);
+      if (resumeWhenComposerReady) {
+        // ChatGPT may keep mutating the page while its editor mounts.
+        // DOM-only debounce can starve for minutes; do not repeat storage polls.
+        if (++composerWaits > 750) {
+          clearInterval(poll);
+          fallbackBanner('HSTRY continuation: ChatGPT has not loaded its composer. Refresh this tab to retry.');
+        } else if (editableElement()) {
+          void takeOverIfPending();
+        }
+      } else if (++retries > 30) {
+        clearInterval(poll);
+      } else {
+        void takeOverIfPending();
+      }
     }, 800);
     takeOverIfPending();
   }
