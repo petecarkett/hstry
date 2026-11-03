@@ -5,6 +5,7 @@ import './handoff-background.js';
 import { NotLoggedInError } from './lib/common.js';
 import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName, nextContinuationPriority } from './lib/live-capture.js';
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS } from './providers/index.js';
+import { nextNativeRecoveryPriority } from './providers/chatgpt.js';
 import { badgeState, failureStatusMessage } from './ui.js';
 
 const DEFAULT_SETTINGS = {
@@ -384,7 +385,8 @@ async function runSync(
           const keys = (await chrome.storage.local.getKeys())
             .filter(key => key.startsWith('hstryTakeoverSource:'));
           const receipts = keys.length ? await chrome.storage.local.get(keys) : {};
-          const priority = nextContinuationPriority(queue, receipts, entry.state);
+          const priority = nextNativeRecoveryPriority(entry.state) ??
+            nextContinuationPriority(queue, receipts, entry.state);
           if (priority) entry.state = { ...entry.state,
             pending: { ...entry.state.pending, priority } };
           chatgptOptions = {
