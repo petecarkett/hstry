@@ -1,0 +1,146 @@
+import assert from 'node:assert/strict';
+import { syncChatGPT } from '../providers/chatgpt.js';
+import { nextContinuationPriority } from '../lib/live-capture.js';
+
+const id = '11111111-2222-4333-8444-555555555555';
+const inaccessible = '66666666-7777-4888-8999-000000000000';
+const messageId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+const project = 'g-p-6818bc97551c8191865a07d09f7b3678';
+const personal = { accountId: 'account-1', accountKey: 'acc1', sourceId: 'chatgpt-web-acc1',
+  projectId: null, projectName: null, projectShortUrl: null };
+const projectOwner = { ...personal, projectId: project, projectName: 'Example', projectShortUrl: project };
+const cache = { items: [], next: null, scopeIndex: 0, offset: 0, cursor: '0',
+  projectId: null, accountKey: 'acc1' };
+const pending = () => ({ scopes: [personal, projectOwner], scopeIndex: 0,
+  offset: 0, cursor: '0', pageIndex: 0, detected: 0, processed: 0,
+  failures: 0, scopeFailures: 0, runStartedMs: Date.now(), cachedPage: cache });
+const queue = { [id + ':' + messageId]: { conversationId: id, messageId, projectId: null,
+  indexedSource: personal.sourceId, content: 'known captured message' } };
+const receipts = { ['hstryTakeoverSource:' + id]: { status: 'completed', automatic: true,
+  originalUrl: 'https://chatgpt.com/c/' + id, completedAt: Date.now() } };
+
+const task = nextContinuationPriority(queue, receipts, { pending: pending() });
+assert.deepEqual(task, { conversationId: id, sourceId: personal.sourceId,
+  accountKey: personal.accountKey, projectId: null, kind: 'continuation' });
+assert.equal(nextContinuationPriority(queue, receipts,
+  { pending: { ...pending(), priorityDoneIds: [id] } }), null);
+assert.equal(nextContinuationPriority(queue, receipts,
+  { pending: { ...pending(), nativeDetail: { conversationId: id } } }), null);
+assert.equal(nextContinuationPriority(queue, receipts,
+  { pending: { ...pending(), lastPriorityProcessed: 0 } }), null);
+assert.equal(nextContinuationPriority(queue, receipts, { pending: pending(),
+  ignoredFailures: [{ conversationId: id, accountKey: personal.accountKey, projectId: null }] }),
+  null, 'user exclusion must remain authoritative');
+assert.equal(nextContinuationPriority({ ...queue, duplicate: {
+  conversationId: id, projectId: null, indexedSource: 'other-source' } },
+  receipts, { pending: pending() }), null, 'ambiguous ownership must fail closed');
+assert.equal(nextContinuationPriority(queue,
+  { ...receipts, ['hstryTakeoverSource:' + id]: { ...receipts['hstryTakeoverSource:' + id],
+    originalUrl: 'https://evil.example/c/' + id } }, { pending: pending() }), null);
+
+const previousFetch = globalThis.fetch;
+const previousChrome = globalThis.chrome;
+let mode = 'healthy';
+let requests = [];
+let ingests = [];
+let confirmations = [];
+let saved = [];
+globalThis.chrome = { storage: { session: {
+  get: async () => ({ hstryChatGPTAccessToken: { token: 'fixture',
+    expiresAtMs: Date.now() + 3_600_000 } }),
+} } };
+const detail = cid => ({
+  conversation_id: cid, title: 'Recovered', create_time: Date.now() / 1000 - 300,
+  update_time: Date.now() / 1000 - 250,
+  messages: [{ id: messageId, author: { role: 'user' }, create_time: Date.now() / 1000 - 250,
+    content: { content_type: 'text', parts: ['known captured message'] } }],
+  page_info: { has_previous_page: false, has_next_page: false },
+});
+globalThis.fetch = async (input) => {
+  const url = new URL(input);
+  requests.push(url.pathname);
+  if (url.pathname === '/backend-api/conversations/' + id)
+    return Response.json(detail(id));
+  if (url.pathname === '/backend-api/gizmos/' + project + '/conversations')
+    return Response.json({ items: [], cursor: null });
+  if (url.pathname === '/backend-api/conversations/' + inaccessible) {
+    if (mode === 'native-inaccessible')
+      return Response.json({ detail: { code: 'conversation_inaccessible', can_retry: false } },
+        { status: 404 });
+    if (mode === 'native-rate-limit')
+      return new Response('', { status: 429, headers: { 'retry-after': '60' } });
+    return Response.json({ ...detail(inaccessible), project_id: project });
+  }
+  throw new Error('Unexpected remote request: ' + url.pathname);
+};
+const run = state => syncChatGPT({ state, push: async (_source, _adapter, convs) => {
+  ingests.push(convs); return convs.length;
+}, register: async () => {}, report: async () => {},
+checkpoint: async next => saved.push(structuredClone(next)),
+onCanonicalIngest: async confirmed => confirmations.push(confirmed) });
+
+try {
+  // A completed handoff is eligible even before the old 72-scope listing sees it.
+  let state = { pending: { ...pending(), priority: task } };
+  const result = await run(state);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + id],
+    'exactly one canonical remote request; no list rewind');
+  assert.equal(ingests.length, 1);
+  assert.equal(confirmations.length, 1);
+  assert.equal(result.state.pending.priority, undefined);
+  assert.deepEqual(result.state.pending.priorityDoneIds, [id]);
+  assert.equal(result.state.pending.pageIndex, 0);
+  assert.equal(result.state.pending.processed, 0);
+
+  // Six duplicated terminal entries in personal/project scopes are one source
+  // conversation. The existing native endpoint gets one bounded chance.
+  requests = []; ingests = []; confirmations = []; saved = [];
+  const failure = (owner) => ({ conversationId: inaccessible, projectId: owner.projectId,
+    accountId: owner.accountId, accountKey: owner.accountKey, sourceId: owner.sourceId,
+    errorType: 'HTTP 404', attempts: 1, lastFailedAtMs: Date.now() - 120_000,
+    accessVerification: { code: 'conversation_inaccessible', canRetry: false },
+    resolvedAtMs: null });
+  state = { pending: pending(), failureDetails: [failure(projectOwner), failure(personal)] };
+  const recovered = await run(state);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(ingests.length, 1);
+  assert.equal(recovered.state.failureDetails.filter(f => !f.resolvedAtMs).length, 0,
+    'canonical success resolves duplicates from the same account');
+  assert.equal(recovered.state.pending.scopeIndex, 0, 'original scan still intact');
+
+  // A second explicit 404 must not kill scheduled sync, erase provenance,
+  // falsely mark success, or make duplicate requests in future runs.
+  requests = []; ingests = []; confirmations = []; saved = [];
+  mode = 'native-inaccessible';
+  state = { pending: pending(), failureDetails: [failure(projectOwner), failure(personal)] };
+  const unavailable = await run(state);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(ingests.length, 0);
+  assert.equal(unavailable.hasMore, true);
+  assert.equal(unavailable.state.pending.priority, undefined);
+  assert.equal(unavailable.state.failureDetails.filter(f =>
+    f.accessVerification?.nativeCheckedAtMs).length, 2);
+  assert.equal(unavailable.state.failureDetails.filter(f => !f.resolvedAtMs).length, 2);
+  requests = [];
+  const next = await run(unavailable.state);
+  assert.deepEqual(requests, ['/backend-api/gizmos/' + project + '/conversations'],
+    'resume the normal scan, not another alternate GET');
+  assert.equal(next.failures, 2);
+
+  // A 429 on the alternative route yields to a normal scan after cooldown.
+  requests = []; mode = 'native-rate-limit';
+  state = { pending: pending(), failureDetails: [failure(projectOwner)] };
+  const deferred = await run(state);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(deferred.deferredHttpStatus, 429);
+  assert.equal(deferred.state.pending.retryYieldToScan, true);
+  requests = []; mode = 'healthy';
+  await run(deferred.state);
+  assert.deepEqual(requests, ['/backend-api/gizmos/' + project + '/conversations'],
+    'retry cooldown must yield a scan turn, not immediately retry native detail');
+
+  console.log('PASS automatic continuation priority, alternate 404 recovery, bounded terminal fallback, exact owner and no duplicate request');
+} finally {
+  globalThis.fetch = previousFetch;
+  globalThis.chrome = previousChrome;
+}
