@@ -3,7 +3,7 @@ import './handoff-background.js';
 // new/updated conversations to a local hstry-api instance (POST /ingest).
 
 import { NotLoggedInError } from './lib/common.js';
-import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName } from './lib/live-capture.js';
+import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName, nextContinuationPriority } from './lib/live-capture.js';
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS } from './providers/index.js';
 import { badgeState, failureStatusMessage } from './ui.js';
 
@@ -378,17 +378,27 @@ async function runSync(
       });
       const register = makeRegister(settings);
       try {
+        let chatgptOptions = {};
+        if (name === 'chatgpt') {
+          const queue = (await chrome.storage.local.get(LIVE_KEY))[LIVE_KEY] ?? {};
+          const keys = (await chrome.storage.local.getKeys())
+            .filter(key => key.startsWith('hstryTakeoverSource:'));
+          const receipts = keys.length ? await chrome.storage.local.get(keys) : {};
+          const priority = nextContinuationPriority(queue, receipts, entry.state);
+          if (priority) entry.state = { ...entry.state,
+            pending: { ...entry.state.pending, priority } };
+          chatgptOptions = {
+            onCanonicalIngest: settleLiveCapture,
+            pendingLiveConversationIds: [...new Set(Object.values(queue)
+              .map(item => item.conversationId).filter(Boolean))],
+          };
+        }
         const result = await provider.sync({
           state: entry.state ?? {},
           push,
           register,
           report,
-          ...(name === 'chatgpt' ? {
-            onCanonicalIngest: settleLiveCapture,
-            pendingLiveConversationIds: [...new Set(Object.values(
-              (await chrome.storage.local.get(LIVE_KEY))[LIVE_KEY] ?? {}
-            ).map(item => item.conversationId).filter(Boolean))],
-          } : {}),
+          ...chatgptOptions,
           checkpoint: async state => {
             entry.state = state;
             entry.lastDeferredHttpStatus = state.pending?.lastDeferredHttpStatus ??

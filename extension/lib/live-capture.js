@@ -54,6 +54,49 @@ export function resolveLiveProjectName(capture, status) {
   return names.size === 1 ? [...names][0] : null;
 }
 
+// Use only completed extension receipts and the source of already indexed
+// captures. No guessing between ChatGPT personal/workspace identities.
+export function nextContinuationPriority(queue, receipts, state) {
+  const pending = state?.pending;
+  if (!pending?.scopes || pending.priority || pending.nativeDetail ||
+      pending.retryYieldToScan === true ||
+      Number.isFinite(pending.lastPriorityProcessed) &&
+        pending.processed - pending.lastPriorityProcessed < 3) return null;
+  const done = new Set(pending.priorityDoneIds ?? []);
+  const owners = new Map();
+  for (const capture of Object.values(queue ?? {})) {
+    if (!UUID.test(capture?.conversationId ?? '') || !capture.indexedSource) continue;
+    const existing = owners.get(capture.conversationId);
+    const candidate = { sourceId: capture.indexedSource,
+      projectId: capture.projectId ?? null };
+    owners.set(capture.conversationId,
+      existing && (existing.sourceId !== candidate.sourceId ||
+        existing.projectId !== candidate.projectId) ? { ambiguous: true } :
+        existing?.ambiguous ? existing : candidate);
+  }
+  const ordered = Object.entries(receipts ?? {}).filter(([key, receipt]) =>
+    key.startsWith('hstryTakeoverSource:') && receipt?.status === 'completed' &&
+    receipt.automatic === true && Number.isFinite(receipt.completedAt))
+    .sort((a, b) => b[1].completedAt - a[1].completedAt);
+  for (const [key, receipt] of ordered) {
+    const id = key.slice('hstryTakeoverSource:'.length);
+    const route = conversationFromUrl(receipt.originalUrl);
+    const capture = owners.get(id);
+    if (!route || route.conversationId !== id || done.has(id) ||
+        !capture || capture.ambiguous || capture.projectId !== route.projectId) continue;
+    const matching = pending.scopes.filter(scope =>
+      !scope.archived && scope.sourceId === capture.sourceId &&
+      (scope.projectId ?? null) === capture.projectId);
+    if (matching.length !== 1 || (state.ignoredFailures ?? []).some(entry =>
+      entry.conversationId === id && entry.accountKey === matching[0].accountKey &&
+      (entry.projectId ?? null) === route.projectId)) continue;
+    return { conversationId: id, sourceId: capture.sourceId,
+      accountKey: matching[0].accountKey, projectId: capture.projectId,
+      kind: 'continuation' };
+  }
+  return null;
+}
+
 export function appendLiveCaptures(current, items) {
   let next = current;
   for (const item of items) {

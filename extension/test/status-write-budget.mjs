@@ -33,6 +33,7 @@ globalThis.chrome = {
     onInstalled: events, onStartup: events },
   storage: {
     local: {
+      async getKeys() { return Object.keys(stored); },
       async get(key) {
         if (typeof key === 'string') return { [key]: clone(stored[key]) };
         if (Array.isArray(key)) return Object.fromEntries(key.map(k => [k, clone(stored[k])]));

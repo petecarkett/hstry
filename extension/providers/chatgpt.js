@@ -921,15 +921,38 @@ export async function syncChatGPT({
       (pending.retryYieldToScan == null && pending.rateLimitStreak >= 3 &&
         pending.lastDeferredHttpStatus === 429));
   pending.retryYieldToScan = false;
+  // The legacy detail endpoint can return a terminal 404 while the native
+  // paginated endpoint still has the canonical history. Test that once per
+  // distinct inaccessible conversation without consuming another request.
+  if (!scanTurn && !pending.priority && !pending.nativeDetail &&
+      (!Number.isFinite(pending.lastPriorityProcessed) ||
+        pending.processed - pending.lastPriorityProcessed >= 3)) {
+    const candidate = failureDetails.find(failure =>
+      !failure.resolvedAtMs && isNonRetryableAccess(failure) &&
+      !failure.accessVerification?.nativeCheckedAtMs &&
+      CHAT_ID.test(failure.conversationId ?? '') &&
+      pending.scopes.some(scope => !scope.archived &&
+        scope.sourceId === failure.sourceId && scope.accountKey === failure.accountKey &&
+        (scope.projectId ?? null) === (failure.projectId ?? null) &&
+        !isIgnoredConversation(newState, failure.conversationId, scope)));
+    if (candidate) pending.priority = {
+      conversationId: candidate.conversationId, sourceId: candidate.sourceId,
+      accountKey: candidate.accountKey,
+      projectId: candidate.projectId ?? null, kind: 'native-404',
+    };
+  }
   await checkpointNow();
 
   // A user-requested recovery may use the same existing checkpoint and pace
   // without moving the ongoing historic listing cursor or creating a new writer.
   // The exact source/project identity must already exist in canonical discovery.
-  if (pending.priority && !pending.nativeDetail) {
+  if (pending.priority && !pending.nativeDetail &&
+      (!scanTurn || !['continuation', 'native-404'].includes(pending.priority.kind)) &&
+      (pending.priority.nextRetryAtMs ?? 0) <= Date.now()) {
     const task = pending.priority;
     const owner = pending.scopes.find(scope => !scope.archived &&
       scope.sourceId === task.sourceId &&
+      (task.accountKey == null || scope.accountKey === task.accountKey) &&
       (scope.projectId ?? null) === (task.projectId ?? null));
     if (!CHAT_ID.test(task.conversationId ?? '') || !owner ||
         isIgnoredConversation(newState, task.conversationId, owner) ||
@@ -942,7 +965,49 @@ export async function syncChatGPT({
     try { stage = await readNativePage(task.conversationId, headers, task.stage); }
     catch (error) {
       if (error instanceof NotLoggedInError) return renewAfter401(error);
-      if (error instanceof RateLimitedError) return deferRateLimit(error, 'targeted-native-detail');
+      if (error instanceof RateLimitedError) {
+        if (task.kind && error.status === 429) pending.retryYieldToScan = true;
+        return deferRateLimit(error, 'targeted-native-detail');
+      }
+      if (['continuation', 'native-404'].includes(task.kind) &&
+          (error.status === 404 || error.name === 'TimeoutError')) {
+        const now = Date.now();
+        if (task.kind === 'native-404' && error.status === 404) {
+          for (const failure of failureDetails) {
+            if (!failure.resolvedAtMs && failure.conversationId === task.conversationId &&
+                failure.accountKey === owner.accountKey) {
+              failure.accessVerification = { ...failure.accessVerification,
+                nativeCheckedAtMs: now, nativeStatus: 404 };
+            }
+          }
+          delete pending.priority;
+          pending.lastPriorityProcessed = pending.processed;
+        } else {
+          const attempts = (task.attempts ?? 0) + 1;
+          pending.priority = { ...task, attempts,
+            nextRetryAtMs: now + retryDelayMs(attempts) };
+          if (task.kind === 'continuation' &&
+              !failureDetails.some(f => f.conversationId === task.conversationId &&
+                f.accountKey === owner.accountKey && !f.resolvedAtMs)) {
+            if (failureDetails.length < FAILURE_DETAIL_LIMIT) {
+              failureDetails.push({ conversationId: task.conversationId,
+                accountId: owner.accountId, accountKey: owner.accountKey,
+                projectId: owner.projectId ?? null, sourceId: owner.sourceId,
+                errorType: failureType(error), lastFailedAtMs: now, attempts: 1,
+                ...(error.canRetry === false ? { accessVerification: {
+                  code: error.code, canRetry: false, source: 'native paginated detail',
+                  verifiedAtMs: now } } : {}),
+                resolvedAtMs: null });
+            } else {
+              pending.untrackedFailures = (pending.untrackedFailures ?? 0) + 1;
+            }
+          }
+        }
+        await checkpointNow();
+        return { state: { ...newState, pending: { ...pending } },
+          conversations: total, hasMore: true, failures: outstanding(),
+          retryAfterMinutes: paceMinutes() };
+      }
       throw error;
     }
     pending.priority = { ...task, stage };
@@ -959,7 +1024,18 @@ export async function syncChatGPT({
     total += await push(owner.sourceId, 'chatgpt-web', parsed);
     await onCanonicalIngest({ conversationId: task.conversationId,
       confirmed: canonicalMessages(detail) });
+    for (const failure of failureDetails) {
+      if (failure.conversationId === task.conversationId &&
+          failure.accountKey === owner.accountKey && !failure.resolvedAtMs) {
+        failure.resolvedAtMs = Date.now();
+      }
+    }
+    if (task.kind === 'continuation') {
+      pending.priorityDoneIds = [...(pending.priorityDoneIds ?? []), task.conversationId]
+        .slice(-128);
+    }
     delete pending.priority;
+    pending.lastPriorityProcessed = pending.processed;
     healthyRead();
     await checkpointNow();
     return { state: { ...newState, pending: { ...pending } }, conversations: total,
