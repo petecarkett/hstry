@@ -126,9 +126,8 @@ assert.equal(pollCancelled, false, 'composer readiness must outlive 4 minutes of
 flushTimers(); // No composer yet.
 assert.equal(sent.length, 1);
 ready = true;
-observerCallback(); // The debounce is still starved at the moment the editor mounts.
-pollTick(); // Dedicated readiness poll must resume without waiting for DOM to settle.
-await settle();
+observerCallback(); // Hidden-tab timers may be suspended when the composer mounts.
+await settle(); // No timer ticks: the DOM change itself must resume the handoff.
 assert.equal(editorValue, '', 'native submit clears the input');
 assert.equal(composerSends, 1);
 assert.equal(finished, true);

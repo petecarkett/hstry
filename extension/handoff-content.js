@@ -324,14 +324,13 @@
 
   let observer;
   function scheduleWarningCheck() {
+    // Background tabs throttle timers, but DOM changes can wake a ready composer.
+    if (resumeWhenComposerReady && editableElement()) {
+      resumeWhenComposerReady = false;
+      void takeOverIfPending();
+    }
     clearTimeout(detectionTimer);
-    detectionTimer = setTimeout(() => {
-      detectLimit();
-      if (resumeWhenComposerReady && editableElement()) {
-        resumeWhenComposerReady = false;
-        void takeOverIfPending();
-      }
-    }, 700);
+    detectionTimer = setTimeout(detectLimit, 700);
   }
   window.addEventListener('hstry:conversation-too-large', event => {
     const detail = event?.detail;
