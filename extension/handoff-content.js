@@ -299,6 +299,11 @@
     let composerWaits = 0;
     const poll = setInterval(() => {
       if (handoffStarted) return clearInterval(poll);
+      if (checkingHandoff) {
+        // Do not exhaust initial retries while a worker response is in flight.
+        if (++composerWaits > 750) clearInterval(poll);
+        return;
+      }
       if (resumeWhenComposerReady) {
         // ChatGPT may keep mutating the page while its editor mounts.
         // DOM-only debounce can starve for minutes; do not repeat storage polls.
