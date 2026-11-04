@@ -1,4 +1,4 @@
-import { DEFAULT_PROVIDER_SETTINGS, badgeState, friendlyError, formatTime, normalizeSettings, progressDetail, providerState, failureStatusMessage } from '../ui.js';
+import { DEFAULT_PROVIDER_SETTINGS, badgeState, friendlyError, formatTime, normalizeSettings, progressDetail, providerState, failureStatusMessage, failureDisposition } from '../ui.js';
 
 let failures = 0;
 function check(label, actual, expected) {
@@ -61,6 +61,13 @@ check('duplicate scopes do not inflate inaccessible conversation count', failure
 check('untracked attempts remain explicitly unresolved', failureStatusMessage(16, inaccessible), '16 unresolved failure records; 7 distinct inaccessible conversation(s), others remain retryable or untracked');
 check('resolved records do not inflate counts', failureStatusMessage(1, [{ ...inaccessible[0], resolvedAtMs: Date.now() }, inaccessible[0]]), '1 distinct inaccessible conversation(s) across 1 scope record; verify source access or retention');
 check('zero failures clears status message', failureStatusMessage(0, inaccessible), null);
+check('excluded conversation is never labelled recovered',
+  failureDisposition({ resolution: 'excluded-not-recovered', resolvedAtMs: now, accessVerification: { nativeStatus: 404 } }),
+  ' (excluded; not recovered)');
+check('successfully imported conversation is labelled recovered', failureDisposition({ resolvedAtMs: now }),
+  ' (recovered)');
+check('unresolved native error still requires access',
+  failureDisposition({ accessVerification: { canRetry: false } }), ' (inaccessible; access required)');
 check('visible settings normalize before sync', normalizeSettings({
   port: '3434',
   token: ' hello ',

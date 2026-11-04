@@ -1,4 +1,4 @@
-import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS, formatTime, providerState } from './ui.js';
+import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS, formatTime, providerState, failureDisposition } from './ui.js';
 import { recordedContinuations } from './handoff-core.js';
 
 const DEFAULTS = { port: 41770, intervalMinutes: 15, providers: DEFAULT_PROVIDER_SETTINGS };
@@ -20,19 +20,22 @@ function providerCard(name, entry, enabled) {
   if (name === 'chatgpt' && Array.isArray(recent) && recent.length) {
     const disclosure = document.createElement('details');
     const summary = document.createElement('summary');
-    summary.textContent = `Failure details (${recent.length} recorded)`;
+    const excluded = recent.filter(failure => failure.resolution === 'excluded-not-recovered');
+    const excludedCount = new Set(excluded.map(failure => failure.conversationId)).size;
+    summary.textContent = `Failure details (${recent.length} recorded${excludedCount ?
+      ` · ${excludedCount} excluded, not recovered` : ''})`;
     disclosure.appendChild(summary);
     const list = document.createElement('ul');
     list.className = 'failure-details';
     const ordered = [...recent].sort((a, b) =>
+      Number(b.resolution === 'excluded-not-recovered') - Number(a.resolution === 'excluded-not-recovered') ||
       Number(Boolean(a.resolvedAtMs)) - Number(Boolean(b.resolvedAtMs)) ||
       (b.lastFailedAtMs ?? 0) - (a.lastFailedAtMs ?? 0));
     for (const failure of ordered.slice(0, 15)) {
       const row = document.createElement('li');
       const origin = failure.projectId ? 'Project' : 'Personal';
       row.textContent = `${origin} ${failure.conversationId}: ${failure.errorType}` +
-        (failure.resolvedAtMs ? ' (recovered)' :
-          failure.accessVerification?.canRetry === false ? ' (inaccessible; access required)' : '');
+        failureDisposition(failure);
       list.appendChild(row);
     }
     disclosure.appendChild(list);

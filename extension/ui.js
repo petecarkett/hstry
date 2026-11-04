@@ -123,6 +123,13 @@ export function progressDetail(progress) {
   return parts.join(' · ');
 }
 
+export function failureDisposition(failure) {
+  if (failure.resolution === 'excluded-not-recovered') return ' (excluded; not recovered)';
+  if (failure.resolvedAtMs) return ' (recovered)';
+  if (failure.accessVerification?.canRetry === false) return ' (inaccessible; access required)';
+  return '';
+}
+
 export function failureStatusMessage(total, details = []) {
   if (!total) return null;
   const inaccessible = details.filter(item => !item.resolvedAtMs &&
