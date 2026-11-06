@@ -9,6 +9,8 @@ const data = {
 };
 let slowId = null;
 let missingId = null;
+let unreadableId = null;
+let serverErrorId = null;
 let timeoutId = null;
 let rateLimitedList = false;
 let accountEndpointStatus = null;
@@ -39,6 +41,8 @@ globalThis.fetch = async (url, init = {}) => {
   if (id) {
     if (id === slowId) return new Response('', { status: 429, headers: { 'retry-after': '60' } });
     if (id === missingId) return new Response('missing', { status: 404 });
+    if (id === unreadableId) return Response.json({ id, title: id, mapping: {} });
+    if (id === serverErrorId) return new Response('', { status: 500 });
     if (id === timeoutId) throw new DOMException('signal timed out', 'TimeoutError');
     return Response.json({
       id, title: id, create_time: old, update_time: old,
@@ -177,11 +181,42 @@ try {
   assert(Number.isFinite(partial.state.failureDetails[0].lastFailedAtMs));
   missingId = null;
 
+  unreadableId = 'personal-1';
+  let unreadable = await run({});
+  for (let i = 0; i < 6 && unreadable.failures === 0 && unreadable.hasMore; i++) {
+    unreadable = await run(unreadable.state);
+  }
+  assert.equal(unreadable.failures, 1, 'unreadable detail remains an unresolved failure');
+  const bad = unreadable.state.failureDetails[0];
+  assert.equal(bad.errorType, 'GenericError');
+  assert.equal(bad.errorDiagnostic, 'ChatGPT detail has no readable messages');
+  const due = structuredClone(unreadable.state);
+  due.failureDetails[0].nextRetryAtMs = Date.now() - 1;
+  const unreadableRetry = await run(due);
+  assert.equal(unreadableRetry.state.failureDetails[0].attempts, 2);
+  assert.equal(unreadableRetry.state.failureDetails[0].errorDiagnostic,
+    'Conversation has no readable messages');
+  assert.equal(unreadableRetry.state.pending.processed, due.pending.processed,
+    'targeted diagnostics must not advance the history cursor');
+  unreadableId = null;
+
+  serverErrorId = 'personal-1';
+  let serverError = await run({});
+  for (let i = 0; i < 6 && serverError.failures === 0 && serverError.hasMore; i++) {
+    serverError = await run(serverError.state);
+  }
+  assert.equal(serverError.failures, 1);
+  assert.equal(serverError.state.failureDetails[0].errorType, 'HTTP 500');
+  assert.equal(serverError.state.failureDetails[0].errorDiagnostic, 'GET [URL] -> 500',
+    'checkpoint diagnostics must not persist conversation URLs');
+  serverErrorId = null;
+
   assert.equal(failureType(new DOMException('signal timed out', 'TimeoutError')), 'TimeoutError');
   assert.equal(failureType(new Error('signal timed out')), 'TimeoutError');
   assert.equal(failureType(new DOMException('The operation was aborted', 'AbortError')), 'AbortError');
   assert.equal(failureType(new TypeError('Failed to fetch')), 'NetworkError');
   assert.equal(failureType(new SyntaxError('Unexpected JSON')), 'SyntaxError');
+  assert.equal(failureType(new Error('unclassified detail')), 'GenericError');
   assert.equal(failureType({ status: 503, name: 'Error' }), 'HTTP 503');
   assert.equal(failureType({ name: 'UnexpectedIllegalName', message: 'failed' }), 'UnknownError');
 

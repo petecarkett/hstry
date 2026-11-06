@@ -53,8 +53,15 @@ export function failureType(error) {
   if (error?.name === 'TypeError' && /failed to fetch|network/i.test(error?.message ?? '')) {
     return 'NetworkError';
   }
+  if (error?.name === 'Error') return 'GenericError';
   return /^[A-Za-z][A-Za-z0-9]*Error$/.test(error?.name ?? '')
     ? error.name : 'UnknownError';
+}
+
+function failureDiagnostic(error) {
+  return typeof error?.message === 'string'
+    ? error.message.replace(/https?:\/\/\S+/g, '[URL]').replace(/\s+/g, ' ').slice(0, 180)
+    : null;
 }
 // Obey server delays and cap repeated fallback backoff without extra timers.
 function retryAfterMinutes(error, streak = 1) {
@@ -1121,6 +1128,7 @@ export async function syncChatGPT({
         failure.lastTransportError = error.message;
       } else {
         failure.errorType = failureType(error);
+        failure.errorDiagnostic = failureDiagnostic(error);
         delete failure.lastTransportError;
       }
       failure.lastFailedAtMs = Date.now();
@@ -1328,6 +1336,7 @@ export async function syncChatGPT({
               projectName: itemScope.projectName, projectShortUrl: itemScope.projectShortUrl,
               accountKey: scope.accountKey, accountId: scope.accountId,
               sourceId: scope.sourceId, errorType: reason,
+              errorDiagnostic: failureDiagnostic(err),
               attempts: (previous?.attempts ?? 0) + 1,
               lastFailedAtMs: Date.now(), resolvedAtMs: null,
               ...(err.code === 'conversation_inaccessible' && err.canRetry === false
