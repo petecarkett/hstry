@@ -669,16 +669,21 @@ export function nextNativeRecoveryPriority(state) {
       (Number.isFinite(pending.lastPriorityProcessed) &&
         pending.processed - pending.lastPriorityProcessed < 3)) return null;
   const failure = (state.failureDetails ?? []).find(item =>
-    !item.resolvedAtMs && isNonRetryableAccess(item) &&
-    !item.accessVerification?.nativeCheckedAtMs &&
+    !item.resolvedAtMs && !item.accessVerification?.nativeCheckedAtMs &&
     CHAT_ID.test(item.conversationId ?? '') &&
+    (isNonRetryableAccess(item) || (
+      (item.errorDiagnostic === 'Conversation has no readable messages' ||
+       item.errorDiagnostic === 'ChatGPT detail has no readable messages' ||
+       (item.errorType === 'UnknownError' && (item.attempts ?? 0) >= 3)) &&
+      (item.nextRetryAtMs ?? ((item.lastFailedAtMs ?? 0) + RETRY_BASE_MS)) <= Date.now())) &&
     pending.scopes.some(scope => !scope.archived &&
       scope.sourceId === item.sourceId && scope.accountKey === item.accountKey &&
       (scope.projectId ?? null) === (item.projectId ?? null) &&
       !isIgnoredConversation(state, item.conversationId, scope)));
   return failure ? { conversationId: failure.conversationId,
     sourceId: failure.sourceId, accountKey: failure.accountKey,
-    projectId: failure.projectId ?? null, kind: 'native-404' } : null;
+    projectId: failure.projectId ?? null,
+    kind: isNonRetryableAccess(failure) ? 'native-404' : 'native-fallback' } : null;
 }
 
 function unresolvedFailureCount(state) {
@@ -987,15 +992,19 @@ export async function syncChatGPT({
         if (task.kind && error.status === 429) pending.retryYieldToScan = true;
         return deferRateLimit(error, 'targeted-native-detail');
       }
-      if (['continuation', 'native-404'].includes(task.kind) &&
+      if (['continuation', 'native-404', 'native-fallback'].includes(task.kind) &&
           (error.status === 404 || ['TimeoutError', 'TabReadError'].includes(error.name))) {
         const now = Date.now();
-        if (task.kind === 'native-404' && error.status === 404) {
+        if (['native-404', 'native-fallback'].includes(task.kind) && error.status === 404) {
           for (const failure of failureDetails) {
             if (!failure.resolvedAtMs && failure.conversationId === task.conversationId &&
                 failure.accountKey === owner.accountKey) {
               failure.accessVerification = { ...failure.accessVerification,
                 nativeCheckedAtMs: now, nativeStatus: 404 };
+              if (task.kind === 'native-fallback') {
+                failure.errorDiagnostic = 'Legacy detail unreadable; native detail HTTP 404';
+                failure.nextRetryAtMs = now + retryDelayMs(failure.attempts);
+              }
             }
           }
           delete pending.priority;
@@ -1037,6 +1046,23 @@ export async function syncChatGPT({
     }
     const detail = assembledNativeDetail(stage);
     const parsed = toParsedConversations(detail, { id: task.conversationId }, owner);
+    if (!parsed.length && task.kind === 'native-fallback') {
+      for (const failure of failureDetails) {
+        if (!failure.resolvedAtMs && failure.conversationId === task.conversationId &&
+            failure.accountKey === owner.accountKey) {
+          failure.accessVerification = { ...failure.accessVerification,
+            nativeCheckedAtMs: Date.now(), nativeStatus: 200,
+            nativeMessageCount: stage.messages.length };
+          failure.errorDiagnostic = 'Native detail has no readable user or assistant messages';
+          failure.nextRetryAtMs = Date.now() + retryDelayMs(failure.attempts);
+        }
+      }
+      delete pending.priority;
+      pending.lastPriorityProcessed = pending.processed;
+      await checkpointNow();
+      return { state: { ...newState, pending: { ...pending } }, conversations: total,
+        hasMore: true, failures: outstanding(), retryAfterMinutes: paceMinutes() };
+    }
     if (!parsed.length) throw new Error('Targeted paginated detail has no readable messages');
     await register(owner.sourceId, 'chatgpt-web');
     total += await push(owner.sourceId, 'chatgpt-web', parsed);
