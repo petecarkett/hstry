@@ -69,6 +69,8 @@ globalThis.fetch = async (input) => {
         { status: 404 });
     if (mode === 'native-rate-limit')
       return new Response('', { status: 429, headers: { 'retry-after': '60' } });
+    if (mode === 'native-empty')
+      return Response.json({ ...detail(inaccessible), messages: [], project_id: project });
     return Response.json({ ...detail(inaccessible), project_id: project });
   }
   throw new Error('Unexpected remote request: ' + url.pathname);
@@ -157,7 +159,59 @@ try {
   assert.deepEqual(requests, ['/backend-api/gizmos/' + project + '/conversations'],
     'retry cooldown must yield a scan turn, not immediately retry native detail');
 
-  console.log('PASS automatic continuation priority, alternate 404 recovery, bounded terminal fallback, exact owner and no duplicate request');
+  // Repeated legacy detail with no readable messages must switch to the
+  // already-supported native endpoint on a future paced turn, not fetch twice.
+  const unreadable = { ...failure(projectOwner), errorType: 'GenericError',
+    errorDiagnostic: 'Conversation has no readable messages', attempts: 7,
+    nextRetryAtMs: Date.now() - 1, accessVerification: null };
+  state = { pending: pending(), failureDetails: [unreadable] };
+  const nativeUnreadable = nextNativeRecoveryPriority(state);
+  assert.deepEqual(nativeUnreadable, { conversationId: inaccessible,
+    sourceId: projectOwner.sourceId, accountKey: projectOwner.accountKey,
+    projectId: project, kind: 'native-fallback' });
+  assert.equal(nextNativeRecoveryPriority({ ...state, failureDetails: [{ ...unreadable,
+    nextRetryAtMs: Date.now() + 600_000 }] }), null, 'respect saved retry window');
+  assert.equal(nextNativeRecoveryPriority({ ...state, failureDetails: [{ ...unreadable,
+    errorDiagnostic: null, errorType: 'UnknownError', attempts: 6 }] })?.kind,
+    'native-fallback', 'legacy UnknownError records also get one native check');
+  assert.equal(nextNativeRecoveryPriority({ ...state, failureDetails: [{ ...unreadable,
+    errorDiagnostic: null, errorType: 'UnknownError', attempts: 1 }] }), null,
+  'a first unclassified failure does not trigger the fallback');
+  assert.equal(nextNativeRecoveryPriority({ ...state,
+    pending: { ...pending(), lastPriorityProcessed: 0 } }), null,
+  'three normal scan items still separate native fallback attempts');
+  assert.equal(nextNativeRecoveryPriority({ ...state, failureDetails: [{ ...unreadable,
+    accessVerification: { nativeCheckedAtMs: Date.now() } }] }), null,
+  'one native verification per missing history');
+  requests = []; ingests = []; confirmations = []; mode = 'healthy';
+  const nativeSuccess = await run(state);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(ingests.length, 1);
+  assert.equal(confirmations.length, 1);
+  assert(nativeSuccess.state.failureDetails[0].resolvedAtMs,
+    'canonical native content resolves the missing history');
+  assert.equal(nativeSuccess.state.pending.pageIndex, 0);
+
+  // A genuinely empty native result must remain unresolved with evidence.
+  requests = []; ingests = []; mode = 'native-empty';
+  const nativeEmpty = await run({ pending: pending(), failureDetails: [unreadable] });
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(ingests.length, 0);
+  assert.equal(nativeEmpty.state.failureDetails[0].resolvedAtMs, null);
+  assert.equal(nativeEmpty.state.failureDetails[0].accessVerification.nativeStatus, 200);
+  assert(nativeEmpty.state.failureDetails[0].accessVerification.nativeCheckedAtMs);
+  requests = []; mode = 'healthy';
+  await run(nativeEmpty.state);
+  assert.deepEqual(requests, ['/backend-api/gizmos/' + project + '/conversations'],
+    'no repeated native GET after an empty result');
+
+  requests = []; mode = 'native-inaccessible';
+  const native404 = await run({ pending: pending(), failureDetails: [unreadable] });
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(native404.state.failureDetails[0].resolvedAtMs, null);
+  assert.equal(native404.state.failureDetails[0].accessVerification.nativeStatus, 404);
+
+  console.log('PASS native recovery of unreadable legacy history, bounded empty/404 verification, original fairness and rate limit');
 } finally {
   globalThis.fetch = previousFetch;
   globalThis.chrome = previousChrome;
