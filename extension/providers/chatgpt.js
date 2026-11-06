@@ -970,7 +970,7 @@ export async function syncChatGPT({
   // without moving the ongoing historic listing cursor or creating a new writer.
   // The exact source/project identity must already exist in canonical discovery.
   if (pending.priority && !pending.nativeDetail &&
-      (!scanTurn || !['continuation', 'native-404'].includes(pending.priority.kind)) &&
+      (!scanTurn || !['continuation', 'native-404', 'native-fallback'].includes(pending.priority.kind)) &&
       (pending.priority.nextRetryAtMs ?? 0) <= Date.now()) {
     const task = pending.priority;
     const owner = pending.scopes.find(scope => !scope.archived &&
