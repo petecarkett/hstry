@@ -192,6 +192,20 @@ try {
     'canonical native content resolves the missing history');
   assert.equal(nativeSuccess.state.pending.pageIndex, 0);
 
+  // A rate-limited native fallback must yield one scan turn before retrying.
+  requests = []; mode = 'native-rate-limit';
+  const deferredFallback = await run({ pending: pending(), failureDetails: [unreadable] });
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(deferredFallback.deferredHttpStatus, 429);
+  assert.equal(deferredFallback.state.pending.priority?.kind, 'native-fallback');
+  assert.equal(deferredFallback.state.pending.retryYieldToScan, true);
+  requests = []; mode = 'healthy';
+  const afterFallback429 = await run(deferredFallback.state);
+  assert.deepEqual(requests, ['/backend-api/gizmos/' + project + '/conversations'],
+    'a native-fallback 429 must yield to the scan instead of immediately retrying');
+  assert.equal(afterFallback429.state.pending.priority?.kind, 'native-fallback',
+    'a scan turn must retain the recoverable priority and cursor');
+
   // A genuinely empty native result must remain unresolved with evidence.
   requests = []; ingests = []; mode = 'native-empty';
   const nativeEmpty = await run({ pending: pending(), failureDetails: [unreadable] });
