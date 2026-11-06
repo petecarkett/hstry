@@ -1197,18 +1197,17 @@ export async function syncChatGPT({
       delete pending.personalResume;
       await checkpointNow();
     } else if (current && !current.projectId && !pending.personalResume) {
-      let end = pending.scopeIndex + 1;
-      while (pending.scopes[end]?.projectId &&
-             pending.scopes[end].accountKey === current.accountKey) end++;
-      if (end > pending.scopeIndex + 1) {
-        const idx = pending.scopeIndex;
+      const idx = pending.scopeIndex;
+      const remaining = pending.scopes.slice(idx + 1);
+      const projects = remaining.filter(scope => scope.projectId);
+      if (projects.length) {
         pending.personalResume = {
-          index: end - 1, offset: pending.offset, cursor: pending.cursor,
+          index: idx + projects.length, offset: pending.offset, cursor: pending.cursor,
           pageIndex: pending.pageIndex, scopeFailures: pending.scopeFailures,
           scopeTrackedFailures: pending.scopeTrackedFailures ?? 0,
         };
-        pending.scopes.splice(idx, end - idx,
-          ...pending.scopes.slice(idx + 1, end), current);
+        pending.scopes.splice(idx, pending.scopes.length - idx,
+          ...projects, current, ...remaining.filter(scope => !scope.projectId));
         pending.offset = 0;
         pending.cursor = '0';
         pending.pageIndex = 0;
