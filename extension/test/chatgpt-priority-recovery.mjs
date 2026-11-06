@@ -71,11 +71,19 @@ globalThis.fetch = async (input) => {
       return new Response('', { status: 429, headers: { 'retry-after': '60' } });
     if (mode === 'native-empty')
       return Response.json({ ...detail(inaccessible), messages: [], project_id: project });
+    if (mode === 'native-unidentified-empty')
+      return Response.json({ ...detail(inaccessible), conversation_id: undefined,
+        messages: [], project_id: project });
+    if (mode === 'native-nonuser')
+      return Response.json({ ...detail(inaccessible), project_id: project,
+        messages: [{ id: messageId, author: { role: 'tool' },
+          content: { content_type: 'text', parts: ['unrecognized data'] } }] });
     return Response.json({ ...detail(inaccessible), project_id: project });
   }
   throw new Error('Unexpected remote request: ' + url.pathname);
 };
-const run = state => syncChatGPT({ state, push: async (_source, _adapter, convs) => {
+const run = (state, pendingLiveConversationIds = []) => syncChatGPT({
+  state, pendingLiveConversationIds, push: async (_source, _adapter, convs) => {
   ingests.push(convs); return convs.length;
 }, register: async () => {}, report: async () => {},
 checkpoint: async next => saved.push(structuredClone(next)),
@@ -206,18 +214,60 @@ try {
   assert.equal(afterFallback429.state.pending.priority?.kind, 'native-fallback',
     'a scan turn must retain the recoverable priority and cursor');
 
-  // A genuinely empty native result must remain unresolved with evidence.
+  // A complete native 200 with zero server messages is an empty chat shell,
+  // not lost history. It must not be permanently ignored or called recovered.
   requests = []; ingests = []; mode = 'native-empty';
   const nativeEmpty = await run({ pending: pending(), failureDetails: [unreadable] });
   assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
   assert.equal(ingests.length, 0);
-  assert.equal(nativeEmpty.state.failureDetails[0].resolvedAtMs, null);
-  assert.equal(nativeEmpty.state.failureDetails[0].accessVerification.nativeStatus, 200);
-  assert(nativeEmpty.state.failureDetails[0].accessVerification.nativeCheckedAtMs);
+  assert.equal(nativeEmpty.state.failureDetails[0].resolution, 'empty-shell');
+  assert(nativeEmpty.state.failureDetails[0].resolvedAtMs);
+  assert.equal(nativeEmpty.state.failureDetails[0].recoveredVia, undefined);
+  assert.equal(nativeEmpty.state.ignoredFailures?.length ?? 0, 0);
+  assert.equal(nativeEmpty.failures, 0);
   requests = []; mode = 'healthy';
   await run(nativeEmpty.state);
   assert.deepEqual(requests, ['/backend-api/gizmos/' + project + '/conversations'],
-    'no repeated native GET after an empty result');
+    'no repeated native GET after a verified empty result');
+
+  // A first message arriving later makes the former empty shell a real chat.
+  requests = []; ingests = [];
+  const populatedAfterEmpty = await run({ pending: { ...pending(), priority: {
+    conversationId: inaccessible, sourceId: projectOwner.sourceId,
+    accountKey: projectOwner.accountKey, projectId: project, kind: 'continuation' } },
+  failureDetails: nativeEmpty.state.failureDetails });
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(ingests.length, 1);
+  assert.equal(populatedAfterEmpty.state.failureDetails[0].resolution, undefined,
+    'a newly populated chat must no longer display the empty-shell label');
+
+  // Unconfirmed browser captures prevent an empty native route from erasing
+  // the evidence of a newly populated chat in another project or session.
+  requests = []; ingests = []; mode = 'native-empty';
+  const hasLiveMessages = await run({ pending: pending(),
+    failureDetails: [unreadable] }, [inaccessible]);
+  assert.equal(hasLiveMessages.state.failureDetails[0].resolvedAtMs, null);
+  assert.equal(hasLiveMessages.state.failureDetails[0].resolution, undefined);
+  assert.equal(ingests.length, 0);
+
+  // No matched conversation identity is not proof of a real empty chat.
+  requests = []; mode = 'native-unidentified-empty';
+  const unidentified = await run({ pending: pending(), failureDetails: [unreadable] });
+  assert.equal(unidentified.state.failureDetails[0].resolvedAtMs, null);
+  assert.equal(unidentified.state.failureDetails[0].resolution, undefined);
+
+  // Non-user payloads are not proof of an empty server response.
+  requests = []; ingests = []; mode = 'native-nonuser';
+  const unsupported = await run({ pending: pending(), failureDetails: [unreadable] });
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(ingests.length, 0);
+  assert.equal(unsupported.state.failureDetails[0].resolvedAtMs, null);
+  assert.equal(unsupported.state.failureDetails[0].resolution, undefined);
+  assert.equal(unsupported.state.failureDetails[0].accessVerification.nativeStatus, 200);
+  requests = []; mode = 'healthy';
+  await run(unsupported.state);
+  assert.deepEqual(requests, ['/backend-api/gizmos/' + project + '/conversations'],
+    'unreadable nonempty content stays unresolved without repeated native GET');
 
   requests = []; mode = 'native-inaccessible';
   const native404 = await run({ pending: pending(), failureDetails: [unreadable] });
