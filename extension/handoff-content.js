@@ -48,12 +48,118 @@
   let checkingHandoff = false;
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+  // Title a new chat only after a real user sends from its empty landing page.
+  // Existing chats, manually named chats and uncertain account identities stay unchanged.
+  const isLanding = path => path === '/' ||
+    /^\/g\/g-p-[0-9a-f]{32}(?:-[^/]*)?(?:\/project)?\/?$/i.test(path);
+  let newChatLanding = isLanding(location.pathname);
+  let landingPath = location.pathname;
+  let newChatSubmitted = false, autoTitleAttempted = false, manualTitleEdit = false;
+  let firstSubmittedAtMs = null;
+  let titleTargetPath = null, lastObservedTitle = '', titleStableSinceMs = 0, titleWaitTimer = null;
+  document.addEventListener('click', event => {
+    if (!event.isTrusted) return;
+    const action = event.target?.closest?.('button, a, [role="button"], [role="menuitem"]');
+    const name = (action?.getAttribute?.('aria-label') || action?.textContent || '').trim();
+    if (/^new chat$/i.test(name)) {
+      newChatLanding = true; landingPath = location.pathname;
+      newChatSubmitted = false; autoTitleAttempted = false;
+      firstSubmittedAtMs = null; manualTitleEdit = false; titleTargetPath = null;
+      lastObservedTitle = ''; titleStableSinceMs = 0; clearTimeout(titleWaitTimer);
+    }
+    if (action?.getAttribute?.('role') === 'menuitem' && /^rename$/i.test(name)) {
+      manualTitleEdit = true;
+    }
+  }, true);
+
+  async function renameUsingChatGPT(oldTitle, newTitle, path) {
+    if (location.pathname !== path || document.title !== oldTitle ||
+        document.querySelector('[role="menu"], input[name="title-editor"]') ||
+        (editableElement()?.textContent || editableElement()?.value || '').trim()) return false;
+    const header = [...document.querySelectorAll('main button[aria-haspopup="menu"]')]
+      .find(button => button.textContent?.trim() === oldTitle);
+    if (!header) return false;
+    // ChatGPT's Radix title menu listens to pointerdown, not element.click().
+    header.dispatchEvent(new PointerEvent('pointerdown', {
+      bubbles: true, pointerId: 1, pointerType: 'mouse',
+      button: 0, buttons: 1, isPrimary: true,
+    }));
+    await pause(140);
+    if (location.pathname !== path) return false;
+    const rename = [...document.querySelectorAll('[role="menuitem"]')]
+      .find(item => item.textContent?.trim().toLowerCase() === 'rename');
+    if (!rename) return false;
+    rename.click();
+    await pause(140);
+    const editor = document.querySelector('input[name="title-editor"], input[aria-label="Chat title"]');
+    if (!editor || location.pathname !== path || document.title !== oldTitle ||
+        editor.value?.trim() !== oldTitle) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (!setter) return false;
+    setter.call(editor, newTitle);
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    await pause(75);
+    const save = [...(editor.closest('[role="dialog"]')?.querySelectorAll('button[type="submit"]') ?? [])]
+      .find(button => button.textContent?.trim() === 'Save' && !button.disabled);
+    if (!save || location.pathname !== path || document.title !== oldTitle ||
+        editor.value !== newTitle) return false;
+    save.click();
+    for (let i = 0; i < 10; i++) {
+      await pause(200);
+      if (location.pathname !== path) break;
+      if (document.title === newTitle) return true;
+    }
+    return false; // Never retry an uncertain title write.
+  }
+
+  function maybeNameNewChat() {
+    if (!newChatLanding || !newChatSubmitted || !firstSubmittedAtMs ||
+        autoTitleAttempted || manualTitleEdit) return;
+    const path = location.pathname;
+    if (isLanding(path) || path === landingPath || !/\/c\/[0-9a-f-]{36}\/?$/i.test(path)) return;
+    if (titleTargetPath && path !== titleTargetPath) return;
+    titleTargetPath = path;
+    if (document.querySelector('[data-testid="stop-button"]') ||
+        !document.querySelector('[data-conversation-role="assistant"], [data-message-author-role="assistant"]')) return;
+    const originalTitle = (document.title || '').trim();
+    if (!originalTitle || /^(?:new chat|chatgpt)$/i.test(originalTitle)) return;
+    if (originalTitle !== lastObservedTitle) {
+      lastObservedTitle = originalTitle;
+      titleStableSinceMs = Date.now();
+    }
+    if (Date.now() - titleStableSinceMs < 1800) {
+      clearTimeout(titleWaitTimer);
+      titleWaitTimer = setTimeout(maybeNameNewChat, 1900);
+      return;
+    }
+    clearTimeout(titleWaitTimer);
+    autoTitleAttempted = true;
+    void (async () => {
+      if (location.pathname !== path || document.title !== originalTitle || manualTitleEdit) return;
+      const firstUser = document.querySelector('[data-user-message-bubble="true"]')?.innerText || '';
+      const handoff = /^(?:continue the unfinished work|take over from this chat|resume (?:this|the) (?:chat|conversation))/i.test(firstUser.trim());
+      const predecessorUrl = handoff ? firstUser.match(/https:\/\/chatgpt\.com\/(?:g\/[^\s)]+?\/)?c\/[0-9a-f-]{36}/i)?.[0] : null;
+      const result = await send({ type: 'hstryAutoTitleProposal', url: location.href,
+        title: originalTitle, openedAtMs: firstSubmittedAtMs,
+        predecessorUrl });
+      if (result?.ok && result.title && result.title !== originalTitle && !manualTitleEdit) {
+        await renameUsingChatGPT(originalTitle, result.title, path);
+      }
+    })().catch(() => {}); // UI changes fail closed; never affect history capture.
+  }
+
   // Only a real user submission may automatically recover a generic error.
   // Programmatic HSTRY handoff sends and historical errors stay manual.
   document.addEventListener('click', event => {
     if (event.isTrusted && event.target?.closest?.('button[data-testid="send-button"], '+
         'button[aria-label="Send prompt"], button[aria-label="Send message"], '+
-        'button[aria-label="Send"]')) submittedPath = location.pathname;
+        'button[aria-label="Send"]')) {
+      submittedPath = location.pathname;
+      if (newChatLanding && isLanding(location.pathname)) {
+        newChatSubmitted = true;
+        firstSubmittedAtMs ??= Date.now();
+      }
+    }
   }, true);
   document.addEventListener('keydown', event => {
     if (event.isTrusted && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey &&
@@ -63,6 +169,10 @@
           '[data-composer-body] [contenteditable="true"][role="textbox"], '+
           'textarea[placeholder*="Message"]')) {
       submittedPath = location.pathname;
+      if (newChatLanding && isLanding(location.pathname)) {
+        newChatSubmitted = true;
+        firstSubmittedAtMs ??= Date.now();
+      }
     }
   }, true);
 
@@ -269,6 +379,7 @@
         await pause(250);
       }
       if (!button) throw new Error('Takeover text is ready; send it manually');
+      const handoffSubmitAtMs = Date.now();
       button.click();
       // A native click alone is not a successful submission. Keep the handoff
       // pending if ChatGPT leaves the instruction in the composer.
@@ -281,6 +392,11 @@
         await pause(250);
       }
       if (!submitted) throw new Error('Takeover text remains in the composer; send it manually');
+      if (newChatLanding) {
+        newChatSubmitted = true;
+        firstSubmittedAtMs ??= handoffSubmitAtMs;
+        scheduleWarningCheck();
+      }
       await send({ type:'HSTRY_TAKEOVER_DONE' });
     } catch (e) {
       fallbackBanner('HSTRY takeover: ' + String(e.message || e) +
@@ -330,7 +446,7 @@
       void takeOverIfPending();
     }
     clearTimeout(detectionTimer);
-    detectionTimer = setTimeout(detectLimit, 700);
+    detectionTimer = setTimeout(() => { detectLimit(); maybeNameNewChat(); }, 700);
   }
   window.addEventListener('hstry:conversation-too-large', event => {
     const detail = event?.detail;

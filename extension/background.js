@@ -3,7 +3,7 @@ import './handoff-background.js';
 // new/updated conversations to a local hstry-api instance (POST /ingest).
 
 import { NotLoggedInError } from './lib/common.js';
-import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName, nextContinuationPriority } from './lib/live-capture.js';
+import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName, conversationFromUrl, proposedWorkspaceChatTitle, nextArchivedTaskNumber, taskFromHstryContinuation, nextContinuationPriority } from './lib/live-capture.js';
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS } from './providers/index.js';
 import { nextNativeRecoveryPriority, workspaceOnlyChatGPTState } from './providers/chatgpt.js';
 import { badgeState, failureStatusMessage } from './ui.js';
@@ -14,6 +14,7 @@ const DEFAULT_SETTINGS = {
   intervalMinutes: 15,
   providers: DEFAULT_PROVIDER_SETTINGS,
   chatgptWorkspaceOnly: false,
+  autoNameNewChats: false,
 };
 
 const ALARM_NAME = 'hstry-sync';
@@ -495,6 +496,37 @@ chrome.alarms.onAlarm.addListener(alarm => {
 chrome.action.onClicked.addListener(() => runSync('manual'));
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'hstryAutoTitleProposal') {
+    (async () => {
+      if (sender.id !== chrome.runtime.id || sender.frameId !== 0) return { ok: false };
+      const route = conversationFromUrl(message.url);
+      const active = conversationFromUrl(sender.tab?.url);
+      if (!route || !active || route.conversationId !== active.conversationId ||
+          route.projectId !== active.projectId) return { ok: false };
+      const settings = await getSettings();
+      const status = await getStatus();
+      if (!settings.chatgptWorkspaceOnly || !settings.autoNameNewChats ||
+          !settings.providers.chatgpt) return { ok: false };
+      const owner = resolveLiveOwner(route, status);
+      if (!owner?.sourceId?.startsWith('chatgpt-web-')) return { ok: false };
+      // Reuse the installed read-only HSTRY archive. Missing archive data must
+      // not invent an ordinal or race another new conversation.
+      const endpoint = `http://127.0.0.1:${settings.port}/sessions?source=${encodeURIComponent(owner.sourceId)}&limit=5000`;
+      const response = await fetch(endpoint, { signal: AbortSignal.timeout(4000) });
+      if (!response.ok) return { ok: false };
+      const sessions = await response.json();
+      if (sessions?.ok !== true || !Array.isArray(sessions.result)) return { ok: false };
+      const task = taskFromHstryContinuation(message.title, message.predecessorUrl,
+        sessions.result, owner.sourceId, route.projectId);
+      if (!task) return { ok: false };
+      const number = nextArchivedTaskNumber(task, sessions.result, owner.sourceId,
+        route.projectId, route.conversationId);
+      const title = proposedWorkspaceChatTitle(settings, status, route, task,
+        message.openedAtMs, number);
+      return title ? { ok: true, title } : { ok: false };
+    })().then(sendResponse).catch(() => sendResponse({ ok: false }));
+    return true;
+  }
   if (message?.type === 'hstryLiveCapture' || message?.type === 'hstryLiveCaptureBatch') {
     handleLiveCaptures(message.type === 'hstryLiveCapture' ? [message.capture] : message.captures, sender)
       .then(sendResponse)
