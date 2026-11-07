@@ -64,6 +64,9 @@ check('zero failures clears status message', failureStatusMessage(0, inaccessibl
 check('excluded conversation is never labelled recovered',
   failureDisposition({ resolution: 'excluded-not-recovered', resolvedAtMs: now, accessVerification: { nativeStatus: 404 } }),
   ' (excluded; not recovered)');
+check('empty placeholder is not mislabelled recovered',
+  failureDisposition({ resolution: 'empty-shell', resolvedAtMs: now }),
+  ' (verified empty; no history)');
 check('successfully imported conversation is labelled recovered', failureDisposition({ resolvedAtMs: now }),
   ' (recovered)');
 check('unresolved native error still requires access',

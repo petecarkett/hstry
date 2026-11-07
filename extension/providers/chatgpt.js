@@ -638,6 +638,9 @@ function appendNativePage(previous, page, conversationId) {
     ['title', 'create_time', 'update_time', 'gizmo_id', 'project_id', 'url']
       .filter(key => Object.hasOwn(page, key)).map(key => [key, page[key]]));
   return { conversationId, pages, messages, header,
+    serverEmpty: (previous ? previous.serverEmpty === true : true) &&
+      page.conversation_id === conversationId &&
+      page.messages.length === 0 && page.page_info.has_next_page === false,
     seenCursors: cursor ? [...seenCursors, cursor] : seenCursors,
     before: cursor, complete: !page.page_info.has_previous_page };
 }
@@ -647,6 +650,16 @@ function assembledNativeDetail(stage) {
   return { ...stage.header, messages: stage.messages,
     // These flags describe our complete assembled active branch, not a fork graph.
     page_info: { has_previous_page: false, has_next_page: false } };
+}
+
+function resolveEmptyShell(failures, conversationId, accountKey) {
+  for (const failure of failures) {
+    if (failure.conversationId !== conversationId || failure.accountKey !== accountKey ||
+        failure.resolvedAtMs) continue;
+    failure.resolvedAtMs = Date.now();
+    failure.resolution = 'empty-shell';
+    delete failure.nextRetryAtMs;
+  }
 }
 
 const isNonRetryableAccess = failure =>
@@ -1047,6 +1060,16 @@ export async function syncChatGPT({
     const detail = assembledNativeDetail(stage);
     const parsed = toParsedConversations(detail, { id: task.conversationId }, owner);
     if (!parsed.length && task.kind === 'native-fallback') {
+      if (stage.serverEmpty === true && stage.messages.length === 0 &&
+          !pendingLive.has(task.conversationId)) {
+        resolveEmptyShell(failureDetails, task.conversationId, owner.accountKey);
+        delete pending.priority;
+        pending.lastPriorityProcessed = pending.processed;
+        healthyRead();
+        await checkpointNow();
+        return { state: { ...newState, pending: { ...pending } }, conversations: total,
+          hasMore: true, failures: outstanding(), retryAfterMinutes: paceMinutes() };
+      }
       for (const failure of failureDetails) {
         if (!failure.resolvedAtMs && failure.conversationId === task.conversationId &&
             failure.accountKey === owner.accountKey) {
@@ -1070,8 +1093,10 @@ export async function syncChatGPT({
       confirmed: canonicalMessages(detail) });
     for (const failure of failureDetails) {
       if (failure.conversationId === task.conversationId &&
-          failure.accountKey === owner.accountKey && !failure.resolvedAtMs) {
+          failure.accountKey === owner.accountKey &&
+          (!failure.resolvedAtMs || failure.resolution === 'empty-shell')) {
         failure.resolvedAtMs = Date.now();
+        if (failure.resolution === 'empty-shell') delete failure.resolution;
       }
     }
     if (task.kind === 'continuation') {
@@ -1388,9 +1413,13 @@ export async function syncChatGPT({
         healthyRead();
         const recovered = failureDetails.find(detail =>
           detail.conversationId === item.id && detail.projectId === (itemScope.projectId ?? null) &&
-          detail.accountKey === scope.accountKey && !detail.resolvedAtMs
+          detail.accountKey === scope.accountKey &&
+          (!detail.resolvedAtMs || detail.resolution === 'empty-shell')
         );
-        if (recovered) recovered.resolvedAtMs = Date.now();
+        if (recovered) {
+          recovered.resolvedAtMs = Date.now();
+          if (recovered.resolution === 'empty-shell') delete recovered.resolution;
+        }
       }
       // Count only completed entries; a 429 or interrupted ingest retries this index.
       pending.detected++;
