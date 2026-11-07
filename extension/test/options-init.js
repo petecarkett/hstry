@@ -53,6 +53,7 @@ for (const id of [
   'port',
   'token',
   'interval',
+  'workspace-only',
   'provider-list',
   'status-list',
   'resync-list',

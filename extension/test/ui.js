@@ -79,6 +79,7 @@ check('visible settings normalize before sync', normalizeSettings({
 }, { port: 41770, intervalMinutes: 15 }), {
   port: 3434,
   token: 'hello',
+  chatgptWorkspaceOnly: false,
   intervalMinutes: 15,
   providers: { chatgpt: true },
 });
@@ -90,9 +91,15 @@ check('invalid port cannot escape form constraints', normalizeSettings({
 }, { port: 41770, intervalMinutes: 15 }), {
   port: 41770,
   token: '',
+  chatgptWorkspaceOnly: false,
   intervalMinutes: 15,
   providers: { chatgpt: false },
 });
+
+check('workspace-only setting is explicit', normalizeSettings({
+  port: '41770', token: '', intervalMinutes: '15',
+  chatgptWorkspaceOnly: true, providers: { chatgpt: true },
+}, { port: 41770, intervalMinutes: 15 }).chatgptWorkspaceOnly, true);
 
 check('queued retry shows progress rather than a stale red badge',
   badgeState({ chatgpt: { continuationPending: true, lastError: 'Earlier request failed' } }),

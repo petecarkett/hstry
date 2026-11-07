@@ -5,7 +5,7 @@ import './handoff-background.js';
 import { NotLoggedInError } from './lib/common.js';
 import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName, nextContinuationPriority } from './lib/live-capture.js';
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS } from './providers/index.js';
-import { nextNativeRecoveryPriority } from './providers/chatgpt.js';
+import { nextNativeRecoveryPriority, workspaceOnlyChatGPTState } from './providers/chatgpt.js';
 import { badgeState, failureStatusMessage } from './ui.js';
 
 const DEFAULT_SETTINGS = {
@@ -13,6 +13,7 @@ const DEFAULT_SETTINGS = {
   token: '',
   intervalMinutes: 15,
   providers: DEFAULT_PROVIDER_SETTINGS,
+  chatgptWorkspaceOnly: false,
 };
 
 const ALARM_NAME = 'hstry-sync';
@@ -57,6 +58,8 @@ async function flushLiveCaptures() {
     for (const [key, item] of Object.entries(stored[LIVE_KEY] ?? {})) {
       if (count >= 25) break;
       const owner = resolveLiveOwner(item, status);
+      if (settings.chatgptWorkspaceOnly &&
+          !owner?.sourceId?.startsWith('chatgpt-web-')) continue;
       const projectName = owner?.projectName || resolveLiveProjectName(item, status);
       if (item.indexedAt && (!projectName || item.indexedProjectName === projectName)) continue;
       count++;
@@ -270,7 +273,7 @@ async function registerEnabledSources(settings) {
   const register = makeRegister(settings);
   const results = {};
   for (const [id, provider] of Object.entries(PROVIDERS)) {
-    if (!settings.providers[id]) continue;
+    if (!settings.providers[id] || (id === 'chatgpt' && settings.chatgptWorkspaceOnly)) continue;
     try {
       results[id] = await register(provider.sourceId, provider.adapter);
     } catch (error) {
@@ -381,6 +384,9 @@ async function runSync(
       try {
         let chatgptOptions = {};
         if (name === 'chatgpt') {
+          if (settings.chatgptWorkspaceOnly) {
+            entry.state = workspaceOnlyChatGPTState(entry.state ?? {});
+          }
           const queue = (await chrome.storage.local.get(LIVE_KEY))[LIVE_KEY] ?? {};
           const keys = (await chrome.storage.local.getKeys())
             .filter(key => key.startsWith('hstryTakeoverSource:'));
@@ -390,6 +396,7 @@ async function runSync(
           if (priority) entry.state = { ...entry.state,
             pending: { ...entry.state.pending, priority } };
           chatgptOptions = {
+            workspaceOnly: settings.chatgptWorkspaceOnly === true,
             onCanonicalIngest: settleLiveCapture,
             pendingLiveConversationIds: [...new Set(Object.values(queue)
               .map(item => item.conversationId).filter(Boolean))],
@@ -543,9 +550,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'settingsChanged') {
-    Promise.all([ensureAlarm(), registerEnabledSources(), refreshBadge()]).then(([, sources]) => {
-      sendResponse({ ok: true, sources });
-    });
+    (async () => {
+      const settings = await getSettings();
+      if (settings.chatgptWorkspaceOnly && !activeProviders.has('chatgpt')) {
+        const status = await getStatus();
+        const entry = status.chatgpt;
+        if (entry?.state && !entry.running) {
+          const scoped = workspaceOnlyChatGPTState(entry.state);
+          if (scoped !== entry.state) {
+            await setStatusEntry('chatgpt', { ...entry, state: scoped,
+              lastError: failureStatusMessage(scoped.failureDetails?.filter(x => !x.resolvedAtMs).length ?? 0,
+                scoped.failureDetails) });
+          }
+        }
+      }
+      const [, sources] = await Promise.all([ensureAlarm(), registerEnabledSources(), refreshBadge()]);
+      return { ok: true, sources };
+    })().then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message }));
     return true;
   }
   if (message?.type === 'checkApi') {

@@ -1,6 +1,7 @@
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS, formatTime, normalizeSettings, providerState } from './ui.js';
 
-const DEFAULTS = { port: 41770, token: '', intervalMinutes: 15, providers: DEFAULT_PROVIDER_SETTINGS };
+const DEFAULTS = { port: 41770, token: '', intervalMinutes: 15,
+  providers: DEFAULT_PROVIDER_SETTINGS, chatgptWorkspaceOnly: false };
 const el = id => document.getElementById(id);
 let currentSettings = DEFAULTS;
 let apiConnected = false;
@@ -11,6 +12,7 @@ async function load() {
   el('port').value = currentSettings.port;
   el('token').value = currentSettings.token;
   el('interval').value = currentSettings.intervalMinutes;
+  el('workspace-only').checked = currentSettings.chatgptWorkspaceOnly;
   for (const id of Object.keys(PROVIDERS)) el(`provider-${id}`).checked = currentSettings.providers[id];
   await renderStatus();
 }
@@ -20,6 +22,7 @@ function readFormSettings() {
     port: el('port').value,
     token: el('token').value.trim(),
     intervalMinutes: el('interval').value,
+    chatgptWorkspaceOnly: el('workspace-only').checked,
     providers: Object.fromEntries(Object.keys(PROVIDERS).map(id => [id, el(`provider-${id}`).checked])),
   }, DEFAULTS);
 }
