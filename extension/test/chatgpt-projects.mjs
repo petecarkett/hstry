@@ -145,6 +145,73 @@ try {
   assert(legacyState.accounts.accworks?.projects[A]?.lastSyncMs);
   assert(!legacyState.pending, 'reordered checkpoint is removed only after all scopes finish');
 
+  // A saved personal backfill must not block projects in another account.
+  // Preserve its 2,150-item cursor and failures while the other account's
+  // project scopes are scanned first, without replaying those personal items.
+  const otherAccount = { accountId: 'second-account', accountKey: 'secondctx',
+    accountName: 'second', sourceId: 'chatgpt-web-secondctx' };
+  const resumedBackfill = { accounts: {}, pending: {
+    scopes: [
+      { ...legacyScope, projectId: null },
+      { ...otherAccount, projectId: null },
+      { ...otherAccount, projectId: A, projectName: '1hood', projectShortUrl: `${A}-1hood` },
+      { ...otherAccount, projectId: B, projectName: 'Second project',
+        projectShortUrl: `${B}-second-project` },
+      { ...legacyScope, projectId: null, archived: true },
+      { ...otherAccount, projectId: null, archived: true },
+    ],
+    scopeIndex: 0, offset: 2150, cursor: '0', pageIndex: 38,
+    scopeFailures: 67, scopeTrackedFailures: 18, failures: 67,
+    detected: 3343, processed: 3343, runStartedMs: Date.now() - 60_000,
+  } };
+  let crossAccountCheckpoint;
+  const crossAccountReceived = [];
+  const crossAccountResult = await syncChatGPT({
+    state: resumedBackfill,
+    push: async (_source, _adapter, conversations) => {
+      crossAccountReceived.push(conversations[0].externalId);
+      return 1;
+    },
+    register: async () => {}, report: async () => {},
+    checkpoint: async next => { crossAccountCheckpoint = structuredClone(next); },
+  });
+  assert.equal(crossAccountResult.hasMore, true);
+  assert.equal(crossAccountReceived[0], 'project-a-0',
+    'another account\'s project must run before the paused personal backlog');
+  assert.deepEqual(crossAccountCheckpoint.pending.scopes.slice(0, 4).map(x => x.projectId || null),
+    [A, B, null, null], 'all remaining project scopes move ahead of personal backfills');
+  assert.equal(crossAccountCheckpoint.pending.personalResume.index, 2);
+  assert.equal(crossAccountCheckpoint.pending.personalResume.offset, 2150);
+  assert.equal(crossAccountCheckpoint.pending.personalResume.pageIndex, 38);
+  assert.equal(crossAccountCheckpoint.pending.personalResume.scopeFailures, 67);
+  assert.equal(crossAccountCheckpoint.pending.personalResume.scopeTrackedFailures, 18);
+  let projectFirstState = crossAccountResult.state;
+  let resumedCursor = null;
+  for (let run = 0; run < 20 && !resumedCursor; run++) {
+    const next = await syncChatGPT({
+      state: projectFirstState,
+      push: async (_source, _adapter, conversations) => {
+        crossAccountReceived.push(conversations[0].externalId);
+        return 1;
+      },
+      register: async () => {}, report: async () => {},
+      checkpoint: async state => {
+        if (state.pending?.scopeIndex === 2 && !state.pending.personalResume) {
+          resumedCursor ??= structuredClone(state.pending);
+        }
+      },
+    });
+    projectFirstState = next.state;
+  }
+  assert(resumedCursor, 'personal listing resumes after all projects in other accounts');
+  assert.equal(resumedCursor.offset, 2150);
+  assert.equal(resumedCursor.pageIndex, 38);
+  assert.equal(resumedCursor.scopeFailures, 67);
+  assert.equal(resumedCursor.scopeTrackedFailures, 18);
+  assert.deepEqual(crossAccountReceived.slice(0, 11),
+    [...allA.map(x => x.id), 'project-b-one'],
+    'both project streams finish before touching the saved personal cursor');
+
   // The exact project identifier in a conversation's URL or API metadata wins over topic words.
   const bad = { ...detail('unassigned'), url: `https://chatgpt.com/g/${A}-1hood/c/unassigned` };
   assert(/g-p-/.test(bad.url));
