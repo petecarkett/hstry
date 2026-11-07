@@ -180,7 +180,7 @@ function authHeaders(token, accountId) {
 
 /** Enumerate accounts (personal + Teams workspaces). Falls back to the
  * default account when the accounts endpoint is unavailable. */
-async function listAccounts(token) {
+async function listAccounts(token, workspaceOnly = false) {
   try {
     const data = await fetchChatGPTJson(`${BASE}/backend-api/accounts/check/v4-2023-04-27`, {
       headers: authHeaders(token),
@@ -197,13 +197,77 @@ async function listAccounts(token) {
         isWorkspace: (account?.structure ?? account?.plan_type) === 'workspace',
       });
     }
-    if (accounts.length > 0) return accounts;
+    if (accounts.length > 0) {
+      if (!workspaceOnly) return accounts;
+      const workspaces = accounts.filter(account => account.isWorkspace);
+      if (workspaces.length) return workspaces;
+      throw new Error('Workspace-only history sync: no workspace is accessible');
+    }
   } catch (error) {
     // Only a missing/retired account endpoint permits single-account fallback.
     // Timeouts, 5xx and rate limits must not silently hide workspace projects.
     if (error.status !== 404 && error.status !== 410) throw error;
   }
+  if (workspaceOnly) throw new Error('Workspace-only history sync: account discovery is unavailable');
   return [{ id: null, name: 'default', isWorkspace: false }];
+}
+
+const workspaceScope = scope => typeof scope?.sourceId === 'string' &&
+  scope.sourceId.startsWith('chatgpt-web-');
+
+// Keep the saved workspace cursor when skipping an in-progress personal scope.
+export function workspaceOnlyChatGPTState(state = {}) {
+  let next = state;
+  const discovery = state.discovery;
+  if (Array.isArray(discovery?.accounts)) {
+    const workspaces = discovery.accounts.filter(account => account.isWorkspace);
+    if (!workspaces.length) throw new Error('Workspace-only history sync: no workspace is accessible');
+    const oldIndex = discovery.accountIndex ?? 0;
+    next = { ...state, discovery: { ...discovery,
+      accounts: workspaces,
+      scopes: (discovery.scopes ?? []).filter(workspaceScope),
+      accountIndex: discovery.accounts.slice(0, oldIndex).filter(account => account.isWorkspace).length,
+      ...(discovery.accounts[oldIndex]?.isWorkspace ? {} :
+        { cursor: null, pageCount: 0, seenCursors: [] }),
+    } };
+  }
+  const pending = state.pending;
+  if (!Array.isArray(pending?.scopes)) return next;
+  const all = pending.scopes;
+  const retained = all.filter(workspaceScope);
+  if (!retained.length) throw new Error('Workspace-only history sync: no workspace scopes found');
+  if (retained.length === all.length) return next;
+  const index = Math.min(pending.scopeIndex ?? 0, all.length);
+  const nextIndex = all.slice(0, index).filter(workspaceScope).length;
+  const currentRetained = workspaceScope(all[index]);
+  const nextPending = { ...pending, scopes: retained, scopeIndex: nextIndex };
+  if (pending.personalResume && workspaceScope(all[pending.personalResume.index])) {
+    nextPending.personalResume = { ...pending.personalResume,
+      index: all.slice(0, pending.personalResume.index).filter(workspaceScope).length };
+  } else {
+    delete nextPending.personalResume;
+  }
+  if (!currentRetained) {
+    nextPending.offset = 0;
+    nextPending.cursor = '0';
+    nextPending.pageIndex = 0;
+    nextPending.scopeFailures = 0;
+    nextPending.scopeTrackedFailures = 0;
+    delete nextPending.cachedPage;
+    delete nextPending.nativeDetail;
+  } else if (nextPending.cachedPage) {
+    nextPending.cachedPage = { ...nextPending.cachedPage, scopeIndex: nextIndex };
+  }
+  if (nextPending.priority && !workspaceScope(nextPending.priority)) delete nextPending.priority;
+  const accountKeys = new Set(retained.map(scope => scope.accountKey));
+  return { ...next, pending: nextPending,
+    accounts: Object.fromEntries(Object.entries(state.accounts ?? {})
+      .filter(([key]) => accountKeys.has(key))),
+    failureDetails: (state.failureDetails ?? []).filter(failure => accountKeys.has(failure.accountKey)),
+    sourceRoutes: retained.map(scope => ({ accountId: scope.accountId,
+      sourceId: scope.sourceId, projectId: scope.projectId,
+      projectName: scope.projectName })),
+  };
 }
 
 // Project chats are not reliably present in the ordinary conversation list.
@@ -718,7 +782,9 @@ export async function syncChatGPT({
   checkpoint = async () => {},
   onCanonicalIngest = async () => {},
   pendingLiveConversationIds = [],
+  workspaceOnly = false,
 }) {
+  if (workspaceOnly) state = workspaceOnlyChatGPTState(state ?? {});
   await report({ phase: 'discovering' });
   const queueDiscovery = async (error, endpoint = 'discovery') => {
     if (!(error instanceof RateLimitedError)) throw error;
@@ -771,7 +837,7 @@ export async function syncChatGPT({
     };
     try {
       if (!Array.isArray(discovery.accounts)) {
-        const accounts = await listAccounts(token);
+        const accounts = await listAccounts(token, workspaceOnly);
         return queueNext({ ...state, discovery: { ...discovery, accounts } });
       }
       const account = discovery.accounts[discovery.accountIndex];
@@ -823,7 +889,7 @@ export async function syncChatGPT({
   }
   if (!pending) {
     try {
-    const accounts = await listAccounts(token);
+    const accounts = await listAccounts(token, workspaceOnly);
     const scopes = [];
     for (const account of accounts) {
       const accountKey = account.id ? shortId(account.id) : 'default';
