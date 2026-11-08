@@ -125,8 +125,9 @@ export function nextArchivedTaskNumber(nativeTitle, archived, sourceId, projectI
 // Europe/London timezone for every browser running this workspace workflow.
 export function proposedWorkspaceChatTitle(settings, status, route, nativeTitle,
     openedAtMs, seriesNumber = null) {
+  // A root chat URL does not establish which account is currently active.
   if (settings?.chatgptWorkspaceOnly !== true || settings?.autoNameNewChats !== true ||
-      settings?.providers?.chatgpt !== true || !route ||
+      settings?.providers?.chatgpt !== true || !route?.projectId ||
       !Number.isSafeInteger(openedAtMs) || openedAtMs < Date.UTC(2015, 0, 1) ||
       openedAtMs > Date.now() + 60_000) return null;
   const owner = resolveLiveOwner(route, status);

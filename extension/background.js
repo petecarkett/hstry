@@ -501,7 +501,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (sender.id !== chrome.runtime.id || sender.frameId !== 0) return { ok: false };
       const route = conversationFromUrl(message.url);
       const active = conversationFromUrl(sender.tab?.url);
-      if (!route || !active || route.conversationId !== active.conversationId ||
+      if (!route?.projectId || !active || route.conversationId !== active.conversationId ||
           route.projectId !== active.projectId) return { ok: false };
       const settings = await getSettings();
       const status = await getStatus();

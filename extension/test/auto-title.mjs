@@ -27,9 +27,12 @@ assert.equal(title(settings, status, route, 'MT5 integration',
   Date.parse('2026-10-25T01:28:00Z')),
   '2026-10-25 01:28 — FerroQuant — MT5 integration',
   'UK winter time is applied after the autumn clock change');
+// Root chats have no active-account identity in their URL. A cached Workspace
+// scope can persist when the visible browser switches to Personal.
 assert.equal(title(settings, { chatgpt: { state: { pending: { scopes: [
   { ...scope, projectId: null, projectName: null } ] } } } },
-  { ...route, projectId: null }), '2026-11-07 17:28 — Workspace — MT5 integration');
+  { ...route, projectId: null }), null,
+  'unprojected chats are not safe to rename from cached Workspace ownership');
 for (const flag of ['autoNameNewChats', 'chatgptWorkspaceOnly']) {
   assert.equal(title({ ...settings, [flag]: false }), null, `${flag} must be enabled`);
 }
