@@ -208,7 +208,7 @@
     btn.disabled = true;
     btn.textContent = 'Opening continuation...';
     try {
-      const result = await send({ type: 'HSTRY_TAKEOVER_START', automatic,
+      const result = await send({ type: 'HSTRY_TAKEOVER_START', automatic, sourceUrl: location.href,
         failedMessage: serverLimitPath === location.pathname ? rejectedMessage : '',
         missingAttachments: serverLimitPath === location.pathname && rejectedHasAttachments });
       if (!result?.ok) throw new Error(result?.error || 'Unable to open the new chat');
@@ -348,17 +348,30 @@
     document.body.append(b);
   }
 
+  function onHandoffLanding(landingPath) {
+    if (typeof landingPath !== 'string' || !landingPath.startsWith('/')) return false;
+    const path = location.pathname.replace(/\/$/, '') || '/';
+    const expected = landingPath.replace(/\/$/, '') || '/';
+    return path === expected || (expected !== '/' && path === expected + '/project');
+  }
+
   async function takeOverIfPending() {
     if (handoffStarted || checkingHandoff ||
         (resumeWhenComposerReady && !editableElement())) return;
     checkingHandoff = true;
     let result;
-    try { result = await send({ type:'HSTRY_TAKEOVER_POLL' }); }
+    try { result = await send({ type:'HSTRY_TAKEOVER_POLL', pagePath: location.pathname }); }
     catch { checkingHandoff = false; return; }
     checkingHandoff = false;
     if (!result?.ok || !result.found || handoffStarted) return;
+    // A worker response can arrive after an SPA navigation to another project.
+    if (!onHandoffLanding(result.landingPath)) {
+      resumeWhenComposerReady = true;
+      return;
+    }
     handoffStarted = true;
     const prompt = result.prompt;
+    let clicked = false;
     try {
       const editor = editableElement();
       if (!editor) {
@@ -370,17 +383,21 @@
         return;
       }
       resumeWhenComposerReady = false;
+      if (!onHandoffLanding(result.landingPath)) throw new Error('Destination project changed before composing');
       if (!enterPrompt(editor, prompt)) throw new Error('ChatGPT did not accept the takeover text');
       // Wait for ChatGPT to enable its native send control.
       let button;
       for (let i = 0; i < 20; i++) {
+        if (!onHandoffLanding(result.landingPath)) throw new Error('Destination project changed before sending');
         button = sendButton();
         if (button) break;
         await pause(250);
       }
       if (!button) throw new Error('Takeover text is ready; send it manually');
+      if (!onHandoffLanding(result.landingPath)) throw new Error('Destination project changed before sending');
       const handoffSubmitAtMs = Date.now();
       button.click();
+      clicked = true;
       // A native click alone is not a successful submission. Keep the handoff
       // pending if ChatGPT leaves the instruction in the composer.
       let submitted = false;
@@ -397,10 +414,18 @@
         firstSubmittedAtMs ??= handoffSubmitAtMs;
         scheduleWarningCheck();
       }
-      await send({ type:'HSTRY_TAKEOVER_DONE' });
+      const done = await send({ type:'HSTRY_TAKEOVER_DONE', pagePath: location.pathname });
+      if (!done?.ok || !done.completed) throw new Error(done?.error || 'Continuation completion was not verified');
     } catch (e) {
-      fallbackBanner('HSTRY takeover: ' + String(e.message || e) +
-        '. If the instruction is in the composer, press Send. Otherwise retry from the original chat.');
+      if (!clicked) {
+        handoffStarted = false;
+        resumeWhenComposerReady = true;
+      }
+      const message = String(e.message || e);
+      fallbackBanner(/Destination project changed/.test(message)
+        ? 'HSTRY paused because the tab changed projects. Do not send the continuation here; return to its original project.'
+        : 'HSTRY takeover: ' + message +
+          '. If the instruction is in the composer, press Send. Otherwise retry from the original chat.');
     }
   }
 

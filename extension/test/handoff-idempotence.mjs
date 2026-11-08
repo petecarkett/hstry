@@ -72,7 +72,8 @@ assert.equal(injected.length, 1, 'unrelated websites must never be injected');
 
 const send = (url, type, tabId, automatic = false, frameUrl = url, extra = {}) => new Promise(resolve => {
   const sender = { id: chrome.runtime.id, frameId: 0, url: frameUrl, tab: { id: tabId, url } };
-  const keepOpen = listener({ type, automatic, ...extra }, sender, resolve);
+  const keepOpen = listener({ type, automatic, pagePath: new URL(url).pathname,
+    ...(type === 'HSTRY_TAKEOVER_START' ? { sourceUrl: url } : {}), ...extra }, sender, resolve);
   assert.equal(keepOpen, true);
 });
 
@@ -129,6 +130,16 @@ const projectLanding = await send(landing + '/project', 'HSTRY_TAKEOVER_POLL', 1
 assert.equal(projectLanding.found, true, 'ChatGPT project landing alias is supported');
 
 const newChat = 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/99999999-aaaa-4bbb-8ccc-dddddddddddd';
+const foreignChat = 'https://chatgpt.com/g/g-p-6a81a59c80e48191a14c2f7c5ccdd387-krar-vst/c/99999999-aaaa-4bbb-8ccc-dddddddddddd';
+const foreignDone = await send(foreignChat, 'HSTRY_TAKEOVER_DONE', 1);
+assert.equal(foreignDone.ok, false, 'a different project cannot complete this handoff');
+assert.equal(session.has('hstryTakeoverTab:1'), true,
+  'rejected completion must leave the original handoff pending');
+assert.equal(local.get('hstryTakeoverSource:' + sourceId).status, 'started');
+const falseStart = await send(foreignChat, 'HSTRY_TAKEOVER_START', 1, true,
+  foreignChat, { sourceUrl: original });
+assert.equal(falseStart.ok, false,
+  'tab and current page must agree on the exact source conversation and project');
 tabs.get(1).url = newChat;
 const done = await send(newChat, 'HSTRY_TAKEOVER_DONE', 1);
 assert.equal(done.ok, true);
@@ -195,4 +206,36 @@ assert(Number.isFinite(legacy.legacyLastAt), 'older completion time remains avai
 assert.equal(legacy.automatic.length,0);
 
 
-console.log('PASS same-tab project continuation, durable deduplication, source validation and failed navigation recovery');
+// Four independent near-simultaneous continuations must never share a tab,
+// project landing, prompt, or receipt, including a root chat among projects.
+const starts = [
+  ['https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/11111111-1111-4111-8111-111111111111', 6],
+  ['https://chatgpt.com/g/g-p-6a81a59c80e48191a14c2f7c5ccdd387-krar-vst/c/22222222-2222-4222-8222-222222222222', 7],
+  ['https://chatgpt.com/c/33333333-3333-4333-8333-333333333333', 8],
+  ['https://chatgpt.com/g/g-p-6a7cf18195e08191afa988505b092577-system-optimisation/c/44444444-4444-4444-8444-444444444444', 9],
+];
+for (const [url, tabId] of starts) tabs.set(tabId, { id: tabId, url });
+const started = await Promise.all(starts.map(([url, tabId]) =>
+  send(url, 'HSTRY_TAKEOVER_START', tabId, true)));
+assert(started.every((r, i) => r.ok && r.tabId === starts[i][1]));
+for (const [url, tabId] of starts) {
+  const id = url.split('/').at(-1);
+  const stored = session.get('hstryTakeoverTab:' + tabId);
+  assert(stored?.original === url, 'the tab must retain its own exact source');
+  assert(stored.prompt.includes(url), 'the prompt must reference its own source');
+  const source = new URL(url);
+  const landing = source.pathname.replace(/\/c\/[0-9a-f-]{36}$/i, '');
+  assert.equal(tabs.get(tabId).url, source.origin + (landing || '/'),
+    'each tab must land in its own project');
+  const pending = await send(tabs.get(tabId).url, 'HSTRY_TAKEOVER_POLL', tabId);
+  assert.equal(pending.ok, true);
+  assert.equal(pending.found, true);
+  assert(pending.prompt.includes(url));
+  assert.equal(pending.landingPath, new URL(tabs.get(tabId).url).pathname);
+  assert.equal(local.get('hstryTakeoverSource:' + id).tabId, tabId);
+}
+const crossTab = await send(tabs.get(7).url, 'HSTRY_TAKEOVER_POLL', 6);
+assert.equal(crossTab.found, false, 'another project cannot consume the first tab handoff');
+assert(starts.every(([,tabId]) => session.has('hstryTakeoverTab:' + tabId)));
+
+console.log('PASS concurrent four-project continuation isolation, source and destination routing, durable receipts');
