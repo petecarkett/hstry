@@ -421,8 +421,11 @@
         handoffStarted = false;
         resumeWhenComposerReady = true;
       }
-      fallbackBanner('HSTRY takeover: ' + String(e.message || e) +
-        '. If the instruction is in the composer, press Send. Otherwise retry from the original chat.');
+      const message = String(e.message || e);
+      fallbackBanner(/Destination project changed/.test(message)
+        ? 'HSTRY paused because the tab changed projects. Do not send the continuation here; return to its original project.'
+        : 'HSTRY takeover: ' + message +
+          '. If the instruction is in the composer, press Send. Otherwise retry from the original chat.');
     }
   }
 
