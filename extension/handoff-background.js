@@ -1,4 +1,4 @@
-import { parseConversationUrl, takeoverPrompt } from './handoff-core.js';
+import { parseConversationUrl, isContinuationDestinationPath, takeoverPrompt } from './handoff-core.js';
 
 const PREFIX = 'hstryTakeoverTab:';
 const SOURCE_PREFIX = 'hstryTakeoverSource:';
@@ -24,7 +24,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // ChatGPT uses SPA navigation: sender.url can remain the frame's original
     // URL after the active tab has moved to another conversation.
     const parsed = parseConversationUrl(senderTab.url || '');
-    if (!parsed || !/^https:\/\/chatgpt\.com(?:\/|$)/.test(sender.url || '')) {
+    const claimed = parseConversationUrl(msg.sourceUrl || '');
+    if (!parsed || claimed?.original !== parsed.original ||
+        !/^https:\/\/chatgpt\.com(?:\/|$)/.test(sender.url || '')) {
       sendResponse({ ok: false, error: 'Open the original ChatGPT conversation first.' });
       return false;
     }
@@ -33,6 +35,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const task = (async () => {
       const sourceKey = SOURCE_PREFIX + parsed.id;
       const prior = (await chrome.storage.local.get(sourceKey))[sourceKey];
+      if (prior?.originalUrl && prior.originalUrl !== parsed.original) {
+        throw new Error('Existing continuation belongs to a different project.');
+      }
       if (prior?.status === 'completed') {
         return { existing: true, completed: true, tabId: prior.tabId };
       }
@@ -41,7 +46,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Reuse a previous continuation, including one opened by older builds.
         // If the same source tab never navigated, allow a safe retry in place.
         if (tab?.url?.startsWith('https://chatgpt.com/') &&
-            !(tab.id === senderTab.id && parseConversationUrl(tab.url)?.id === parsed.id)) {
+            !(tab.id === senderTab.id && parseConversationUrl(tab.url)?.original === parsed.original)) {
+          const previous = (await chrome.storage.session.get(PREFIX + tab.id))[PREFIX + tab.id];
+          if (previous?.original !== parsed.original ||
+              !isContinuationDestinationPath(parsed, new URL(tab.url).pathname, true)) {
+            throw new Error('Previous continuation tab is no longer in its source project.');
+          }
           return { existing: true, tabId: tab.id };
         }
       }
@@ -59,8 +69,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const automatic = msg.automatic === true;
       try {
         const current = await chrome.tabs.get(tabId);
-        if (parseConversationUrl(current.url || '')?.id !== parsed.id) {
-          throw new Error('Original conversation changed before takeover.');
+        if (parseConversationUrl(current.url || '')?.original !== parsed.original) {
+          throw new Error('Original conversation or project changed before takeover.');
         }
         // Navigate the original tab only after storing the full handoff.
         // Its browser history retains the source conversation for Back.
@@ -94,7 +104,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return replyAsync(sendResponse, (async () => {
       const key = PREFIX + senderTab.id;
       const record = (await chrome.storage.session.get(key))[key];
-      if (!record) return { found: false };
+      if (!record || record.sourceTabId !== senderTab.id) return { found: false };
       if (Date.now() - record.createdAt > MAX_AGE_MS) {
         await chrome.storage.session.remove(key);
         return { found: false };
@@ -104,13 +114,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         throw new Error('Takeover destination is not ChatGPT.');
       }
       const original = parseConversationUrl(record.original);
-      if (!original) throw new Error('Stored takeover source is invalid.');
-      if (msg.type === 'HSTRY_TAKEOVER_POLL') {
-        const landing = new URL(original.landing).pathname.replace(/\/$/, '') || '/';
-        const path = current.pathname.replace(/\/$/, '') || '/';
-        if (path !== landing && !(original.project && path === landing + '/project')) {
-          return { found: false };
+      if (!original || record.project !== original.project) {
+        throw new Error('Stored takeover source or project is invalid.');
+      }
+      // The sender tab and its live SPA path must agree. Never trust a stale
+      // document URL when several ChatGPT projects are changing at once.
+      if (msg.pagePath !== current.pathname ||
+          !isContinuationDestinationPath(original, current.pathname,
+            msg.type === 'HSTRY_TAKEOVER_DONE')) {
+        if (msg.type === 'HSTRY_TAKEOVER_DONE') {
+          throw new Error('Continuation destination changed project before completion.');
         }
+        return { found: false };
       }
       const sourceKey = SOURCE_PREFIX + original.id;
       if (msg.type === 'HSTRY_TAKEOVER_DONE') {
@@ -129,7 +144,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       const receipt = (await chrome.storage.local.get(sourceKey))[sourceKey];
       if (receipt?.status === 'completed') return { found: false, completed: true };
-      return { found: true, prompt: record.prompt, original: record.original };
+      return { found: true, prompt: record.prompt, original: record.original,
+        landingPath: new URL(original.landing).pathname };
     })());
   }
   return false;
