@@ -54,8 +54,109 @@ export function resolveLiveProjectName(capture, status) {
   return names.size === 1 ? [...names][0] : null;
 }
 
-// Use only completed extension receipts and the source of already indexed
-// captures. No guessing between ChatGPT personal/workspace identities.
+// Generic titles and unspecific predecessor labels do not establish a task.
+function vagueTaskTitle(value) {
+  return /^(?:new chat|chatgpt|task status check|read history chat|recover conversation history|continue (?:qa verification|existing project|(?:the )?conversation)|(?:continue|advance|resume)\s+(?:the\s+)?(?:\S+\s+)?work)$/i
+    .test(String(value ?? '').trim());
+}
+
+// Reuse a specific predecessor task rather than labelling every continuation
+// "Continue Existing Work". Follow only explicit same-project HSTRY handoffs.
+export function taskFromHstryContinuation(generated, parentUrl, archived, sourceId, projectId) {
+  if (!vagueTaskTitle(generated)) return generated;
+  let parent = conversationFromUrl(parentUrl);
+  if (!parent || parent.projectId !== (projectId ?? null)) return null;
+  const seen = new Set();
+  for (let i = 0; parent && i < 8; i++) {
+    if (seen.has(parent.conversationId)) return null;
+    seen.add(parent.conversationId);
+    const entry = (archived ?? []).find(item => item?.source_id === sourceId &&
+      (item.workspace ?? null) === (projectId ?? null) &&
+      item.external_id?.toLowerCase() === parent.conversationId);
+    if (!entry) return null;
+    const name = String(entry.title ?? '').trim()
+      .replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — [^—]+ — /, '');
+    const task = name.replace(/^(?:Branch · |Branch of )/i, '').replace(/\s+\d+$/, '');
+    if (task && !vagueTaskTitle(task) && !/^Continue the unfinished work/i.test(task)) {
+      return task;
+    }
+    const prompt = String(entry.first_user_message ?? '');
+    if (!/^(?:continue the unfinished work|take over from this chat|resume (?:this|the) (?:chat|conversation))/i.test(prompt.trim())) return null;
+    const link = prompt.match(/https:\/\/chatgpt\.com\/(?:g\/[^\s)]+?\/)?c\/[0-9a-f-]{36}/i);
+    parent = link ? conversationFromUrl(link[0]) : null;
+  }
+  return null;
+}
+
+// Derive a continuation number from canonical archived conversations, not from
+// a second sequence counter. Branches reuse their parent's number.
+export function nextArchivedTaskNumber(nativeTitle, archived, sourceId, projectId, currentId,
+    openedAtMs = Date.now()) {
+  const task = String(nativeTitle || '').trim().replace(/\s+\d+$/, '').toLowerCase();
+  if (!task || vagueTaskTitle(task) ||
+      /\s+\d+$/.test(String(nativeTitle || '').trim())) return null;
+  const limit = openedAtMs / 1000;
+  const related = [];
+  for (const entry of archived ?? []) {
+    const at = typeof entry?.created_at === 'number' ? entry.created_at
+      : Date.parse(entry?.created_at ?? '') / 1000;
+    if (entry?.source_id !== sourceId || (entry.workspace ?? null) !== (projectId ?? null) ||
+        entry.external_id === currentId || /^(?:Branch · |Branch of )/i.test(entry.title ?? '') ||
+        entry.message_count === 0 || entry.message_count === 1 ||
+        !Number.isFinite(at) || at > limit) continue;
+    const raw = String(entry.title ?? '').trim()
+      .replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — [^—]+ — /, '');
+    const match = raw.match(/^(.*?)(?:\s+(\d+))?$/);
+    if (match && match[1].toLowerCase() === task) {
+      related.push({ at, id: entry.external_id, explicit: match[2] ? Number(match[2]) : null });
+      continue;
+    }
+    // A generic HSTRY handoff is part of the series when its verified
+    // predecessor resolves to the same task in this same project/account.
+    const link = String(entry.first_user_message ?? '')
+      .match(/https:\/\/chatgpt\.com\/(?:g\/[^\s)]+?\/)?c\/[0-9a-f-]{36}/i)?.[0];
+    if (taskFromHstryContinuation(entry.title, link, archived, sourceId, projectId)
+        ?.toLowerCase() === task) {
+      related.push({ at, id: entry.external_id, explicit: null });
+    }
+  }
+  related.sort((a, b) => a.at - b.at || String(a.id).localeCompare(String(b.id)));
+  let number = 0;
+  for (const entry of related) number = entry.explicit ? Math.max(number, entry.explicit) : number + 1;
+  return number ? number + 1 : null;
+}
+
+// Chat opening is captured before a rename, not at rename time. Use the same
+// Europe/London timezone for every browser running this workspace workflow.
+export function proposedWorkspaceChatTitle(settings, status, route, nativeTitle,
+    openedAtMs, seriesNumber = null) {
+  // A root chat URL does not establish which account is currently active.
+  if (settings?.chatgptWorkspaceOnly !== true || settings?.autoNameNewChats !== true ||
+      settings?.providers?.chatgpt !== true || !route?.projectId ||
+      !Number.isSafeInteger(openedAtMs) || openedAtMs < Date.UTC(2015, 0, 1) ||
+      openedAtMs > Date.now() + 60_000) return null;
+  const owner = resolveLiveOwner(route, status);
+  if (!owner?.sourceId?.startsWith('chatgpt-web-')) return null;
+  const project = route.projectId ? resolveLiveProjectName(route, status) : 'Workspace';
+  if (!project) return null;
+  const title = String(nativeTitle ?? '').trim().replace(/\s+[-|]\s+ChatGPT$/i, '');
+  if (!title || vagueTaskTitle(title) ||
+      title.length > 90 || title.includes('\n') || /^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — /.test(title)) return null;
+  const name = String(project).replace(/\s+/g, ' ').trim().slice(0, 50);
+  if (!name || title.toLowerCase().startsWith(name.toLowerCase() + ' — ')) return null;
+  const values = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date(openedAtMs)).filter(part => part.type !== 'literal')
+    .map(part => [part.type, part.value]));
+  const time = `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}`;
+  const numbered = Number.isSafeInteger(seriesNumber) && seriesNumber > 0 && seriesNumber < 10_000 &&
+    !/\s+\d+$/.test(title) ? `${title} ${seriesNumber}` : title;
+  return `${time} — ${name} — ${numbered}`;
+}
+
+// Prioritize verified captured conversations without bypassing canonical account
+// ownership, per-conversation dedupe, or ordinary scan fairness.
 export function nextContinuationPriority(queue, receipts, state) {
   const pending = state?.pending;
   if (!pending?.scopes || pending.priority || pending.nativeDetail ||
@@ -74,6 +175,21 @@ export function nextContinuationPriority(queue, receipts, state) {
         existing.projectId !== candidate.projectId) ? { ambiguous: true } :
         existing?.ambiguous ? existing : candidate);
   }
+  const taskFor = (id, capture, explicitReceipt = false) => {
+    if (done.has(id) || !capture || capture.ambiguous) return null;
+    const matching = pending.scopes.filter(scope =>
+      !scope.archived && scope.sourceId === capture.sourceId &&
+      (scope.projectId ?? null) === capture.projectId);
+    if (matching.length !== 1 || typeof matching[0].accountKey !== 'string' ||
+        (!explicitReceipt && (!matching[0].accountId ||
+          typeof matching[0].accountId !== 'string')) ||
+        (state.ignoredFailures ?? []).some(entry =>
+          entry.conversationId === id && entry.accountKey === matching[0].accountKey &&
+          (entry.projectId ?? null) === capture.projectId)) return null;
+    return { conversationId: id, sourceId: capture.sourceId,
+      accountKey: matching[0].accountKey, projectId: capture.projectId,
+      kind: 'continuation' };
+  };
   const ordered = Object.entries(receipts ?? {}).filter(([key, receipt]) =>
     key.startsWith('hstryTakeoverSource:') && receipt?.status === 'completed' &&
     receipt.automatic === true && Number.isFinite(receipt.completedAt))
@@ -82,17 +198,18 @@ export function nextContinuationPriority(queue, receipts, state) {
     const id = key.slice('hstryTakeoverSource:'.length);
     const route = conversationFromUrl(receipt.originalUrl);
     const capture = owners.get(id);
-    if (!route || route.conversationId !== id || done.has(id) ||
-        !capture || capture.ambiguous || capture.projectId !== route.projectId) continue;
-    const matching = pending.scopes.filter(scope =>
-      !scope.archived && scope.sourceId === capture.sourceId &&
-      (scope.projectId ?? null) === capture.projectId);
-    if (matching.length !== 1 || (state.ignoredFailures ?? []).some(entry =>
-      entry.conversationId === id && entry.accountKey === matching[0].accountKey &&
-      (entry.projectId ?? null) === route.projectId)) continue;
-    return { conversationId: id, sourceId: capture.sourceId,
-      accountKey: matching[0].accountKey, projectId: capture.projectId,
-      kind: 'continuation' };
+    if (!route || route.conversationId !== id ||
+        capture?.projectId !== route.projectId) continue;
+    const task = taskFor(id, capture, true);
+    if (task) return task;
+  }
+  // An indexed live capture is also a bounded recovery request. Unlike a
+  // handoff receipt it has no original URL, so only its verified source/project
+  // scope may authorize the existing canonical native-detail path.
+  for (const [id, capture] of owners) {
+    if (Object.hasOwn(receipts ?? {}, 'hstryTakeoverSource:' + id)) continue;
+    const task = taskFor(id, capture);
+    if (task) return task;
   }
   return null;
 }
