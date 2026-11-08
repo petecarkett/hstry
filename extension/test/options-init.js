@@ -54,6 +54,7 @@ for (const id of [
   'token',
   'interval',
   'workspace-only',
+  'auto-names',
   'provider-list',
   'status-list',
   'resync-list',

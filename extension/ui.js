@@ -25,6 +25,7 @@ export function normalizeSettings(values, defaults) {
     port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : defaults.port,
     token: String(values.token ?? '').trim(),
     chatgptWorkspaceOnly: values.chatgptWorkspaceOnly === true,
+    autoNameNewChats: values.autoNameNewChats === true,
     intervalMinutes:
       Number.isInteger(intervalMinutes) && intervalMinutes >= 1 && intervalMinutes <= 720
         ? intervalMinutes

@@ -80,6 +80,7 @@ check('visible settings normalize before sync', normalizeSettings({
   port: 3434,
   token: 'hello',
   chatgptWorkspaceOnly: false,
+  autoNameNewChats: false,
   intervalMinutes: 15,
   providers: { chatgpt: true },
 });
@@ -92,9 +93,15 @@ check('invalid port cannot escape form constraints', normalizeSettings({
   port: 41770,
   token: '',
   chatgptWorkspaceOnly: false,
+  autoNameNewChats: false,
   intervalMinutes: 15,
   providers: { chatgpt: false },
 });
+
+check('automatic names must be enabled explicitly', normalizeSettings({
+  port: '41770', token: '', intervalMinutes: '15',
+  autoNameNewChats: true, providers: { chatgpt: true },
+}, { port: 41770, intervalMinutes: 15 }).autoNameNewChats, true);
 
 check('workspace-only setting is explicit', normalizeSettings({
   port: '41770', token: '', intervalMinutes: '15',

@@ -4631,6 +4631,85 @@ mod tests {
     }
 
     #[test]
+    fn dedup_respects_native_conversation_and_project_identity() {
+        let mut conv = Conversation {
+            id: uuid::Uuid::new_v4(),
+            source_id: "chatgpt-web-workspace".into(),
+            external_id: Some("chat-a".into()),
+            readable_id: None,
+            platform_id: None,
+            title: Some("Same text".into()),
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            model: None,
+            provider: None,
+            workspace: Some("project-a".into()),
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            metadata: serde_json::json!({}),
+            harness: None,
+            version: 0,
+            message_count: 1,
+            parent_conversation_id: None,
+            parent_message_idx: None,
+            fork_type: None,
+        };
+        let original = dedup_identity(&conv);
+        assert!(original.is_some());
+        conv.id = uuid::Uuid::new_v4();
+        assert_eq!(
+            original,
+            dedup_identity(&conv),
+            "two imports of the same native chat can match"
+        );
+        conv.external_id = Some("chat-b".into());
+        assert_ne!(original, dedup_identity(&conv));
+        conv.external_id = Some("chat-a".into());
+        conv.workspace = Some("project-b".into());
+        assert_ne!(original, dedup_identity(&conv));
+        conv.workspace = Some("project-a".into());
+        conv.fork_type = Some("fork".into());
+        assert_ne!(original, dedup_identity(&conv));
+        conv.fork_type = None;
+        conv.external_id = None;
+        assert_eq!(dedup_identity(&conv), None);
+    }
+
+    #[test]
+    fn dedup_never_ignores_message_parts_or_attribution() {
+        let original = Message {
+            id: uuid::Uuid::new_v4(),
+            conversation_id: uuid::Uuid::new_v4(),
+            idx: 0,
+            role: MessageRole::User,
+            content: "same visible text".into(),
+            parts_json: serde_json::json!([{"type":"text","text":"same visible text"}]),
+            created_at: None,
+            model: None,
+            tokens: None,
+            cost_usd: None,
+            metadata: serde_json::json!({}),
+            sender: None,
+            provider: None,
+            harness: None,
+            client_id: None,
+        };
+        let copy = original.clone();
+        assert!(same_dedup_messages(&[original.clone()], &[copy]));
+        let mut different = original.clone();
+        different.parts_json = serde_json::json!([{"type":"image","url":"image-a"}]);
+        assert!(!same_dedup_messages(&[original.clone()], &[different]));
+        let mut different = original.clone();
+        different.metadata = serde_json::json!({"unique":"attachment"});
+        assert!(!same_dedup_messages(&[original.clone()], &[different]));
+        let mut different = original.clone();
+        different.content = "different text".into();
+        assert!(!same_dedup_messages(&[original.clone()], &[different]));
+        assert!(!same_dedup_messages(&[original], &[]));
+    }
+
+    #[test]
     fn read_input_reads_json_file() {
         let mut file =
             tempfile::NamedTempFile::new().unwrap_or_else(|err| panic!("temp file: {err}"));
@@ -6196,6 +6275,55 @@ struct DedupResult {
     dry_run: bool,
 }
 
+// Distinct platform conversation IDs are not duplicates, even when their text
+// is identical. Branch and project identity also protect separate work.
+type DedupIdentity = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn dedup_identity(conv: &Conversation) -> Option<DedupIdentity> {
+    let native_id = conv
+        .external_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())?;
+    Some((
+        conv.source_id.clone(),
+        native_id.to_owned(),
+        conv.workspace.clone(),
+        conv.parent_conversation_id.clone(),
+        conv.parent_message_idx,
+        conv.fork_type.clone(),
+        conv.title.clone(),
+        conv.metadata.to_string(),
+    ))
+}
+
+fn same_dedup_messages(left: &[Message], right: &[Message]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(a, b)| {
+            a.idx == b.idx
+                && a.role == b.role
+                && a.content == b.content
+                && a.parts_json == b.parts_json
+                && a.metadata == b.metadata
+                && a.created_at == b.created_at
+                && a.model == b.model
+                && a.tokens == b.tokens
+                && a.cost_usd == b.cost_usd
+                && a.sender == b.sender
+                && a.provider == b.provider
+                && a.harness == b.harness
+                && a.client_id == b.client_id
+        })
+}
+
 async fn cmd_dedup(
     db: &Database,
     dry_run: bool,
@@ -6203,8 +6331,6 @@ async fn cmd_dedup(
     json: bool,
 ) -> Result<()> {
     use std::collections::HashMap;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
 
     let opts = hstry_core::db::ListConversationsOptions {
         source_id: source_filter,
@@ -6223,46 +6349,43 @@ async fn cmd_dedup(
         );
     }
 
-    // Group conversations by a hash of their full content
-    let mut groups: HashMap<u64, Vec<Conversation>> = HashMap::new();
-
+    // Group by canonical native identity before comparing full payloads.
+    // Never delete an unidentifiable conversation or collapse distinct forks.
+    let mut groups: HashMap<DedupIdentity, Vec<Conversation>> = HashMap::new();
     for conv in conversations {
-        let messages = db.get_messages(conv.id).await?;
-
-        // Hash all message content for accurate dedup
-        let mut hasher = DefaultHasher::new();
-        conv.source_id.hash(&mut hasher);
-        for msg in &messages {
-            msg.role.to_string().hash(&mut hasher);
-            msg.content.hash(&mut hasher);
+        if let Some(identity) = dedup_identity(&conv) {
+            groups.entry(identity).or_default().push(conv);
         }
-        let hash = hasher.finish();
-
-        groups.entry(hash).or_default().push(conv);
     }
 
-    // Find groups with duplicates
     let mut duplicates_found = 0usize;
     let mut to_remove: Vec<uuid::Uuid> = Vec::new();
-
-    for (_key, mut convs) in groups {
-        if convs.len() > 1 {
-            duplicates_found += convs.len() - 1;
-            // Sort by updated_at descending, keep the most recent
-            convs.sort_by(|a, b| {
-                let a_time = a.updated_at.unwrap_or(a.created_at);
-                let b_time = b.updated_at.unwrap_or(b.created_at);
-                b_time.cmp(&a_time)
-            });
-            // Keep first (most recent), mark rest for removal
-            for conv in convs.into_iter().skip(1) {
+    for (_identity, mut convs) in groups {
+        if convs.len() < 2 {
+            continue;
+        }
+        convs.sort_by(|a, b| {
+            let a_time = a.updated_at.unwrap_or(a.created_at);
+            let b_time = b.updated_at.unwrap_or(b.created_at);
+            b_time.cmp(&a_time)
+        });
+        let mut retained: Vec<Vec<Message>> = Vec::new();
+        for conv in convs {
+            let messages = db.get_messages(conv.id).await?;
+            if retained
+                .iter()
+                .any(|prior| same_dedup_messages(prior, &messages))
+            {
+                duplicates_found += 1;
                 to_remove.push(conv.id);
+            } else {
+                retained.push(messages);
             }
         }
     }
 
     if !json && !to_remove.is_empty() {
-        println!("Found {} duplicate conversations", duplicates_found);
+        println!("Found {duplicates_found} duplicate conversations");
     }
 
     // Count messages that will be removed (use lightweight count query)

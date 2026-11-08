@@ -22,6 +22,60 @@ const receipts = { ['hstryTakeoverSource:' + id]: { status: 'completed', automat
 const task = nextContinuationPriority(queue, receipts, { pending: pending() });
 assert.deepEqual(task, { conversationId: id, sourceId: personal.sourceId,
   accountKey: personal.accountKey, projectId: null, kind: 'continuation' });
+const ordinary = nextContinuationPriority(queue, {}, { pending: pending() });
+assert.deepEqual(ordinary, task,
+  'indexed ordinary live captures must receive one canonical paced recovery');
+assert.equal(nextContinuationPriority({ [id + ':' + messageId]: {
+  ...queue[id + ':' + messageId], indexedSource: undefined,
+} }, {}, { pending: pending() }), null,
+'captures without verified indexed source must not be targeted');
+assert.deepEqual(nextContinuationPriority({ [id + ':' + messageId]: {
+  ...queue[id + ':' + messageId], projectId: project,
+} }, {}, { pending: pending() }), {
+  conversationId: id, sourceId: personal.sourceId, accountKey: personal.accountKey,
+  projectId: project, kind: 'continuation',
+}, 'a project capture requires an exact matching project-scoped owner');
+assert.equal(nextContinuationPriority({ [id + ':' + messageId]: {
+  ...queue[id + ':' + messageId], indexedSource: 'chatgpt-web-other-account',
+} }, {}, { pending: pending() }), null,
+'unknown account/source must fail closed');
+assert.equal(nextContinuationPriority(queue, {}, { pending: { ...pending(), scopes: [
+  { ...personal, accountId: 'account-2', accountKey: 'acc2' }, personal,
+] } }), null, 'same source/project shared across two accounts is ambiguous');
+assert.equal(nextContinuationPriority(queue, {}, { pending: {
+  ...pending(), scopes: [{ ...personal, archived: true }],
+} }), null, 'archived-only scope must not route an ordinary live capture');
+assert.equal(nextContinuationPriority(queue, {}, { pending: {
+  ...pending(), retryYieldToScan: true,
+} }), null, 'rate-limit scan turn must take precedence over queued live recovery');
+assert.equal(nextContinuationPriority(queue, {}, { pending: {
+  ...pending(), lastPriorityProcessed: 0,
+} }), null, 'ordinary scan must advance between priority recoveries');
+assert.equal(nextContinuationPriority({ ...queue, conflictingProject: {
+  conversationId: id, projectId: project, indexedSource: personal.sourceId,
+} }, {}, { pending: pending() }), null,
+'conflicting project ownership for one native chat must fail closed');
+assert.equal(nextContinuationPriority(queue, {}, { pending: pending(),
+  ignoredFailures: [{ conversationId: id, accountKey: personal.accountKey,
+    projectId: null }] }), null,
+'ignored histories remain excluded even from ordinary live recovery');
+const manyCaptures = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [
+  `capture-${i}`, { ...queue[id + ':' + messageId], messageId: String(i) },
+]));
+assert.deepEqual(nextContinuationPriority(manyCaptures, {}, { pending: pending() }), task,
+'30 message captures from the same conversation create only one priority request');
+const legacyDefaultScope = { ...personal, accountId: null, accountKey: 'default',
+  sourceId: 'chatgpt-web' };
+const defaultQueue = { [id + ':' + messageId]: {
+  ...queue[id + ':' + messageId], indexedSource: 'chatgpt-web',
+} };
+assert.deepEqual(nextContinuationPriority(defaultQueue, receipts, {
+  pending: { ...pending(), scopes: [legacyDefaultScope] },
+}), { ...task, sourceId: 'chatgpt-web', accountKey: 'default' },
+'completed handoff in a legacy default account must still work');
+assert.equal(nextContinuationPriority(defaultQueue, {}, {
+  pending: { ...pending(), scopes: [legacyDefaultScope] },
+}), null, 'ordinary fallback requires verified account identity');
 assert.equal(nextContinuationPriority(queue, receipts,
   { pending: { ...pending(), priorityDoneIds: [id] } }), null);
 assert.equal(nextContinuationPriority(queue, receipts,
@@ -101,6 +155,20 @@ try {
   assert.deepEqual(result.state.pending.priorityDoneIds, [id]);
   assert.equal(result.state.pending.pageIndex, 0);
   assert.equal(result.state.pending.processed, 0);
+
+  // An ordinary captured chat uses the existing native route, not a new
+  // importer or a separate mutable recovery queue.
+  requests = []; ingests = []; confirmations = []; saved = [];
+  state = { pending: { ...pending(), priority: ordinary } };
+  const ordinaryRecovered = await run(state);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + id],
+    'one paced remote request for an ordinary captured conversation');
+  assert.equal(ingests.length, 1);
+  assert.equal(confirmations.length, 1);
+  assert.equal(ordinaryRecovered.state.pending.priority, undefined);
+  assert.deepEqual(ordinaryRecovered.state.pending.priorityDoneIds, [id]);
+  assert.equal(ordinaryRecovered.state.pending.pageIndex, 0);
+  assert.equal(ordinaryRecovered.state.pending.processed, 0);
 
   // Six duplicated terminal entries in personal/project scopes are one source
   // conversation. The existing native endpoint gets one bounded chance.
