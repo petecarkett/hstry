@@ -54,8 +54,8 @@ export function resolveLiveProjectName(capture, status) {
   return names.size === 1 ? [...names][0] : null;
 }
 
-// Use only completed extension receipts and the source of already indexed
-// captures. No guessing between ChatGPT personal/workspace identities.
+// Prioritize verified captured conversations without bypassing canonical account
+// ownership, per-conversation dedupe, or ordinary scan fairness.
 export function nextContinuationPriority(queue, receipts, state) {
   const pending = state?.pending;
   if (!pending?.scopes || pending.priority || pending.nativeDetail ||
@@ -74,6 +74,21 @@ export function nextContinuationPriority(queue, receipts, state) {
         existing.projectId !== candidate.projectId) ? { ambiguous: true } :
         existing?.ambiguous ? existing : candidate);
   }
+  const taskFor = (id, capture, explicitReceipt = false) => {
+    if (done.has(id) || !capture || capture.ambiguous) return null;
+    const matching = pending.scopes.filter(scope =>
+      !scope.archived && scope.sourceId === capture.sourceId &&
+      (scope.projectId ?? null) === capture.projectId);
+    if (matching.length !== 1 || typeof matching[0].accountKey !== 'string' ||
+        (!explicitReceipt && (!matching[0].accountId ||
+          typeof matching[0].accountId !== 'string')) ||
+        (state.ignoredFailures ?? []).some(entry =>
+          entry.conversationId === id && entry.accountKey === matching[0].accountKey &&
+          (entry.projectId ?? null) === capture.projectId)) return null;
+    return { conversationId: id, sourceId: capture.sourceId,
+      accountKey: matching[0].accountKey, projectId: capture.projectId,
+      kind: 'continuation' };
+  };
   const ordered = Object.entries(receipts ?? {}).filter(([key, receipt]) =>
     key.startsWith('hstryTakeoverSource:') && receipt?.status === 'completed' &&
     receipt.automatic === true && Number.isFinite(receipt.completedAt))
@@ -82,17 +97,18 @@ export function nextContinuationPriority(queue, receipts, state) {
     const id = key.slice('hstryTakeoverSource:'.length);
     const route = conversationFromUrl(receipt.originalUrl);
     const capture = owners.get(id);
-    if (!route || route.conversationId !== id || done.has(id) ||
-        !capture || capture.ambiguous || capture.projectId !== route.projectId) continue;
-    const matching = pending.scopes.filter(scope =>
-      !scope.archived && scope.sourceId === capture.sourceId &&
-      (scope.projectId ?? null) === capture.projectId);
-    if (matching.length !== 1 || (state.ignoredFailures ?? []).some(entry =>
-      entry.conversationId === id && entry.accountKey === matching[0].accountKey &&
-      (entry.projectId ?? null) === route.projectId)) continue;
-    return { conversationId: id, sourceId: capture.sourceId,
-      accountKey: matching[0].accountKey, projectId: capture.projectId,
-      kind: 'continuation' };
+    if (!route || route.conversationId !== id ||
+        capture?.projectId !== route.projectId) continue;
+    const task = taskFor(id, capture, true);
+    if (task) return task;
+  }
+  // An indexed live capture is also a bounded recovery request. Unlike a
+  // handoff receipt it has no original URL, so only its verified source/project
+  // scope may authorize the existing canonical native-detail path.
+  for (const [id, capture] of owners) {
+    if (Object.hasOwn(receipts ?? {}, 'hstryTakeoverSource:' + id)) continue;
+    const task = taskFor(id, capture);
+    if (task) return task;
   }
   return null;
 }
