@@ -54,12 +54,16 @@ export function resolveLiveProjectName(capture, status) {
   return names.size === 1 ? [...names][0] : null;
 }
 
+// Generic titles and unspecific predecessor labels do not establish a task.
+function vagueTaskTitle(value) {
+  return /^(?:new chat|chatgpt|task status check|read history chat|recover conversation history|continue (?:qa verification|existing project|(?:the )?conversation)|(?:continue|advance|resume)\s+(?:the\s+)?(?:\S+\s+)?work)$/i
+    .test(String(value ?? '').trim());
+}
+
 // Reuse a specific predecessor task rather than labelling every continuation
 // "Continue Existing Work". Follow only explicit same-project HSTRY handoffs.
 export function taskFromHstryContinuation(generated, parentUrl, archived, sourceId, projectId) {
-  const generic = value => /^(?:new chat|continue (?:existing |project |archived )?work|continue (?:the )?conversation|task status check)$/i
-    .test(String(value ?? '').trim());
-  if (!generic(generated)) return generated;
+  if (!vagueTaskTitle(generated)) return generated;
   let parent = conversationFromUrl(parentUrl);
   if (!parent || parent.projectId !== (projectId ?? null)) return null;
   const seen = new Set();
@@ -72,8 +76,9 @@ export function taskFromHstryContinuation(generated, parentUrl, archived, source
     if (!entry) return null;
     const name = String(entry.title ?? '').trim()
       .replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — [^—]+ — /, '');
-    if (name && !generic(name) && !/^Continue the unfinished work/i.test(name)) {
-      return name.replace(/^(?:Branch · |Branch of )/i, '').replace(/\s+\d+$/, '');
+    const task = name.replace(/^(?:Branch · |Branch of )/i, '').replace(/\s+\d+$/, '');
+    if (task && !vagueTaskTitle(task) && !/^Continue the unfinished work/i.test(task)) {
+      return task;
     }
     const prompt = String(entry.first_user_message ?? '');
     if (!/^(?:continue the unfinished work|take over from this chat|resume (?:this|the) (?:chat|conversation))/i.test(prompt.trim())) return null;
@@ -88,7 +93,7 @@ export function taskFromHstryContinuation(generated, parentUrl, archived, source
 export function nextArchivedTaskNumber(nativeTitle, archived, sourceId, projectId, currentId,
     openedAtMs = Date.now()) {
   const task = String(nativeTitle || '').trim().replace(/\s+\d+$/, '').toLowerCase();
-  if (!task || /^(?:new chat|continue (?:existing |project |archived )?work|continue conversation|task status check)$/.test(task) ||
+  if (!task || vagueTaskTitle(task) ||
       /\s+\d+$/.test(String(nativeTitle || '').trim())) return null;
   const limit = openedAtMs / 1000;
   const related = [];
@@ -135,7 +140,7 @@ export function proposedWorkspaceChatTitle(settings, status, route, nativeTitle,
   const project = route.projectId ? resolveLiveProjectName(route, status) : 'Workspace';
   if (!project) return null;
   const title = String(nativeTitle ?? '').trim().replace(/\s+[-|]\s+ChatGPT$/i, '');
-  if (!title || /^(?:new chat|chatgpt|continue (?:existing |project )?work|continue conversation|task status check)$/i.test(title) ||
+  if (!title || vagueTaskTitle(title) ||
       title.length > 90 || title.includes('\n') || /^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — /.test(title)) return null;
   const name = String(project).replace(/\s+/g, ' ').trim().slice(0, 50);
   if (!name || title.toLowerCase().startsWith(name.toLowerCase() + ' — ')) return null;

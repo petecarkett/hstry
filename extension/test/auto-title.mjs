@@ -45,9 +45,14 @@ assert.equal(title(settings, { chatgpt: { state: { pending: { scopes: [
 assert.equal(title(settings, { chatgpt: { state: { pending: { scopes: [
   { ...scope, projectName: '' } ] } } } }), null,
   'unidentified project cannot be named');
-for (const generic of ['New chat','ChatGPT','Continue Existing Work','Task Status Check']) {
+for (const generic of ['New chat','ChatGPT','Continue Existing Work','Task Status Check',
+  'Advance 1hood Work', 'Continue 1hood Work', 'Read History Chat',
+  'Recover Conversation History', 'Continue QA verification', 'Continue Existing Project']) {
   assert.equal(title(settings,status,route,generic),null,`${generic} needs task context`);
 }
+assert.equal(title(settings,status,route,'Check Telegram Upload Issue',at),
+  '2026-11-07 17:28 — FerroQuant — Check Telegram Upload Issue',
+  'task-specific titles must remain eligible');
 assert.equal(title(settings, status, route, 'MT5 integration', null), null,
   'missing opening timestamp must not use current rename time');
 assert.equal(title(settings, status, route, 'MT5 integration', Date.now() + 3_600_000), null,
@@ -116,6 +121,12 @@ const priorSessions = [
 assert.equal(taskFromHstryContinuation('Continue Existing Work',prevUrl,
   priorSessions,sourceId,projectId), 'TikTok Automation',
   'generic continuation finds specific task through verified predecessor lineage');
+for (const vague of ['Advance 1hood Work', 'Continue 1hood Work',
+  'Read History Chat', 'Continue QA verification']) {
+  assert.equal(taskFromHstryContinuation('Continue Existing Work',prevUrl,
+    [priorSessions[0], { ...item(vague, olderId) }], sourceId,projectId), null,
+    `${vague} must not propagate from a generic predecessor`);
+}
 assert.equal(taskFromHstryContinuation('Continue Existing Work',prevUrl,
   priorSessions,sourceId,'other-project'), null,
   'cross-project continuation is not trusted');
