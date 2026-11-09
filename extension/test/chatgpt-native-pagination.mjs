@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { syncChatGPT } from '../providers/chatgpt.js';
+import { nextNativeRecoveryPriority, syncChatGPT } from '../providers/chatgpt.js';
 
 const cid = '11111111-2222-4333-8444-555555555555';
 const ids = Array.from({ length: 6 }, (_, i) =>
@@ -160,6 +160,47 @@ try {
   assert.equal(ingests.length, priorIngests + 1);
   assert.equal(requests.length, priorRequests,
     'retrying local ingestion cannot produce another remote request');
+
+  // Repeated legacy detail timeouts must reuse the same paginated, durable
+  // priority path instead of another single huge conversation fetch.
+  const timedOut = structuredClone(initialState);
+  timedOut.failureDetails = [{ conversationId: cid, accountKey: scope.accountKey,
+    accountId: scope.accountId, sourceId: scope.sourceId, projectId: null,
+    errorType: 'TimeoutError', errorDiagnostic: 'signal timed out',
+    attempts: 5, lastFailedAtMs: Date.now() - 60_000,
+    nextRetryAtMs: Date.now() - 1000, resolvedAtMs: null }];
+  assert.equal(nextNativeRecoveryPriority(timedOut)?.kind, 'native-fallback',
+    'repeated due TimeoutError should select the existing native pagination');
+  const cooling = structuredClone(timedOut);
+  cooling.failureDetails[0].nextRetryAtMs = Date.now() + 60_000;
+  assert.equal(nextNativeRecoveryPriority(cooling), null,
+    'a timed-out history must not bypass the saved retry cooldown');
+  const wrongOwner = structuredClone(timedOut);
+  wrongOwner.failureDetails[0].accountKey = 'different-account';
+  assert.equal(nextNativeRecoveryPriority(wrongOwner), null,
+    'the paginated fallback must stay bound to the indexed account');
+  requests.length = 0;
+  ingests.length = 0;
+  confirmations.length = 0;
+  rateLimitOnce = false;
+  let retryState = timedOut;
+  for (let i = 0; i < 3; i++) {
+    const next = await run(retryState);
+    assert.equal(requests.length, i + 1,
+      'one paginated detail request per scheduled retry worker');
+    assert(requests[i].startsWith('/backend-api/conversations/' + cid + '?'),
+      'timeout fallback must not repeat the monolithic legacy endpoint');
+    assert.equal(next.state.pending.pageIndex, 0,
+      'a targeted timeout recovery must not advance the main list cursor');
+    if (i < 2) assert.equal(ingests.length, 0,
+      'partial pages cannot be promoted to canonical history');
+    retryState = next.state;
+  }
+  assert.equal(ingests.length, 1);
+  assert.equal(ingests[0][0].metadata.selectedBranchOnly, true);
+  assert.equal(confirmations.length, 1);
+  assert(Number.isFinite(retryState.failureDetails[0].resolvedAtMs));
+  assert.equal(retryState.pending.priority, undefined);
 
   console.log('PASS modern page cursors, 429 checkpoint, strict validation, exact-owner priority, local retry, full-ordering and canonical ingest');
 } finally { globalThis.fetch = oldFetch; globalThis.chrome = oldChrome; }
