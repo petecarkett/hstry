@@ -751,6 +751,7 @@ export function nextNativeRecoveryPriority(state) {
     (isNonRetryableAccess(item) || (
       (item.errorDiagnostic === 'Conversation has no readable messages' ||
        item.errorDiagnostic === 'ChatGPT detail has no readable messages' ||
+       (item.errorType === 'TimeoutError' && (item.attempts ?? 0) >= 2) ||
        (item.errorType === 'UnknownError' && (item.attempts ?? 0) >= 3)) &&
       (item.nextRetryAtMs ?? ((item.lastFailedAtMs ?? 0) + RETRY_BASE_MS)) <= Date.now())) &&
     pending.scopes.some(scope => !scope.archived &&
