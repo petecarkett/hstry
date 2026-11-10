@@ -202,5 +202,34 @@ try {
   assert(Number.isFinite(retryState.failureDetails[0].resolvedAtMs));
   assert.equal(retryState.pending.priority, undefined);
 
+  // A due repeat legacy failure may be blocked by the three-item fairness
+  // window. Do not fall through to the huge legacy GET while it is deferred.
+  const deferred = structuredClone(initialState);
+  deferred.pending.processed = 110;
+  deferred.pending.lastPriorityProcessed = 108;
+  deferred.failureDetails = [{ conversationId: cid, accountKey: scope.accountKey,
+    accountId: scope.accountId, sourceId: scope.sourceId, projectId: null,
+    errorType: 'TimeoutError', errorDiagnostic: 'signal timed out',
+    attempts: 5, lastFailedAtMs: Date.now() - 6 * 3600_000,
+    nextRetryAtMs: Date.now() - 1000, resolvedAtMs: null }];
+  requests.length = 0;
+  ingests.length = 0;
+  assert.equal(nextNativeRecoveryPriority(deferred), null,
+    'native fallback cannot bypass the ordinary-scan fairness gate');
+  const deferredResult = await run(deferred);
+  assert(!requests.some(x => x.startsWith('/backend-api/conversation/' + cid)),
+    'while fairness defers native retry, do not send an old monolithic detail GET');
+  assert.equal(deferredResult.state.failureDetails[0].attempts, 5,
+    'a deferred native retry must not consume an additional failure attempt');
+  const after500 = structuredClone(timedOut);
+  after500.failureDetails[0].errorType = 'HTTP 500';
+  after500.failureDetails[0].errorDiagnostic = 'ChatGPT conversation detail -> 500';
+  after500.failureDetails[0].attempts = 6;
+  assert.equal(nextNativeRecoveryPriority(after500)?.kind, 'native-fallback',
+    'a repeated 500 from legacy detail must retain the paginated recovery route');
+  after500.failureDetails[0].nextRetryAtMs = Date.now() + 6 * 3600_000;
+  assert.equal(nextNativeRecoveryPriority(after500), null,
+    'do not ignore the already-saved six-hour cooldown after a legacy HTTP 500');
+
   console.log('PASS modern page cursors, 429 checkpoint, strict validation, exact-owner priority, local retry, full-ordering and canonical ingest');
 } finally { globalThis.fetch = oldFetch; globalThis.chrome = oldChrome; }

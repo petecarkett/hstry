@@ -735,6 +735,14 @@ const isIgnoredConversation = (state, id, scope) =>
     record.conversationId === id && record.accountKey === scope.accountKey &&
     (record.projectId ?? null) === (scope.projectId ?? null));
 
+// Retried legacy detail failures use paginated recovery exclusively. Otherwise
+// the scan-fairness gate can defer native recovery yet fall through to another
+// oversized legacy request, overwriting the failure reason and retry deadline.
+const prefersNativeDetail = failure =>
+  CHAT_ID.test(failure?.conversationId ?? '') &&
+  ['TimeoutError', 'HTTP 500'].includes(failure?.errorType) &&
+  (failure?.attempts ?? 0) >= 2;
+
 // Recover known missing histories before older automatic handoff receipts.
 // The same checkpoint, source-owner checks and scan fairness govern both.
 export function nextNativeRecoveryPriority(state) {
@@ -751,7 +759,7 @@ export function nextNativeRecoveryPriority(state) {
     (isNonRetryableAccess(item) || (
       (item.errorDiagnostic === 'Conversation has no readable messages' ||
        item.errorDiagnostic === 'ChatGPT detail has no readable messages' ||
-       (item.errorType === 'TimeoutError' && (item.attempts ?? 0) >= 2) ||
+       prefersNativeDetail(item) ||
        (item.errorType === 'UnknownError' && (item.attempts ?? 0) >= 3)) &&
       (item.nextRetryAtMs ?? ((item.lastFailedAtMs ?? 0) + RETRY_BASE_MS)) <= Date.now())) &&
     pending.scopes.some(scope => !scope.archived &&
@@ -1183,6 +1191,7 @@ export async function syncChatGPT({
   const now = Date.now();
   const failure = !scanTurn && failureDetails.find(detail =>
     !detail.resolvedAtMs && detail.sourceId && !isNonRetryableAccess(detail) &&
+    !prefersNativeDetail(detail) &&
     !isIgnoredConversation(newState, detail.conversationId, detail) &&
     (detail.nextRetryAtMs ??
       ((detail.lastFailedAtMs ?? 0) + RETRY_BASE_MS)) <= now);
