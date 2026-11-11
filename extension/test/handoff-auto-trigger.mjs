@@ -6,7 +6,7 @@ const script = readFileSync(new URL('../handoff-content.js', import.meta.url), '
 const warning = "You've reached the maximum length for this conversation. You can keep talking by starting a new chat.";
 const path = '/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/6add53d9-4c88-83ed-a57d-6a602a257293';
 
-function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning, hasNative = true, precedingText = '', unrelatedEditorText = '', hasAttachment = false) {
+function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning, hasNative = true, precedingText = '', unrelatedEditorText = '', hasAttachment = false, retryRecord = null) {
   let visible = active;
   let focused = active;
   let reachedLimit = initialWarning;
@@ -75,7 +75,9 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
         },
       },
     },
-    sessionStorage: { getItem: () => null, removeItem() {} },
+    sessionStorage: { getItem: key => key === 'hstry.takeover.retryAfterReload' ?
+      (retryRecord && JSON.stringify(retryRecord)) : null,
+      removeItem(key) { if (key === 'hstry.takeover.retryAfterReload') retryRecord = null; } },
     setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
     clearTimeout(id) { timers.delete(id); },
     setInterval() { return 1; }, clearInterval() {},
@@ -354,5 +356,32 @@ assert.ok(obsolete.button, 'stale same-version context must be replaced');
 const live = mount(true, { version: '0.4.38', isLive: () => true });
 live.flush();
 assert.equal(live.button, null, 'healthy same-version handler remains installed');
+
+// An extension context update can reload the original chat after its terminal
+// panel disappears. The remembered, exact-path retry must finish the handoff.
+const retryAfterReload = mount(false, null, false, '', 'Normal conversation', false,
+  '', '', false, { path, at: Date.now(), automatic: true,
+    serverLimit: true, failedMessage: 'now?' });
+retryAfterReload.flush();
+await tick();
+assert.equal(retryAfterReload.sent.length, 1,
+  'valid reload receipt continues even without the vanished error panel');
+assert.equal(retryAfterReload.sent[0].automatic, true,
+  'retry preserves the original automatic action');
+assert.equal(retryAfterReload.sent[0].failedMessage, 'now?',
+  'retry must retain the rejected user message');
+
+const expiredRetry = mount(false, null, false, '', 'Normal conversation', false,
+  '', '', false, { path, at: Date.now() - 90_000, automatic: true });
+expiredRetry.flush();
+await tick();
+assert.equal(expiredRetry.sent.length, 0, 'expired reload receipt cannot launch a handoff');
+
+const wrongPathRetry = mount(false, null, false, '', 'Normal conversation', false,
+  '', '', false, { path: '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    at: Date.now(), automatic: true });
+wrongPathRetry.flush();
+await tick();
+assert.equal(wrongPathRetry.sent.length, 0, 'different-chat receipt cannot launch a handoff');
 
 console.log('PASS automatic continuation handles already-full focused chats, SPA and DOM redraws without duplicates');

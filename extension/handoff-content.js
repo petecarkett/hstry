@@ -20,6 +20,7 @@
   const RETRY_TTL_MS = 60_000;
   let retryOnce = false;
   let resumePending = false;
+  let reloadRecord = null;
   try {
     const saved = sessionStorage.getItem(RETRY_KEY);
     sessionStorage.removeItem(RETRY_KEY);
@@ -28,6 +29,7 @@
       if (retry?.path === location.pathname &&
           Number.isFinite(retry.at) && Date.now() - retry.at < RETRY_TTL_MS &&
           Date.now() >= retry.at) {
+        reloadRecord = retry;
         resumePending = true;
         retryOnce = true;
       }
@@ -35,10 +37,11 @@
   } catch { /* Session storage is optional; normal clicks still work. */ }
 
   const WARNING = /you(?:'|\u2019)ve\s+reached\s+the\s+maximum\s+length\s+for\s+this\s+conversation/i;
-  let serverLimitPath = null;
-  let rejectedMessage = '';
-  let rejectedHasAttachments = false;
-  let rejectedTooLong = false;
+  let serverLimitPath = reloadRecord?.serverLimit ? location.pathname : null;
+  let rejectedMessage = typeof reloadRecord?.failedMessage === 'string' &&
+    reloadRecord.failedMessage.length <= 8000 ? reloadRecord.failedMessage : '';
+  let rejectedHasAttachments = reloadRecord?.missingAttachments === true;
+  let rejectedTooLong = reloadRecord?.oversized === true;
   let resumeWhenComposerReady = false;
   let submittedPath = null;
   let autoAttemptedPath = null;
@@ -223,8 +226,12 @@
         // One reload restores a current extension context. A tab-local marker
         // resumes this user-initiated action exactly once after navigation.
         try {
-          sessionStorage.setItem(RETRY_KEY,
-            JSON.stringify({ path: location.pathname, at: Date.now() }));
+          sessionStorage.setItem(RETRY_KEY, JSON.stringify({
+            path: location.pathname, at: Date.now(), automatic,
+            serverLimit: serverLimitPath === location.pathname,
+            failedMessage: serverLimitPath === location.pathname ? rejectedMessage : '',
+            missingAttachments: rejectedHasAttachments, oversized: rejectedTooLong,
+          }));
           location.reload();
           return;
         } catch { /* Do not reload if the marker could not be stored. */ }
@@ -289,13 +296,7 @@
       btn.style.cssText += 'position:fixed;right:20px;bottom:85px;z-index:999999;';
       document.body.append(btn);
     }
-    if (resumePending) {
-      resumePending = false;
-      submittedPath = null;
-      void startTakeover(btn);
-    } else if (explicitLimit || newTerminalError) {
-      autoContinue(btn);
-    }
+    if (explicitLimit || newTerminalError) autoContinue(btn);
   }
 
   function editableElement() {
@@ -466,5 +467,13 @@
     observer = new MutationObserver(scheduleWarningCheck);
     observer.observe(document.body, { childList: true, subtree: true });
     scheduleWarningCheck();
+  }
+  if (resumePending) {
+    // The terminal panel may vanish on reload; the exact-path, one-shot
+    // receipt, not a surviving error DOM, authorizes resuming this action.
+    resumePending = false;
+    submittedPath = null;
+    autoAttemptedPath = location.pathname;
+    void startTakeover(document.createElement('button'), reloadRecord?.automatic === true);
   }
 })();
