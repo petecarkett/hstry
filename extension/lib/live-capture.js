@@ -159,8 +159,8 @@ export function proposedWorkspaceChatTitle(settings, status, route, nativeTitle,
 // ownership, per-conversation dedupe, or ordinary scan fairness.
 export function nextContinuationPriority(queue, receipts, state) {
   const pending = state?.pending;
-  if (!pending?.scopes || pending.priority || pending.nativeDetail ||
-      pending.retryYieldToScan === true ||
+  if (!pending?.scopes || pending.priority || pending.parkedPriority ||
+      pending.nativeDetail || pending.retryYieldToScan === true ||
       Number.isFinite(pending.lastPriorityProcessed) &&
         pending.processed - pending.lastPriorityProcessed < 3) return null;
   const done = new Set(pending.priorityDoneIds ?? []);

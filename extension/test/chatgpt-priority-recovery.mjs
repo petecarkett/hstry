@@ -343,6 +343,79 @@ try {
   assert.equal(native404.state.failureDetails[0].resolvedAtMs, null);
   assert.equal(native404.state.failureDetails[0].accessVerification.nativeStatus, 404);
 
+  // A cooling user continuation must not lock out eleven due recovery cases.
+  // Its exact source, owner, attempt count and cooldown stay in the canonical
+  // checkpoint while an independent native-fallback uses the single active slot.
+  requests = []; ingests = []; confirmations = [];
+  mode = 'healthy';
+  const future = Date.now() + 3_600_000;
+  const parked = { conversationId: inaccessible, sourceId: personal.sourceId,
+    accountKey: personal.accountKey, projectId: null, kind: 'continuation',
+    attempts: 9, nextRetryAtMs: future };
+  const due = { conversationId: id, sourceId: personal.sourceId,
+    accountKey: personal.accountKey, accountId: personal.accountId,
+    projectId: null, errorType: 'TimeoutError', attempts: 8,
+    lastFailedAtMs: Date.now() - 7_200_000,
+    nextRetryAtMs: Date.now() - 1, resolvedAtMs: null };
+  const earlierDueSameChat = { ...due, conversationId: inaccessible,
+    errorType: 'HTTP 404', attempts: 9,
+    nextRetryAtMs: Date.now() - 60_000 };
+  const coolingState = { pending: { ...pending(), processed: 6,
+    lastPriorityProcessed: 2, priority: parked },
+    failureDetails: [earlierDueSameChat, due] };
+  const recoveredOther = await run(coolingState);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + id],
+    'cooling continuation must not starve a different due native recovery');
+  assert.equal(ingests.length, 1);
+  assert.equal(recoveredOther.state.pending.priority, undefined);
+  assert.deepEqual(recoveredOther.state.pending.parkedPriority, parked,
+    'the cooling continuation survives unchanged in the same checkpoint');
+  assert(recoveredOther.state.failureDetails.find(f => f.conversationId === id).resolvedAtMs);
+  assert(!recoveredOther.state.failureDetails.find(f =>
+    f.conversationId === inaccessible).resolvedAtMs);
+  assert.equal(nextContinuationPriority(queue, receipts, recoveredOther.state), null,
+    'saved live capture must not reissue the parked continuation');
+  assert.equal(nextNativeRecoveryPriority({ ...coolingState,
+    pending: { ...pending(), processed: 6, lastPriorityProcessed: 2,
+      parkedPriority: parked } })?.conversationId, id,
+    'parked chat with earlier failure due time must not bypass its own cooldown');
+
+  // Finishing the last list scope cannot erase a cooling recovery checkpoint.
+  requests = [];
+  const finishedScan = structuredClone(recoveredOther.state);
+  finishedScan.pending.scopeIndex = finishedScan.pending.scopes.length;
+  const stillCooling = await run(finishedScan);
+  assert.equal(stillCooling.hasMore, true);
+  assert.deepEqual(stillCooling.state.pending.parkedPriority, parked);
+  assert.equal(requests.length, 0);
+  requests = []; ingests = []; confirmations = [];
+  const nowDue = structuredClone(stillCooling.state);
+  nowDue.pending.parkedPriority.nextRetryAtMs = Date.now() - 1;
+  const resumedContinuation = await run(nowDue);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible],
+    'when due, resume the same continuation without losing its identity');
+  assert.equal(resumedContinuation.state.pending.priority, undefined);
+  assert.equal(resumedContinuation.state.pending.parkedPriority, undefined);
+  assert.deepEqual(resumedContinuation.state.pending.priorityDoneIds, [inaccessible]);
+  assert.equal(ingests.length, 1);
+
+  // A staged partial native response cannot be discarded when its worker
+  // backoff outlasts the ordinary scan, nor retried through the old endpoint.
+  requests = []; ingests = [];
+  const stagedCooling = structuredClone(finishedScan);
+  delete stagedCooling.pending.parkedPriority;
+  stagedCooling.pending.priority = { ...parked,
+    stage: { conversationId: inaccessible, pages: 1, complete: false,
+      before: messageId, messages: [], seenCursors: [messageId] } };
+  stagedCooling.failureDetails = [earlierDueSameChat];
+  const savedPartial = await run(stagedCooling);
+  assert.equal(requests.length, 0,
+    'do not invoke legacy GET while a staged native priority is cooling');
+  assert.equal(savedPartial.hasMore, true,
+    'unfinished native history must survive an otherwise completed scan');
+  assert.deepEqual(savedPartial.state.pending?.priority, stagedCooling.pending.priority,
+    'the complete staged page and original deadline must remain intact');
+
   console.log('PASS native recovery of unreadable legacy history, bounded empty/404 verification, original fairness and rate limit');
 } finally {
   globalThis.fetch = previousFetch;
