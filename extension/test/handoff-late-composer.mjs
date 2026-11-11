@@ -78,7 +78,7 @@ const context = {
       sendMessage: (message, callback) => {
         sent.push(message.type);
         const response = () => callback(message.type === 'HSTRY_TAKEOVER_POLL'
-          ? { ok: true, found: true, prompt: 'HSTRY recovery fixture prompt' }
+          ? { ok: true, found: true, prompt: 'HSTRY recovery fixture prompt', landingPath: '/' }
           : { ok: true, completed: true });
         // A congested Chrome worker can hold the FIRST storage response for
         // minutes; this must not exhaust the landing retry window.
@@ -126,12 +126,21 @@ assert.equal(pollCancelled, false, 'composer readiness must outlive 4 minutes of
 flushTimers(); // No composer yet.
 assert.equal(sent.length, 1);
 ready = true;
-observerCallback(); // Hidden-tab timers may be suspended when the composer mounts.
+context.location.pathname = '/g/g-p-6a81a59c80e48191a14c2f7c5ccdd387-krar-vst';
+observerCallback();
+await settle();
+assert.equal(composerSends, 0,
+  'a delayed source-A handoff must not write or send in project B');
+assert.equal(finished, false, 'cross-project page must not receive a completion receipt');
+context.location.pathname = '/';
+observerCallback(); // Returning to the intended landing may resume the handoff.
 await settle(); // No timer ticks: the DOM change itself must resume the handoff.
 assert.equal(editorValue, '', 'native submit clears the input');
 assert.equal(composerSends, 1);
 assert.equal(finished, true);
-assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_DONE']);
+assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_POLL',
+  'HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_DONE'],
+  'one additional check is required after the tab returns from the wrong project');
 assert.equal(bannerCount, 0);
 
 observerCallback();

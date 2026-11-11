@@ -28,6 +28,18 @@ export function parseConversationUrl(input) {
   };
 }
 
+// A handoff may be consumed only on its source project's new-chat landing;
+// completion may additionally occur in a new conversation in that project.
+export function isContinuationDestinationPath(source, pathname, allowNewChat = false) {
+  if (!source || typeof pathname !== 'string' || !pathname.startsWith('/')) return false;
+  const landing = new URL(source.landing).pathname.replace(/\/$/, '') || '/';
+  const path = pathname.replace(/\/$/, '') || '/';
+  if (path === landing || (source.project && path === landing + '/project')) return true;
+  if (!allowNewChat) return false;
+  const destination = parseConversationUrl('https://chatgpt.com' + pathname);
+  return !!destination && destination.project === source.project && destination.id !== source.id;
+}
+
 // Each source chat has one existing durable completion receipt. Older receipts
 // cannot be retrospectively labelled automatic without evidence.
 export function recordedContinuations(receipts = {}) {
