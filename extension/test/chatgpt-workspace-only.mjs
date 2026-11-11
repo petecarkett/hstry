@@ -43,6 +43,20 @@ assert.equal(filtered.pending.personalResume.scopeFailures, 67);
 assert.equal(filtered.pending.personalResume.scopeTrackedFailures, 18);
 assert.equal(filtered.pending.processed, 3380);
 assert.equal(filtered.pending.priority, undefined, 'personal recovery is dropped');
+const parkedPersonal = workspaceOnlyChatGPTState({ ...initial,
+  pending: { ...initial.pending,
+    parkedPriority: { conversationId: '11111111-2222-4333-8444-555555555555',
+      sourceId: personal.sourceId, accountKey: personal.accountKey, projectId: null,
+      kind: 'continuation', nextRetryAtMs: Date.now() + 60_000 } } });
+assert.equal(parkedPersonal.pending.parkedPriority, undefined,
+  'Workspace-only routing must remove parked personal-account work');
+const parkedWorkspaceTask = { conversationId: '11111111-2222-4333-8444-555555555555',
+  sourceId: workspace.sourceId, accountKey: workspace.accountKey, projectId: null,
+  kind: 'continuation', nextRetryAtMs: Date.now() + 60_000 };
+const parkedWorkspace = workspaceOnlyChatGPTState({ ...initial,
+  pending: { ...initial.pending, parkedPriority: parkedWorkspaceTask } });
+assert.deepEqual(parkedWorkspace.pending.parkedPriority, parkedWorkspaceTask,
+  'Workspace-only migration must preserve the workspace recovery deadline');
 assert.equal(filtered.pending.cachedPage, undefined, 'personal cached page is dropped');
 assert.deepEqual(Object.keys(filtered.accounts), ['work']);
 assert.equal(filtered.failureDetails.length, 1);

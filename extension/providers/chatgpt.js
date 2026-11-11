@@ -259,6 +259,8 @@ export function workspaceOnlyChatGPTState(state = {}) {
     nextPending.cachedPage = { ...nextPending.cachedPage, scopeIndex: nextIndex };
   }
   if (nextPending.priority && !workspaceScope(nextPending.priority)) delete nextPending.priority;
+  if (nextPending.parkedPriority && !workspaceScope(nextPending.parkedPriority))
+    delete nextPending.parkedPriority;
   const accountKeys = new Set(retained.map(scope => scope.accountKey));
   return { ...next, pending: nextPending,
     accounts: Object.fromEntries(Object.entries(state.accounts ?? {})
@@ -743,18 +745,27 @@ const prefersNativeDetail = failure =>
   ['TimeoutError', 'HTTP 500'].includes(failure?.errorType) &&
   (failure?.attempts ?? 0) >= 2;
 
+const sameRecoveryTarget = (failure, task) =>
+  failure?.conversationId === task?.conversationId &&
+  failure?.sourceId === task?.sourceId &&
+  (failure?.projectId ?? null) === (task?.projectId ?? null) &&
+  (task?.accountKey == null || failure?.accountKey === task.accountKey);
+
 // Recover known missing histories before older automatic handoff receipts.
 // The same checkpoint, source-owner checks and scan fairness govern both.
 export function nextNativeRecoveryPriority(state) {
   const pending = state?.pending;
   if (!Array.isArray(pending?.scopes) || pending.priority || pending.nativeDetail ||
+      (pending.parkedPriority &&
+        (pending.parkedPriority.nextRetryAtMs ?? 0) <= Date.now()) ||
       pending.retryYieldToScan === true ||
       (pending.retryYieldToScan == null && pending.rateLimitStreak >= 3 &&
         pending.lastDeferredHttpStatus === 429) ||
       (Number.isFinite(pending.lastPriorityProcessed) &&
         pending.processed - pending.lastPriorityProcessed < 3)) return null;
   const failure = (state.failureDetails ?? []).find(item =>
-    !item.resolvedAtMs && !item.accessVerification?.nativeCheckedAtMs &&
+    !item.resolvedAtMs && !sameRecoveryTarget(item, pending.parkedPriority) &&
+    !item.accessVerification?.nativeCheckedAtMs &&
     CHAT_ID.test(item.conversationId ?? '') &&
     (isNonRetryableAccess(item) || (
       (item.errorDiagnostic === 'Conversation has no readable messages' ||
@@ -1045,6 +1056,20 @@ export async function syncChatGPT({
       (pending.retryYieldToScan == null && pending.rateLimitStreak >= 3 &&
         pending.lastDeferredHttpStatus === 429));
   pending.retryYieldToScan = false;
+  // Park a cooling priority in the same persisted checkpoint so other due
+  // recoveries can use the one active slot without losing its original backoff.
+  if (pending.priority && !pending.parkedPriority && !pending.priority.stage &&
+      ['continuation', 'native-404', 'native-fallback'].includes(pending.priority.kind) &&
+      Number.isFinite(pending.priority.nextRetryAtMs) &&
+      pending.priority.nextRetryAtMs > Date.now()) {
+    pending.parkedPriority = pending.priority;
+    delete pending.priority;
+  }
+  if (!pending.priority && pending.parkedPriority &&
+      (pending.parkedPriority.nextRetryAtMs ?? 0) <= Date.now()) {
+    pending.priority = pending.parkedPriority;
+    delete pending.parkedPriority;
+  }
   // The legacy detail endpoint can return a terminal 404 while the native
   // paginated endpoint still has the canonical history. Test that once per
   // distinct inaccessible conversation without consuming another request.
@@ -1191,6 +1216,8 @@ export async function syncChatGPT({
   const now = Date.now();
   const failure = !scanTurn && failureDetails.find(detail =>
     !detail.resolvedAtMs && detail.sourceId && !isNonRetryableAccess(detail) &&
+    !sameRecoveryTarget(detail, pending.priority) &&
+    !sameRecoveryTarget(detail, pending.parkedPriority) &&
     !prefersNativeDetail(detail) &&
     !isIgnoredConversation(newState, detail.conversationId, detail) &&
     (detail.nextRetryAtMs ??
@@ -1564,6 +1591,11 @@ export async function syncChatGPT({
     await checkpointNow();
   }
 
+  if (pending.priority || pending.parkedPriority) {
+    await checkpointNow();
+    return { state: { ...newState, pending: { ...pending } }, conversations: total,
+      hasMore: true, failures: outstanding(), retryAfterMinutes: paceMinutes() };
+  }
   await report({ phase: 'complete', detected: pending.detected,
     processed: pending.processed, failed: pending.failures });
   const completeState = { ...newState };
