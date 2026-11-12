@@ -15,6 +15,7 @@
   // A prior extension instance can leave an orphaned DOM button behind.
   // Replace it so its invalidated click handler can no longer be invoked.
   document.getElementById('hstry-continue-chat')?.remove();
+  document.getElementById('hstry-open-continuation')?.remove();
 
   const RETRY_KEY = 'hstry.takeover.retryAfterReload';
   const RETRY_TTL_MS = 60_000;
@@ -189,6 +190,62 @@
     } catch (err) { reject(err); }
   });
 
+  let lastStatusPath = null, lastStatusAt = 0, checkingStatus = false;
+  async function showContinuationStatus() {
+    const path = location.pathname;
+    const old = document.getElementById('hstry-open-continuation');
+    if (!/\/c\/[0-9a-f-]{36}\/?$/i.test(path)) {
+      old?.remove();
+      return;
+    }
+    if (checkingStatus || (lastStatusPath === path && Date.now() - lastStatusAt < 12_000)) return;
+    lastStatusPath = path;
+    lastStatusAt = Date.now();
+    checkingStatus = true;
+    let result;
+    try {
+      result = await send({ type: 'HSTRY_TAKEOVER_STATUS', sourceUrl: location.href });
+    } catch { checkingStatus = false; return; }
+    checkingStatus = false;
+    if (location.pathname !== path) return;
+    if (!result?.ok || !result.found) { old?.remove(); return; }
+    const canOpen = result.status === 'completed' && result.hasDestination;
+    let button = document.getElementById('hstry-open-continuation');
+    if (!button) {
+      button = document.createElement('button');
+      button.id = 'hstry-open-continuation';
+      button.type = 'button';
+      button.style.cssText = 'position:fixed;right:20px;bottom:145px;z-index:999999;'+
+        'padding:9px 16px;border-radius:24px;border:1px solid #7d9e88;'+
+        'background:#305e46;color:white;cursor:pointer;font:14px sans-serif';
+      button.addEventListener('click', async () => {
+        if (button.disabled) return;
+        button.disabled = true;
+        button.textContent = 'Opening continuation...';
+        let timer;
+        try {
+          const response = await Promise.race([
+            send({ type: 'HSTRY_TAKEOVER_OPEN', sourceUrl: location.href }),
+            new Promise((_, reject) => { timer = setTimeout(() =>
+              reject(new Error('HSTRY did not confirm the continuation tab.')), 30_000); }),
+          ]);
+          if (!response?.ok) throw new Error(response?.error || 'Cannot open continuation');
+          button.textContent = 'Continuation opened';
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = 'Open continuation';
+          fallbackBanner('HSTRY: ' + String(error?.message || error));
+        } finally { clearTimeout(timer); }
+      });
+      document.body.append(button);
+    }
+    button.disabled = !canOpen;
+    button.textContent = canOpen ? 'Open continuation' :
+      result.status === 'completed' ? 'Continuation recorded (link missing)' : 'Continuation pending';
+    button.title = canOpen ? 'Focus the continuation tab or reopen it in a new tab' :
+      'No verified destination URL is stored. HSTRY will not guess or create a duplicate.';
+  }
+
   async function startTakeover(btn, automatic = false) {
     if (btn.disabled) return;
     if (serverLimitPath === location.pathname && rejectedTooLong) {
@@ -210,12 +267,34 @@
     }
     btn.disabled = true;
     btn.textContent = 'Opening continuation...';
+    let startTimeout;
     try {
-      const result = await send({ type: 'HSTRY_TAKEOVER_START', automatic, sourceUrl: location.href,
-        failedMessage: serverLimitPath === location.pathname ? rejectedMessage : '',
-        missingAttachments: serverLimitPath === location.pathname && rejectedHasAttachments });
+      const result = await Promise.race([
+        send({ type: 'HSTRY_TAKEOVER_START', automatic, sourceUrl: location.href,
+          failedMessage: serverLimitPath === location.pathname ? rejectedMessage : '',
+          missingAttachments: serverLimitPath === location.pathname && rejectedHasAttachments }),
+        new Promise((_, reject) => { startTimeout = setTimeout(() => reject(new Error(
+          'HSTRY did not confirm navigation. Check this tab before retrying.')), 30_000); }),
+      ]);
       if (!result?.ok) throw new Error(result?.error || 'Unable to open the new chat');
-      btn.textContent = result.existing ? 'Continuation already opened' : 'Continuing in this tab';
+      if (result.existing) {
+        btn.textContent = result.completed ? 'Continuation already completed' : 'Continuation already opened';
+      } else {
+        const projectPath = location.pathname.replace(/\/c\/[0-9a-f-]{36}$/i, '') || '/';
+        const expected = 'https://chatgpt.com' + projectPath;
+        if (result.landingUrl !== expected) throw new Error('HSTRY destination does not match this chat project');
+        btn.textContent = 'Continuing in this tab';
+        const sourcePath = location.pathname;
+        // If navigation is blocked, leave the existing saved handoff retryable.
+        setTimeout(() => {
+          if (location.pathname === sourcePath) {
+            btn.disabled = false;
+            btn.textContent = 'Continue with HSTRY';
+            fallbackBanner('HSTRY saved the handoff, but this tab did not navigate. Check before retrying.');
+          }
+        }, 30_000);
+        location.assign(expected);
+      }
     } catch (err) {
       btn.disabled = false;
       btn.textContent = 'Continue with HSTRY';
@@ -239,6 +318,8 @@
       fallbackBanner(/extension context invalidated/i.test(message)
         ? 'HSTRY was updated but the extension is still unavailable. Refresh this chat and try again.'
         : 'HSTRY takeover: ' + message);
+    } finally {
+      clearTimeout(startTimeout);
     }
   }
 
@@ -403,7 +484,8 @@
       // pending if ChatGPT leaves the instruction in the composer.
       let submitted = false;
       for (let i = 0; i < 40; i++) {
-        if (!(editor.value || editor.textContent || '').includes(prompt.slice(0, 32))) {
+        if (!onHandoffLanding(result.landingPath) ||
+            !(editor.value || editor.textContent || '').includes(prompt.slice(0, 32))) {
           submitted = true;
           break;
         }
@@ -414,6 +496,10 @@
         newChatSubmitted = true;
         firstSubmittedAtMs ??= handoffSubmitAtMs;
         scheduleWarningCheck();
+      }
+      for (let i = 0; i < 40 && onHandoffLanding(result.landingPath); i++) await pause(250);
+      if (onHandoffLanding(result.landingPath)) {
+        throw new Error('ChatGPT has not created a new conversation. The handoff remains pending.');
       }
       const done = await send({ type:'HSTRY_TAKEOVER_DONE', pagePath: location.pathname });
       if (!done?.ok || !done.completed) throw new Error(done?.error || 'Continuation completion was not verified');
@@ -471,6 +557,7 @@
       resumeWhenComposerReady = false;
       void takeOverIfPending();
     }
+    void showContinuationStatus();
     clearTimeout(detectionTimer);
     detectionTimer = setTimeout(() => { detectLimit(); maybeNameNewChat(); }, 700);
   }

@@ -6,12 +6,15 @@ const script = readFileSync(new URL('../handoff-content.js', import.meta.url), '
 const warning = "You've reached the maximum length for this conversation. You can keep talking by starting a new chat.";
 const path = '/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood/c/6add53d9-4c88-83ed-a57d-6a602a257293';
 
-function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning, hasNative = true, precedingText = '', unrelatedEditorText = '', hasAttachment = false, retryRecord = null) {
+function mount(initialWarning, previous = null, active = false, draft = '', screenText = warning, hasNative = true, precedingText = '', unrelatedEditorText = '', hasAttachment = false, retryRecord = null, hangStart = false, statusRecord = null) {
   let visible = active;
   let focused = active;
   let reachedLimit = initialWarning;
   let button = null;
   let clickButton = null;
+  let continuationButton = null, continuationClick = null;
+  const opens = [];
+  let assignedUrl = null;
   const sent = [];
   const events = new Map();
   const timers = new Map();
@@ -30,10 +33,14 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
   };
   const document = {
     body: { get textContent() { return reachedLimit ? precedingText + screenText : ''; },
-      append(element) { if (element.id === 'hstry-continue-chat') button = element; } },
+      append(element) {
+        if (element.id === 'hstry-continue-chat') button = element;
+        if (element.id === 'hstry-open-continuation') continuationButton = element;
+      } },
     get visibilityState() { return visible ? 'visible' : 'hidden'; },
     hasFocus: () => focused,
-    getElementById(id) { return id === 'hstry-continue-chat' ? button : null; },
+    getElementById(id) { return id === 'hstry-continue-chat' ? button :
+      id === 'hstry-open-continuation' ? continuationButton : null; },
     querySelector: () => hasAttachment ? {} : null,
     querySelectorAll(query) {
       if (query === 'button, a') return hasNative ? [native] : [];
@@ -54,12 +61,19 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     createElement() {
       return {
         style: {}, disabled: false, setAttribute() {},
-        addEventListener(type, handler) { if (type === 'click') clickButton = handler; },
+        addEventListener(type, handler) {
+          if (type === 'click') {
+            if (this.id === 'hstry-open-continuation') continuationClick = handler;
+            else clickButton = handler;
+          }
+        },
       };
     },
     addEventListener(type, handler) { events.set(type, handler); },
   };
-  const location = { pathname: path, reload() { throw Error('reload unexpected'); } };
+  const location = { pathname: path, get href() { return 'https://chatgpt.com' + this.pathname; },
+    reload() { throw Error('reload unexpected'); },
+    assign(url) { assignedUrl = url; } };
   const context = {
     document, location,
     addEventListener(type, handler) { events.set(`window:${type}`, handler); },
@@ -70,8 +84,19 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
         lastError: null,
         onMessage: { addListener() {} },
         sendMessage(message, done) {
+          if (message.type === 'HSTRY_TAKEOVER_STATUS') {
+            queueMicrotask(() => done({ ok: true, found: !!statusRecord, ...statusRecord }));
+            return;
+          }
+          if (message.type === 'HSTRY_TAKEOVER_OPEN') {
+            opens.push(message);
+            queueMicrotask(() => done({ ok: true, reused: true, tabId: 77 }));
+            return;
+          }
           sent.push(message);
-          queueMicrotask(() => done({ ok: true, tabId: 600 }));
+          if (hangStart && message.type === 'HSTRY_TAKEOVER_START') return;
+          queueMicrotask(() => done({ ok: true, tabId: 600,
+            landingUrl: 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood' }));
         },
       },
     },
@@ -97,7 +122,10 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     pending.forEach(callback => callback());
   };
   return {
-    sent,
+    sent, opens,
+    get continuationButton() { return continuationButton; },
+    clickContinuation() { continuationClick?.(); },
+    get assignedUrl() { return assignedUrl; },
     get button() { return button; },
     flush, mutate() { if (observing) observer(); },
     redrawPanel() { button = null; if (observing) observer(); },
@@ -134,6 +162,9 @@ existing.manualClick();
 await tick();
 assert.equal(existing.sent.length, 1);
 assert.equal(existing.sent[0].automatic, false);
+assert.equal(existing.assignedUrl,
+  'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood',
+  'source tab itself navigates only after the START reply');
 
 const terminal = mount(true, null, true, '', 'Unknown error Start new chat');
 terminal.flush();
@@ -362,6 +393,7 @@ assert.equal(live.button, null, 'healthy same-version handler remains installed'
 const retryAfterReload = mount(false, null, false, '', 'Normal conversation', false,
   '', '', false, { path, at: Date.now(), automatic: true,
     serverLimit: true, failedMessage: 'now?' });
+await tick(); // Let the synthetic Chrome response settle before advancing timers.
 retryAfterReload.flush();
 await tick();
 assert.equal(retryAfterReload.sent.length, 1,
@@ -370,6 +402,9 @@ assert.equal(retryAfterReload.sent[0].automatic, true,
   'retry preserves the original automatic action');
 assert.equal(retryAfterReload.sent[0].failedMessage, 'now?',
   'retry must retain the rejected user message');
+assert.equal(retryAfterReload.assignedUrl,
+  'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood',
+  'reload recovery navigates within the source project');
 
 const expiredRetry = mount(false, null, false, '', 'Normal conversation', false,
   '', '', false, { path, at: Date.now() - 90_000, automatic: true });
@@ -383,5 +418,52 @@ const wrongPathRetry = mount(false, null, false, '', 'Normal conversation', fals
 wrongPathRetry.flush();
 await tick();
 assert.equal(wrongPathRetry.sent.length, 0, 'different-chat receipt cannot launch a handoff');
+
+const stalledNavigation = mount(true);
+stalledNavigation.flush();
+stalledNavigation.manualClick();
+await tick();
+assert.equal(stalledNavigation.button.disabled, true);
+stalledNavigation.flush();
+await tick();
+assert.equal(stalledNavigation.button.disabled, false,
+  'cancelled navigation restores the button without clearing the saved handoff');
+assert.equal(stalledNavigation.sent.length, 1, 'navigation watchdog never duplicates START');
+
+const hungStart = mount(true, null, false, '', warning, true, '', '', false, null, true);
+hungStart.flush();
+hungStart.manualClick();
+assert.equal(hungStart.button.disabled, true, 'pending START shows a progress state');
+hungStart.flush();
+await tick();
+assert.equal(hungStart.button.disabled, false,
+  'unanswered START must not leave the chat button disabled indefinitely');
+assert.equal(hungStart.sent.length, 1, 'timeout must not create a duplicate handoff');
+
+// A completed continuation is discoverable when the original chat is reopened
+// in a fresh browser window, with no new-chat action until the user clicks.
+const linked = mount(false, null, false, '', 'Normal conversation', false,
+  '', '', false, null, false, { status: 'completed', hasDestination: true });
+await tick();
+assert.equal(linked.continuationButton?.textContent, 'Open continuation');
+assert.equal(linked.continuationButton.disabled, false);
+assert.equal(linked.opens.length, 0, 'revisiting a source never opens a tab automatically');
+linked.clickContinuation();
+await tick();
+assert.equal(linked.opens.length, 1);
+assert.equal(linked.opens[0].type, 'HSTRY_TAKEOVER_OPEN');
+assert.equal(linked.continuationButton.textContent, 'Continuation opened');
+
+const oldReceipt = mount(false, null, false, '', 'Normal conversation', false,
+  '', '', false, null, false, { status: 'completed', hasDestination: false });
+await tick();
+assert.equal(oldReceipt.continuationButton?.disabled, true);
+assert.match(oldReceipt.continuationButton.textContent, /link missing/i);
+assert.equal(oldReceipt.opens.length, 0);
+const pendingReceipt = mount(false, null, false, '', 'Normal conversation', false,
+  '', '', false, null, false, { status: 'started', hasDestination: false });
+await tick();
+assert.equal(pendingReceipt.continuationButton?.textContent, 'Continuation pending');
+assert.equal(pendingReceipt.continuationButton.disabled, true);
 
 console.log('PASS automatic continuation handles already-full focused chats, SPA and DOM redraws without duplicates');

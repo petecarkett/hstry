@@ -28,12 +28,17 @@ const editor = {
 const sendButton = {
   disabled: false,
   getBoundingClientRect: () => ({ width: 42, height: 42 }),
-  click: () => { composerSends++; editorValue = ''; },
+  click: () => {
+    composerSends++;
+    editorValue = '';
+    context.location.pathname = '/c/99999999-aaaa-4bbb-8ccc-dddddddddddd';
+  },
 };
 const context = {
   document: {
     body: { textContent: '' },
     getElementById: () => null,
+    querySelector: () => null,
     querySelectorAll: selector => {
       if (selector.startsWith('#prompt-textarea') && selector.includes('[contenteditable="true"][data-composer-markdown]')) return ready ? [editor] : [];
       if (selector.startsWith('button[data-testid="send-button"]')) {
@@ -76,6 +81,10 @@ const context = {
       onMessage: { addListener() {} },
       lastError: null,
       sendMessage: (message, callback) => {
+        if (message.type === 'HSTRY_TAKEOVER_STATUS') {
+          queueMicrotask(() => callback({ ok: true, found: false }));
+          return;
+        }
         sent.push(message.type);
         const response = () => callback(message.type === 'HSTRY_TAKEOVER_POLL'
           ? { ok: true, found: true, prompt: 'HSTRY recovery fixture prompt', landingPath: '/' }
