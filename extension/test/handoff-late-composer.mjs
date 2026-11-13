@@ -16,6 +16,9 @@ let finished = false;
 let bannerCount = 0;
 let editorValue = '';
 let releaseFirstPoll;
+const sourceUrl = 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111';
+const intentToken = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+let sourceIntent = null;
 
 // ChatGPT uses a ProseMirror div[contenteditable][data-composer-markdown].
 const editor = {
@@ -56,8 +59,13 @@ const context = {
     },
   },
   location: { pathname: '/' },
+  URL,
   addEventListener() {},
-  sessionStorage: { getItem: () => null, removeItem: () => {} },
+  sessionStorage: {
+    getItem: key => key === 'hstry.takeover.sourceIntent' && sourceIntent
+      ? JSON.stringify(sourceIntent) : null,
+    removeItem(key) { if (key === 'hstry.takeover.sourceIntent') sourceIntent = null; },
+  },
   HTMLTextAreaElement: class TextArea {},
   getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
   Event: class { constructor(type) { this.type = type; } },
@@ -86,8 +94,14 @@ const context = {
           return;
         }
         sent.push(message.type);
+        if (message.type === 'HSTRY_TAKEOVER_POLL' ||
+            message.type === 'HSTRY_TAKEOVER_DONE') {
+          assert.equal(message.sourceUrl, sourceUrl);
+          assert.equal(message.intentToken, intentToken);
+        }
         const response = () => callback(message.type === 'HSTRY_TAKEOVER_POLL'
-          ? { ok: true, found: true, prompt: 'HSTRY recovery fixture prompt', landingPath: '/' }
+          ? { ok: true, found: true, prompt: 'HSTRY recovery fixture prompt',
+              original: sourceUrl, intentToken, landingPath: '/' }
           : { ok: true, completed: true });
         // A congested Chrome worker can hold the FIRST storage response for
         // minutes; this must not exhaust the landing retry window.
@@ -112,6 +126,11 @@ const flushTimers = () => {
   batch.forEach(cb => cb());
 };
 
+await settle();
+assert.deepEqual(sent, [], 'unrelated new chat must not poll or consume another source');
+sourceIntent = { token: intentToken, sourceUrl, landingUrl: 'https://chatgpt.com/',
+  at: Date.now() };
+pollTick();
 await settle();
 assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL']);
 assert.equal(composerSends, 0, 'must not send before composer exists');
@@ -148,8 +167,8 @@ assert.equal(editorValue, '', 'native submit clears the input');
 assert.equal(composerSends, 1);
 assert.equal(finished, true);
 assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_POLL',
-  'HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_DONE'],
-  'one additional check is required after the tab returns from the wrong project');
+  'HSTRY_TAKEOVER_DONE'],
+  'wrong-project navigation must not consume a poll or lose the pending handoff');
 assert.equal(bannerCount, 0);
 
 observerCallback();

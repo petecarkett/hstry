@@ -112,6 +112,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       const tabId = senderTab.id;
       const startedAt = Date.now();
+      const intentToken = crypto.randomUUID();
       const automatic = msg.automatic === true;
       try {
         const current = await chrome.tabs.get(tabId);
@@ -124,12 +125,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           original: parsed.original, project: parsed.project,
           prompt: takeoverPrompt(parsed.original, pending,
             msg.failedMessage || '', msg.missingAttachments === true),
-          createdAt: startedAt, sourceTabId: tabId, automatic,
+          createdAt: startedAt, sourceTabId: tabId, automatic, intentToken,
         } });
         await chrome.storage.local.set({ [sourceKey]: {
           status: 'started', tabId, startedAt, automatic, originalUrl: parsed.original,
         } });
-        return { tabId, pendingCaptures: pending, landingUrl: parsed.landing };
+        return { tabId, pendingCaptures: pending, landingUrl: parsed.landing,
+          sourceUrl: parsed.original, intentToken };
       } catch (error) {
         // Failed persistence leaves the source page in place. Clear partial
         // receipts so the same tab can retry safely.
@@ -150,6 +152,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const key = PREFIX + senderTab.id;
       const record = (await chrome.storage.session.get(key))[key];
       if (!record || record.sourceTabId !== senderTab.id) return { found: false };
+      // The same browser tab can later visit an unrelated chat. An explicit
+      // source-page continuation intent must match before returning a prompt.
+      if (typeof record.intentToken !== 'string' ||
+          msg.intentToken !== record.intentToken || msg.sourceUrl !== record.original) {
+        if (msg.type === 'HSTRY_TAKEOVER_DONE') {
+          throw new Error('Continuation intent no longer belongs to this source chat.');
+        }
+        return { found: false };
+      }
       if (Date.now() - record.createdAt > MAX_AGE_MS) {
         await chrome.storage.session.remove(key);
         return { found: false };
@@ -195,7 +206,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const receipt = (await chrome.storage.local.get(sourceKey))[sourceKey];
       if (receipt?.status === 'completed') return { found: false, completed: true };
       return { found: true, prompt: record.prompt, original: record.original,
-        landingPath: new URL(original.landing).pathname };
+        intentToken: record.intentToken, landingPath: new URL(original.landing).pathname };
     })());
   }
   return false;

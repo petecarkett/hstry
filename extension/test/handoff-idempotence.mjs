@@ -80,7 +80,10 @@ assert.equal(injected.length, 1, 'unrelated websites must never be injected');
 
 const send = (url, type, tabId, automatic = false, frameUrl = url, extra = {}) => new Promise(resolve => {
   const sender = { id: chrome.runtime.id, frameId: 0, url: frameUrl, tab: { id: tabId, url } };
+  const bound = session.get('hstryTakeoverTab:' + tabId);
   const keepOpen = listener({ type, automatic, pagePath: new URL(url).pathname,
+    ...(['HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_DONE'].includes(type) && bound
+      ? { sourceUrl: bound.original, intentToken: bound.intentToken } : {}),
     ...(['HSTRY_TAKEOVER_START', 'HSTRY_TAKEOVER_STATUS', 'HSTRY_TAKEOVER_OPEN'].includes(type)
       ? { sourceUrl: url } : {}), ...extra }, sender, resolve);
   assert.equal(keepOpen, true);
@@ -113,6 +116,10 @@ assert.equal(sameTab.landingUrl, landing, 'same-tab retry retains destination');
 assert.equal(tabs.get(1).url, original, 'source remains until it receives the handoff response');
 assert.equal(tabs.get(2).url, original, 'unrelated duplicate source tab was left untouched');
 assert.ok(session.get('hstryTakeoverTab:1')?.prompt.includes(original));
+assert.equal(first.sourceUrl, original);
+assert.match(first.intentToken, /^[0-9a-f-]{36}$/i);
+assert.equal(session.get('hstryTakeoverTab:1')?.intentToken, first.intentToken);
+assert.notEqual(session.get('hstryTakeoverTab:1')?.intentToken, undefined);
 assert.equal(session.get('hstryTakeoverTab:1')?.automatic,true,'automatic classification survives session navigation');
 assert.equal(local.get('hstryTakeoverSource:'+sourceId)?.automatic,true,'automatic start is durable');
 
@@ -137,10 +144,27 @@ assert.equal(stillSource.found, false, 'original full-chat DOM cannot consume it
 const wrongProject = await send('https://chatgpt.com/', 'HSTRY_TAKEOVER_POLL', 1);
 assert.equal(wrongProject.found, false, 'unrelated landing cannot consume project handoff');
 
+const missingIntent = await send(landing, 'HSTRY_TAKEOVER_POLL', 1, false,
+  landing, { intentToken: undefined });
+assert.equal(missingIntent.found, false,
+  'a same-tab landing without source-page intent cannot consume the saved prompt');
+const unrelatedIntent = await send(landing, 'HSTRY_TAKEOVER_POLL', 1, false,
+  landing, { sourceUrl: another });
+assert.equal(unrelatedIntent.found, false,
+  'a different conversation source cannot consume a matching-tab pending prompt');
+const wrongToken = await send(landing, 'HSTRY_TAKEOVER_POLL', 1, false,
+  landing, { intentToken: '00000000-0000-4000-8000-000000000000' });
+assert.equal(wrongToken.found, false,
+  'stale intent from a previous continuation cannot consume a new prompt');
 const pending = await send(landing, 'HSTRY_TAKEOVER_POLL', 1);
 assert.equal(pending.ok, true);
 assert.equal(pending.found, true);
 assert.ok(pending.prompt.includes(original));
+assert.equal(pending.intentToken, first.intentToken);
+const wrongDoneIntent = await send(landing, 'HSTRY_TAKEOVER_DONE', 1, false,
+  landing, { intentToken: undefined });
+assert.equal(wrongDoneIntent.ok, false,
+  'completion cannot be recorded without original source-page intent');
 const projectLanding = await send(landing + '/project', 'HSTRY_TAKEOVER_POLL', 1);
 assert.equal(projectLanding.found, true, 'ChatGPT project landing alias is supported');
 const prematureDone = await send(landing, 'HSTRY_TAKEOVER_DONE', 1);
@@ -244,6 +268,10 @@ for (const [url, tabId] of starts) {
   const stored = session.get('hstryTakeoverTab:' + tabId);
   assert(stored?.original === url, 'the tab must retain its own exact source');
   assert(stored.prompt.includes(url), 'the prompt must reference its own source');
+  assert.equal(stored.intentToken, started.find(r => r.tabId === tabId)?.intentToken);
+  assert(!starts.some(([otherUrl, otherId]) =>
+    otherId !== tabId && session.get('hstryTakeoverTab:' + otherId)?.intentToken === stored.intentToken),
+    'simultaneous projects must use distinct source intents');
   const source = new URL(url);
   const landing = source.pathname.replace(/\/c\/[0-9a-f-]{36}$/i, '');
   assert.equal(started.find(r => r.tabId === tabId)?.landingUrl, source.origin + (landing || '/'),

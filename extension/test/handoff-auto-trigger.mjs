@@ -18,6 +18,8 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
   const sent = [];
   const events = new Map();
   const timers = new Map();
+  const storage = new Map();
+  if (retryRecord) storage.set('hstry.takeover.retryAfterReload', JSON.stringify(retryRecord));
   let nextTimer = 0;
   let observer;
   let observing = false;
@@ -75,7 +77,7 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     reload() { throw Error('reload unexpected'); },
     assign(url) { assignedUrl = url; } };
   const context = {
-    document, location,
+    document, location, URL,
     addEventListener(type, handler) { events.set(`window:${type}`, handler); },
     chrome: {
       runtime: {
@@ -96,13 +98,17 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
           sent.push(message);
           if (hangStart && message.type === 'HSTRY_TAKEOVER_START') return;
           queueMicrotask(() => done({ ok: true, tabId: 600,
-            landingUrl: 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood' }));
+            landingUrl: 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood',
+            sourceUrl: 'https://chatgpt.com' + path,
+            intentToken: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' }));
         },
       },
     },
-    sessionStorage: { getItem: key => key === 'hstry.takeover.retryAfterReload' ?
-      (retryRecord && JSON.stringify(retryRecord)) : null,
-      removeItem(key) { if (key === 'hstry.takeover.retryAfterReload') retryRecord = null; } },
+    sessionStorage: {
+      getItem(key) { return storage.get(key) ?? null; },
+      setItem(key, value) { storage.set(key, value); },
+      removeItem(key) { storage.delete(key); },
+    },
     setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
     clearTimeout(id) { timers.delete(id); },
     setInterval() { return 1; }, clearInterval() {},
@@ -123,6 +129,7 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
   };
   return {
     sent, opens,
+    get sourceIntent() { return storage.get('hstry.takeover.sourceIntent'); },
     get continuationButton() { return continuationButton; },
     clickContinuation() { continuationClick?.(); },
     get assignedUrl() { return assignedUrl; },
@@ -165,6 +172,11 @@ assert.equal(existing.sent[0].automatic, false);
 assert.equal(existing.assignedUrl,
   'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood',
   'source tab itself navigates only after the START reply');
+assert.equal(JSON.parse(existing.sourceIntent).sourceUrl, 'https://chatgpt.com' + path,
+  'source tab must record exact initiating chat before navigation');
+assert.equal(JSON.parse(existing.sourceIntent).token,
+  'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+  'destination poll must be bound to the source-initiated token');
 
 const terminal = mount(true, null, true, '', 'Unknown error Start new chat');
 terminal.flush();

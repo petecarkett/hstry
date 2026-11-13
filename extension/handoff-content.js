@@ -18,6 +18,27 @@
   document.getElementById('hstry-open-continuation')?.remove();
 
   const RETRY_KEY = 'hstry.takeover.retryAfterReload';
+  const INTENT_KEY = 'hstry.takeover.sourceIntent';
+  // A source action, not merely arriving at a new-chat landing, authorizes
+  // consuming the pending prompt. This survives same-tab navigation only.
+  function readSourceIntent() {
+    try {
+      const record = JSON.parse(sessionStorage.getItem(INTENT_KEY) || 'null');
+      if (typeof record?.token !== 'string' ||
+          !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(record.token) ||
+          typeof record.sourceUrl !== 'string' ||
+          typeof record.landingUrl !== 'string' ||
+          !Number.isFinite(record.at) ||
+          Date.now() < record.at || Date.now() - record.at >= 30 * 60_000) return null;
+      const source = new URL(record.sourceUrl);
+      const landing = new URL(record.landingUrl);
+      if (source.origin !== 'https://chatgpt.com' ||
+          landing.origin !== source.origin ||
+          !/^\/c\/[0-9a-f-]{36}$/i.test(source.pathname) &&
+          !/^\/g\/g-p-[^/]+\/c\/[0-9a-f-]{36}$/i.test(source.pathname)) return null;
+      return record;
+    } catch { return null; }
+  }
   const RETRY_TTL_MS = 60_000;
   let retryOnce = false;
   let resumePending = false;
@@ -66,6 +87,9 @@
     const action = event.target?.closest?.('button, a, [role="button"], [role="menuitem"]');
     const name = (action?.getAttribute?.('aria-label') || action?.textContent || '').trim();
     if (/^new chat$/i.test(name)) {
+      // A deliberate New Chat action is not consent to reuse a pending
+      // continuation from an earlier conversation in this browser tab.
+      sessionStorage.removeItem(INTENT_KEY);
       newChatLanding = true; landingPath = location.pathname;
       newChatSubmitted = false; autoTitleAttempted = false;
       firstSubmittedAtMs = null; manualTitleEdit = false; titleTargetPath = null;
@@ -283,6 +307,20 @@
         const projectPath = location.pathname.replace(/\/c\/[0-9a-f-]{36}$/i, '') || '/';
         const expected = 'https://chatgpt.com' + projectPath;
         if (result.landingUrl !== expected) throw new Error('HSTRY destination does not match this chat project');
+        if (typeof result.intentToken !== 'string' ||
+            typeof result.sourceUrl !== 'string') {
+          throw new Error('HSTRY did not bind the continuation to its source.');
+        }
+        const sourceUrl = new URL(location.href);
+        sourceUrl.search = '';
+        sourceUrl.hash = '';
+        if (result.sourceUrl !== sourceUrl.href) {
+          throw new Error('HSTRY source changed before handoff navigation.');
+        }
+        sessionStorage.setItem(INTENT_KEY, JSON.stringify({
+          token: result.intentToken, sourceUrl: result.sourceUrl,
+          landingUrl: expected, at: Date.now(),
+        }));
         btn.textContent = 'Continuing in this tab';
         const sourcePath = location.pathname;
         // If navigation is blocked, leave the existing saved handoff retryable.
@@ -440,12 +478,19 @@
   async function takeOverIfPending() {
     if (handoffStarted || checkingHandoff ||
         (resumeWhenComposerReady && !editableElement())) return;
+    const intent = readSourceIntent();
+    if (!intent || !onHandoffLanding(new URL(intent.landingUrl).pathname)) return;
     checkingHandoff = true;
     let result;
-    try { result = await send({ type:'HSTRY_TAKEOVER_POLL', pagePath: location.pathname }); }
+    try { result = await send({ type:'HSTRY_TAKEOVER_POLL', pagePath: location.pathname,
+      intentToken: intent.token, sourceUrl: intent.sourceUrl }); }
     catch { checkingHandoff = false; return; }
     checkingHandoff = false;
     if (!result?.ok || !result.found || handoffStarted) return;
+    if (result.original !== intent.sourceUrl || result.intentToken !== intent.token) {
+      fallbackBanner('HSTRY blocked a continuation from an unrelated conversation.');
+      return;
+    }
     // A worker response can arrive after an SPA navigation to another project.
     if (!onHandoffLanding(result.landingPath)) {
       resumeWhenComposerReady = true;
@@ -501,8 +546,10 @@
       if (onHandoffLanding(result.landingPath)) {
         throw new Error('ChatGPT has not created a new conversation. The handoff remains pending.');
       }
-      const done = await send({ type:'HSTRY_TAKEOVER_DONE', pagePath: location.pathname });
+      const done = await send({ type:'HSTRY_TAKEOVER_DONE', pagePath: location.pathname,
+        intentToken: intent.token, sourceUrl: intent.sourceUrl });
       if (!done?.ok || !done.completed) throw new Error(done?.error || 'Continuation completion was not verified');
+      sessionStorage.removeItem(INTENT_KEY);
     } catch (e) {
       if (!clicked) {
         handoffStarted = false;
@@ -553,7 +600,9 @@
   let observer;
   function scheduleWarningCheck() {
     // Background tabs throttle timers, but DOM changes can wake a ready composer.
-    if (resumeWhenComposerReady && editableElement()) {
+    const intent = readSourceIntent();
+    if (resumeWhenComposerReady && editableElement() && intent &&
+        onHandoffLanding(new URL(intent.landingUrl).pathname)) {
       resumeWhenComposerReady = false;
       void takeOverIfPending();
     }
