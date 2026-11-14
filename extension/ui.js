@@ -129,6 +129,8 @@ export function failureDisposition(failure) {
   if (failure.resolution === 'excluded-not-recovered') return ' (excluded; not recovered)';
   if (failure.resolution === 'empty-shell') return ' (verified empty; no history)';
   if (failure.resolvedAtMs) return ' (recovered)';
+  if (failure.accessVerification?.code === 'conversation_deleted' &&
+      failure.accessVerification.canRetry === false) return ' (deleted; not recovered)';
   if (failure.accessVerification?.canRetry === false) return ' (inaccessible; access required)';
   return '';
 }
@@ -136,10 +138,13 @@ export function failureDisposition(failure) {
 export function failureStatusMessage(total, details = []) {
   if (!total) return null;
   const inaccessible = details.filter(item => !item.resolvedAtMs &&
-    item.accessVerification?.code === 'conversation_inaccessible' &&
+    ['conversation_inaccessible', 'conversation_deleted'].includes(item.accessVerification?.code) &&
     item.accessVerification.canRetry === false);
   const distinct = new Set(inaccessible.map(item => item.conversationId).filter(Boolean)).size;
   if (distinct && inaccessible.length === total) {
+    if (inaccessible.every(item => item.accessVerification.code === 'conversation_deleted')) {
+      return `${distinct} distinct deleted conversation(s) across ${inaccessible.length} scope record${inaccessible.length === 1 ? '' : 's'}; not recoverable`;
+    }
     return `${distinct} distinct inaccessible conversation(s) across ${inaccessible.length} scope record${inaccessible.length === 1 ? '' : 's'}; verify source access or retention`;
   }
   if (distinct) {

@@ -60,6 +60,13 @@ const inaccessible = Array.from({ length: 13 }, (_, i) => ({ conversationId: 'id
 check('duplicate scopes do not inflate inaccessible conversation count', failureStatusMessage(13, inaccessible), '7 distinct inaccessible conversation(s) across 13 scope records; verify source access or retention');
 check('untracked attempts remain explicitly unresolved', failureStatusMessage(16, inaccessible), '16 unresolved failure records; 7 distinct inaccessible conversation(s), others remain retryable or untracked');
 check('resolved records do not inflate counts', failureStatusMessage(1, [{ ...inaccessible[0], resolvedAtMs: Date.now() }, inaccessible[0]]), '1 distinct inaccessible conversation(s) across 1 scope record; verify source access or retention');
+const deleted = { conversationId: 'gone', resolvedAtMs: null,
+  accessVerification: { code: 'conversation_deleted', canRetry: false } };
+check('deleted history is recorded as unrecoverable, not recovered',
+  failureStatusMessage(1, [deleted]),
+  '1 distinct deleted conversation(s) across 1 scope record; not recoverable');
+check('deleted history is not labeled recoverable', failureDisposition(deleted),
+  ' (deleted; not recovered)');
 check('zero failures clears status message', failureStatusMessage(0, inaccessible), null);
 check('excluded conversation is never labelled recovered',
   failureDisposition({ resolution: 'excluded-not-recovered', resolvedAtMs: now, accessVerification: { nativeStatus: 404 } }),

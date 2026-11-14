@@ -728,8 +728,11 @@ function resolveEmptyShell(failures, conversationId, accountKey) {
   }
 }
 
+const isTerminalAccessCode = code =>
+  code === 'conversation_inaccessible' || code === 'conversation_deleted';
+
 const isNonRetryableAccess = failure =>
-  failure?.accessVerification?.code === 'conversation_inaccessible' &&
+  isTerminalAccessCode(failure?.accessVerification?.code) &&
   failure.accessVerification.canRetry === false;
 
 const isIgnoredConversation = (state, id, scope) =>
@@ -1286,7 +1289,7 @@ export async function syncChatGPT({
         delete failure.lastTransportError;
       }
       failure.lastFailedAtMs = Date.now();
-      if (error.code === 'conversation_inaccessible' && error.canRetry === false) {
+      if (isTerminalAccessCode(error.code) && error.canRetry === false) {
         failure.accessVerification = {
           code: error.code, canRetry: false,
           source: 'ChatGPT conversation detail', verifiedAtMs: Date.now(),
@@ -1492,7 +1495,7 @@ export async function syncChatGPT({
               errorDiagnostic: failureDiagnostic(err),
               attempts: (previous?.attempts ?? 0) + 1,
               lastFailedAtMs: Date.now(), resolvedAtMs: null,
-              ...(err.code === 'conversation_inaccessible' && err.canRetry === false
+              ...(isTerminalAccessCode(err.code) && err.canRetry === false
                 ? { accessVerification: {
                   code: err.code, canRetry: false,
                   source: 'ChatGPT conversation detail', verifiedAtMs: Date.now(),
