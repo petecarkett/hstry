@@ -35,9 +35,10 @@ globalThis.fetch = async input => {
     const id = url.pathname.split('/').at(-1);
     calls.push(id);
     if (id === 'ordinary-404') return new Response('', { status: 404 });
-    if (id === 'inaccessible' && responseMode === 'inaccessible-404')
+    if (id === 'inaccessible' && ['inaccessible-404', 'deleted-404'].includes(responseMode))
       return Response.json({ detail: {
-        code: 'conversation_inaccessible', can_retry: false,
+        code: responseMode === 'deleted-404' ? 'conversation_deleted' : 'conversation_inaccessible',
+        can_retry: false,
       } }, { status: 404 });
     if (id !== 'healthy' && responseMode === 'all-healthy')
       throw new Error('Excluded or terminal conversation was fetched: ' + id);
@@ -69,6 +70,14 @@ try {
       error.canRetry === false,
   );
   assert.deepEqual(calls, ['inaccessible']);
+  calls.length = 0;
+  responseMode = 'deleted-404';
+  await assert.rejects(
+    fetchJson('https://chatgpt.com/backend-api/conversation/inaccessible', {}, { retries: 0 }),
+    error => error.status === 404 && error.code === 'conversation_deleted' &&
+      error.canRetry === false,
+  );
+  assert.deepEqual(calls, ['inaccessible'], 'deleted metadata needs no second request');
   calls.length = 0;
 
   // Migrated historical access failures must never consume a due retry.
@@ -113,6 +122,21 @@ try {
   assert.deepEqual(calls, ['healthy'], 'subsequent scan skips terminal inaccessible detail');
   assert.equal(resumed.failures, 1);
   assert.deepEqual(parsed, ['healthy']);
+
+  // Deleted conversations retain an explicit unresolved record, but never retry.
+  calls.length = 0;
+  parsed.length = 0;
+  responseMode = 'deleted-404';
+  const deleted = await run({ pending: pending(), ignoredFailures: [excluded] });
+  const deletedFailure = deleted.state.failureDetails.find(f => f.conversationId === 'inaccessible');
+  assert.equal(deletedFailure.accessVerification.code, 'conversation_deleted');
+  assert.equal(deletedFailure.accessVerification.canRetry, false);
+  assert.equal(deletedFailure.nextRetryAtMs, undefined);
+  calls.length = 0;
+  let continued = await run(deleted.state);
+  for (let i = 0; continued.hasMore && i < 8; i++) continued = await run(continued.state);
+  assert.deepEqual(calls, ['healthy'], 'deleted history must not be fetched again');
+  assert.equal(continued.failures, 1, 'deleted history must not be marked recovered');
 
   // An ordinary 404 without explicit can_retry=false remains retryable.
   await assert.rejects(

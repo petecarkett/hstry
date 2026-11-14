@@ -184,6 +184,10 @@ try {
     sourceId: projectOwner.sourceId, accountKey: projectOwner.accountKey,
     projectId: project, kind: 'native-404' },
   'verified terminal 404 must outrank completed automatic handoff receipts');
+  const deletedFailure = { ...failure(projectOwner), accessVerification: {
+    code: 'conversation_deleted', canRetry: false } };
+  assert.deepEqual(nextNativeRecoveryPriority({ pending: pending(), failureDetails: [deletedFailure] }),
+    nativeFirst, 'deleted conversation gets one canonical alternate-endpoint verification');
   assert.deepEqual(nextContinuationPriority(queue, receipts, state), task,
     'the competing automatic handoff remains independently eligible');
   assert.equal(nextNativeRecoveryPriority({ ...state,
