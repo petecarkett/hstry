@@ -16,6 +16,9 @@ let finished = false;
 let bannerCount = 0;
 let editorValue = '';
 let releaseFirstPoll;
+const sourceUrl = 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111';
+const intentToken = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+let sourceIntent = null;
 
 // ChatGPT uses a ProseMirror div[contenteditable][data-composer-markdown].
 const editor = {
@@ -28,12 +31,17 @@ const editor = {
 const sendButton = {
   disabled: false,
   getBoundingClientRect: () => ({ width: 42, height: 42 }),
-  click: () => { composerSends++; editorValue = ''; },
+  click: () => {
+    composerSends++;
+    editorValue = '';
+    context.location.pathname = '/c/99999999-aaaa-4bbb-8ccc-dddddddddddd';
+  },
 };
 const context = {
   document: {
     body: { textContent: '' },
     getElementById: () => null,
+    querySelector: () => null,
     querySelectorAll: selector => {
       if (selector.startsWith('#prompt-textarea') && selector.includes('[contenteditable="true"][data-composer-markdown]')) return ready ? [editor] : [];
       if (selector.startsWith('button[data-testid="send-button"]')) {
@@ -51,8 +59,13 @@ const context = {
     },
   },
   location: { pathname: '/' },
+  URL,
   addEventListener() {},
-  sessionStorage: { getItem: () => null, removeItem: () => {} },
+  sessionStorage: {
+    getItem: key => key === 'hstry.takeover.sourceIntent' && sourceIntent
+      ? JSON.stringify(sourceIntent) : null,
+    removeItem(key) { if (key === 'hstry.takeover.sourceIntent') sourceIntent = null; },
+  },
   HTMLTextAreaElement: class TextArea {},
   getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
   Event: class { constructor(type) { this.type = type; } },
@@ -76,9 +89,19 @@ const context = {
       onMessage: { addListener() {} },
       lastError: null,
       sendMessage: (message, callback) => {
+        if (message.type === 'HSTRY_TAKEOVER_STATUS') {
+          queueMicrotask(() => callback({ ok: true, found: false }));
+          return;
+        }
         sent.push(message.type);
+        if (message.type === 'HSTRY_TAKEOVER_POLL' ||
+            message.type === 'HSTRY_TAKEOVER_DONE') {
+          assert.equal(message.sourceUrl, sourceUrl);
+          assert.equal(message.intentToken, intentToken);
+        }
         const response = () => callback(message.type === 'HSTRY_TAKEOVER_POLL'
-          ? { ok: true, found: true, prompt: 'HSTRY recovery fixture prompt' }
+          ? { ok: true, found: true, prompt: 'HSTRY recovery fixture prompt',
+              original: sourceUrl, intentToken, landingPath: '/' }
           : { ok: true, completed: true });
         // A congested Chrome worker can hold the FIRST storage response for
         // minutes; this must not exhaust the landing retry window.
@@ -104,6 +127,11 @@ const flushTimers = () => {
 };
 
 await settle();
+assert.deepEqual(sent, [], 'unrelated new chat must not poll or consume another source');
+sourceIntent = { token: intentToken, sourceUrl, landingUrl: 'https://chatgpt.com/',
+  at: Date.now() };
+pollTick();
+await settle();
 assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL']);
 assert.equal(composerSends, 0, 'must not send before composer exists');
 assert.equal(finished, false, 'pending handoff must not be acknowledged prematurely');
@@ -126,12 +154,21 @@ assert.equal(pollCancelled, false, 'composer readiness must outlive 4 minutes of
 flushTimers(); // No composer yet.
 assert.equal(sent.length, 1);
 ready = true;
-observerCallback(); // Hidden-tab timers may be suspended when the composer mounts.
+context.location.pathname = '/g/g-p-6a81a59c80e48191a14c2f7c5ccdd387-krar-vst';
+observerCallback();
+await settle();
+assert.equal(composerSends, 0,
+  'a delayed source-A handoff must not write or send in project B');
+assert.equal(finished, false, 'cross-project page must not receive a completion receipt');
+context.location.pathname = '/';
+observerCallback(); // Returning to the intended landing may resume the handoff.
 await settle(); // No timer ticks: the DOM change itself must resume the handoff.
 assert.equal(editorValue, '', 'native submit clears the input');
 assert.equal(composerSends, 1);
 assert.equal(finished, true);
-assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_DONE']);
+assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_POLL',
+  'HSTRY_TAKEOVER_DONE'],
+  'wrong-project navigation must not consume a poll or lose the pending handoff');
 assert.equal(bannerCount, 0);
 
 observerCallback();

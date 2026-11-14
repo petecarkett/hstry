@@ -15,11 +15,34 @@
   // A prior extension instance can leave an orphaned DOM button behind.
   // Replace it so its invalidated click handler can no longer be invoked.
   document.getElementById('hstry-continue-chat')?.remove();
+  document.getElementById('hstry-open-continuation')?.remove();
 
   const RETRY_KEY = 'hstry.takeover.retryAfterReload';
+  const INTENT_KEY = 'hstry.takeover.sourceIntent';
+  // A source action, not merely arriving at a new-chat landing, authorizes
+  // consuming the pending prompt. This survives same-tab navigation only.
+  function readSourceIntent() {
+    try {
+      const record = JSON.parse(sessionStorage.getItem(INTENT_KEY) || 'null');
+      if (typeof record?.token !== 'string' ||
+          !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(record.token) ||
+          typeof record.sourceUrl !== 'string' ||
+          typeof record.landingUrl !== 'string' ||
+          !Number.isFinite(record.at) ||
+          Date.now() < record.at || Date.now() - record.at >= 30 * 60_000) return null;
+      const source = new URL(record.sourceUrl);
+      const landing = new URL(record.landingUrl);
+      if (source.origin !== 'https://chatgpt.com' ||
+          landing.origin !== source.origin ||
+          !/^\/c\/[0-9a-f-]{36}$/i.test(source.pathname) &&
+          !/^\/g\/g-p-[^/]+\/c\/[0-9a-f-]{36}$/i.test(source.pathname)) return null;
+      return record;
+    } catch { return null; }
+  }
   const RETRY_TTL_MS = 60_000;
   let retryOnce = false;
   let resumePending = false;
+  let reloadRecord = null;
   try {
     const saved = sessionStorage.getItem(RETRY_KEY);
     sessionStorage.removeItem(RETRY_KEY);
@@ -28,6 +51,7 @@
       if (retry?.path === location.pathname &&
           Number.isFinite(retry.at) && Date.now() - retry.at < RETRY_TTL_MS &&
           Date.now() >= retry.at) {
+        reloadRecord = retry;
         resumePending = true;
         retryOnce = true;
       }
@@ -35,10 +59,11 @@
   } catch { /* Session storage is optional; normal clicks still work. */ }
 
   const WARNING = /you(?:'|\u2019)ve\s+reached\s+the\s+maximum\s+length\s+for\s+this\s+conversation/i;
-  let serverLimitPath = null;
-  let rejectedMessage = '';
-  let rejectedHasAttachments = false;
-  let rejectedTooLong = false;
+  let serverLimitPath = reloadRecord?.serverLimit ? location.pathname : null;
+  let rejectedMessage = typeof reloadRecord?.failedMessage === 'string' &&
+    reloadRecord.failedMessage.length <= 8000 ? reloadRecord.failedMessage : '';
+  let rejectedHasAttachments = reloadRecord?.missingAttachments === true;
+  let rejectedTooLong = reloadRecord?.oversized === true;
   let resumeWhenComposerReady = false;
   let submittedPath = null;
   let autoAttemptedPath = null;
@@ -62,6 +87,9 @@
     const action = event.target?.closest?.('button, a, [role="button"], [role="menuitem"]');
     const name = (action?.getAttribute?.('aria-label') || action?.textContent || '').trim();
     if (/^new chat$/i.test(name)) {
+      // A deliberate New Chat action is not consent to reuse a pending
+      // continuation from an earlier conversation in this browser tab.
+      sessionStorage.removeItem(INTENT_KEY);
       newChatLanding = true; landingPath = location.pathname;
       newChatSubmitted = false; autoTitleAttempted = false;
       firstSubmittedAtMs = null; manualTitleEdit = false; titleTargetPath = null;
@@ -186,6 +214,62 @@
     } catch (err) { reject(err); }
   });
 
+  let lastStatusPath = null, lastStatusAt = 0, checkingStatus = false;
+  async function showContinuationStatus() {
+    const path = location.pathname;
+    const old = document.getElementById('hstry-open-continuation');
+    if (!/\/c\/[0-9a-f-]{36}\/?$/i.test(path)) {
+      old?.remove();
+      return;
+    }
+    if (checkingStatus || (lastStatusPath === path && Date.now() - lastStatusAt < 12_000)) return;
+    lastStatusPath = path;
+    lastStatusAt = Date.now();
+    checkingStatus = true;
+    let result;
+    try {
+      result = await send({ type: 'HSTRY_TAKEOVER_STATUS', sourceUrl: location.href });
+    } catch { checkingStatus = false; return; }
+    checkingStatus = false;
+    if (location.pathname !== path) return;
+    if (!result?.ok || !result.found) { old?.remove(); return; }
+    const canOpen = result.status === 'completed' && result.hasDestination;
+    let button = document.getElementById('hstry-open-continuation');
+    if (!button) {
+      button = document.createElement('button');
+      button.id = 'hstry-open-continuation';
+      button.type = 'button';
+      button.style.cssText = 'position:fixed;right:20px;bottom:145px;z-index:999999;'+
+        'padding:9px 16px;border-radius:24px;border:1px solid #7d9e88;'+
+        'background:#305e46;color:white;cursor:pointer;font:14px sans-serif';
+      button.addEventListener('click', async () => {
+        if (button.disabled) return;
+        button.disabled = true;
+        button.textContent = 'Opening continuation...';
+        let timer;
+        try {
+          const response = await Promise.race([
+            send({ type: 'HSTRY_TAKEOVER_OPEN', sourceUrl: location.href }),
+            new Promise((_, reject) => { timer = setTimeout(() =>
+              reject(new Error('HSTRY did not confirm the continuation tab.')), 30_000); }),
+          ]);
+          if (!response?.ok) throw new Error(response?.error || 'Cannot open continuation');
+          button.textContent = 'Continuation opened';
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = 'Open continuation';
+          fallbackBanner('HSTRY: ' + String(error?.message || error));
+        } finally { clearTimeout(timer); }
+      });
+      document.body.append(button);
+    }
+    button.disabled = !canOpen;
+    button.textContent = canOpen ? 'Open continuation' :
+      result.status === 'completed' ? 'Continuation recorded (link missing)' : 'Continuation pending';
+    button.title = canOpen ? 'Focus the continuation tab or reopen it in a new tab' :
+      'No verified destination URL is stored. HSTRY will not guess or create a duplicate.';
+  }
+
   async function startTakeover(btn, automatic = false) {
     if (btn.disabled) return;
     if (serverLimitPath === location.pathname && rejectedTooLong) {
@@ -207,12 +291,48 @@
     }
     btn.disabled = true;
     btn.textContent = 'Opening continuation...';
+    let startTimeout;
     try {
-      const result = await send({ type: 'HSTRY_TAKEOVER_START', automatic,
-        failedMessage: serverLimitPath === location.pathname ? rejectedMessage : '',
-        missingAttachments: serverLimitPath === location.pathname && rejectedHasAttachments });
+      const result = await Promise.race([
+        send({ type: 'HSTRY_TAKEOVER_START', automatic, sourceUrl: location.href,
+          failedMessage: serverLimitPath === location.pathname ? rejectedMessage : '',
+          missingAttachments: serverLimitPath === location.pathname && rejectedHasAttachments }),
+        new Promise((_, reject) => { startTimeout = setTimeout(() => reject(new Error(
+          'HSTRY did not confirm navigation. Check this tab before retrying.')), 30_000); }),
+      ]);
       if (!result?.ok) throw new Error(result?.error || 'Unable to open the new chat');
-      btn.textContent = result.existing ? 'Continuation already opened' : 'Continuing in this tab';
+      if (result.existing) {
+        btn.textContent = result.completed ? 'Continuation already completed' : 'Continuation already opened';
+      } else {
+        const projectPath = location.pathname.replace(/\/c\/[0-9a-f-]{36}$/i, '') || '/';
+        const expected = 'https://chatgpt.com' + projectPath;
+        if (result.landingUrl !== expected) throw new Error('HSTRY destination does not match this chat project');
+        if (typeof result.intentToken !== 'string' ||
+            typeof result.sourceUrl !== 'string') {
+          throw new Error('HSTRY did not bind the continuation to its source.');
+        }
+        const sourceUrl = new URL(location.href);
+        sourceUrl.search = '';
+        sourceUrl.hash = '';
+        if (result.sourceUrl !== sourceUrl.href) {
+          throw new Error('HSTRY source changed before handoff navigation.');
+        }
+        sessionStorage.setItem(INTENT_KEY, JSON.stringify({
+          token: result.intentToken, sourceUrl: result.sourceUrl,
+          landingUrl: expected, at: Date.now(),
+        }));
+        btn.textContent = 'Continuing in this tab';
+        const sourcePath = location.pathname;
+        // If navigation is blocked, leave the existing saved handoff retryable.
+        setTimeout(() => {
+          if (location.pathname === sourcePath) {
+            btn.disabled = false;
+            btn.textContent = 'Continue with HSTRY';
+            fallbackBanner('HSTRY saved the handoff, but this tab did not navigate. Check before retrying.');
+          }
+        }, 30_000);
+        location.assign(expected);
+      }
     } catch (err) {
       btn.disabled = false;
       btn.textContent = 'Continue with HSTRY';
@@ -223,8 +343,12 @@
         // One reload restores a current extension context. A tab-local marker
         // resumes this user-initiated action exactly once after navigation.
         try {
-          sessionStorage.setItem(RETRY_KEY,
-            JSON.stringify({ path: location.pathname, at: Date.now() }));
+          sessionStorage.setItem(RETRY_KEY, JSON.stringify({
+            path: location.pathname, at: Date.now(), automatic,
+            serverLimit: serverLimitPath === location.pathname,
+            failedMessage: serverLimitPath === location.pathname ? rejectedMessage : '',
+            missingAttachments: rejectedHasAttachments, oversized: rejectedTooLong,
+          }));
           location.reload();
           return;
         } catch { /* Do not reload if the marker could not be stored. */ }
@@ -232,6 +356,8 @@
       fallbackBanner(/extension context invalidated/i.test(message)
         ? 'HSTRY was updated but the extension is still unavailable. Refresh this chat and try again.'
         : 'HSTRY takeover: ' + message);
+    } finally {
+      clearTimeout(startTimeout);
     }
   }
 
@@ -289,13 +415,7 @@
       btn.style.cssText += 'position:fixed;right:20px;bottom:85px;z-index:999999;';
       document.body.append(btn);
     }
-    if (resumePending) {
-      resumePending = false;
-      submittedPath = null;
-      void startTakeover(btn);
-    } else if (explicitLimit || newTerminalError) {
-      autoContinue(btn);
-    }
+    if (explicitLimit || newTerminalError) autoContinue(btn);
   }
 
   function editableElement() {
@@ -348,17 +468,37 @@
     document.body.append(b);
   }
 
+  function onHandoffLanding(landingPath) {
+    if (typeof landingPath !== 'string' || !landingPath.startsWith('/')) return false;
+    const path = location.pathname.replace(/\/$/, '') || '/';
+    const expected = landingPath.replace(/\/$/, '') || '/';
+    return path === expected || (expected !== '/' && path === expected + '/project');
+  }
+
   async function takeOverIfPending() {
     if (handoffStarted || checkingHandoff ||
         (resumeWhenComposerReady && !editableElement())) return;
+    const intent = readSourceIntent();
+    if (!intent || !onHandoffLanding(new URL(intent.landingUrl).pathname)) return;
     checkingHandoff = true;
     let result;
-    try { result = await send({ type:'HSTRY_TAKEOVER_POLL' }); }
+    try { result = await send({ type:'HSTRY_TAKEOVER_POLL', pagePath: location.pathname,
+      intentToken: intent.token, sourceUrl: intent.sourceUrl }); }
     catch { checkingHandoff = false; return; }
     checkingHandoff = false;
     if (!result?.ok || !result.found || handoffStarted) return;
+    if (result.original !== intent.sourceUrl || result.intentToken !== intent.token) {
+      fallbackBanner('HSTRY blocked a continuation from an unrelated conversation.');
+      return;
+    }
+    // A worker response can arrive after an SPA navigation to another project.
+    if (!onHandoffLanding(result.landingPath)) {
+      resumeWhenComposerReady = true;
+      return;
+    }
     handoffStarted = true;
     const prompt = result.prompt;
+    let clicked = false;
     try {
       const editor = editableElement();
       if (!editor) {
@@ -370,22 +510,27 @@
         return;
       }
       resumeWhenComposerReady = false;
+      if (!onHandoffLanding(result.landingPath)) throw new Error('Destination project changed before composing');
       if (!enterPrompt(editor, prompt)) throw new Error('ChatGPT did not accept the takeover text');
       // Wait for ChatGPT to enable its native send control.
       let button;
       for (let i = 0; i < 20; i++) {
+        if (!onHandoffLanding(result.landingPath)) throw new Error('Destination project changed before sending');
         button = sendButton();
         if (button) break;
         await pause(250);
       }
       if (!button) throw new Error('Takeover text is ready; send it manually');
+      if (!onHandoffLanding(result.landingPath)) throw new Error('Destination project changed before sending');
       const handoffSubmitAtMs = Date.now();
       button.click();
+      clicked = true;
       // A native click alone is not a successful submission. Keep the handoff
       // pending if ChatGPT leaves the instruction in the composer.
       let submitted = false;
       for (let i = 0; i < 40; i++) {
-        if (!(editor.value || editor.textContent || '').includes(prompt.slice(0, 32))) {
+        if (!onHandoffLanding(result.landingPath) ||
+            !(editor.value || editor.textContent || '').includes(prompt.slice(0, 32))) {
           submitted = true;
           break;
         }
@@ -397,10 +542,24 @@
         firstSubmittedAtMs ??= handoffSubmitAtMs;
         scheduleWarningCheck();
       }
-      await send({ type:'HSTRY_TAKEOVER_DONE' });
+      for (let i = 0; i < 40 && onHandoffLanding(result.landingPath); i++) await pause(250);
+      if (onHandoffLanding(result.landingPath)) {
+        throw new Error('ChatGPT has not created a new conversation. The handoff remains pending.');
+      }
+      const done = await send({ type:'HSTRY_TAKEOVER_DONE', pagePath: location.pathname,
+        intentToken: intent.token, sourceUrl: intent.sourceUrl });
+      if (!done?.ok || !done.completed) throw new Error(done?.error || 'Continuation completion was not verified');
+      sessionStorage.removeItem(INTENT_KEY);
     } catch (e) {
-      fallbackBanner('HSTRY takeover: ' + String(e.message || e) +
-        '. If the instruction is in the composer, press Send. Otherwise retry from the original chat.');
+      if (!clicked) {
+        handoffStarted = false;
+        resumeWhenComposerReady = true;
+      }
+      const message = String(e.message || e);
+      fallbackBanner(/Destination project changed/.test(message)
+        ? 'HSTRY paused because the tab changed projects. Do not send the continuation here; return to its original project.'
+        : 'HSTRY takeover: ' + message +
+          '. If the instruction is in the composer, press Send. Otherwise retry from the original chat.');
     }
   }
 
@@ -441,10 +600,13 @@
   let observer;
   function scheduleWarningCheck() {
     // Background tabs throttle timers, but DOM changes can wake a ready composer.
-    if (resumeWhenComposerReady && editableElement()) {
+    const intent = readSourceIntent();
+    if (resumeWhenComposerReady && editableElement() && intent &&
+        onHandoffLanding(new URL(intent.landingUrl).pathname)) {
       resumeWhenComposerReady = false;
       void takeOverIfPending();
     }
+    void showContinuationStatus();
     clearTimeout(detectionTimer);
     detectionTimer = setTimeout(() => { detectLimit(); maybeNameNewChat(); }, 700);
   }
@@ -466,5 +628,13 @@
     observer = new MutationObserver(scheduleWarningCheck);
     observer.observe(document.body, { childList: true, subtree: true });
     scheduleWarningCheck();
+  }
+  if (resumePending) {
+    // The terminal panel may vanish on reload; the exact-path, one-shot
+    // receipt, not a surviving error DOM, authorizes resuming this action.
+    resumePending = false;
+    submittedPath = null;
+    autoAttemptedPath = location.pathname;
+    void startTakeover(document.createElement('button'), reloadRecord?.automatic === true);
   }
 })();
