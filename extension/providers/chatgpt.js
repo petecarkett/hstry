@@ -1010,6 +1010,16 @@ export async function syncChatGPT({
     }
     if (isNonRetryableAccess(failure)) delete failure.nextRetryAtMs;
   }
+  // Retire a legacy continuation only when its exact source, owner and project
+  // are now explicitly non-retryable. Staged native pages remain preserved.
+  for (const slot of ['priority', 'parkedPriority']) {
+    const task = pending[slot];
+    if (task?.kind === 'continuation' && !task.stage &&
+        failureDetails.some(failure => !failure.resolvedAtMs &&
+          isNonRetryableAccess(failure) && sameRecoveryTarget(failure, task))) {
+      delete pending[slot];
+    }
+  }
   let total = 0;
   let thisRun = 0;
   let pagesThisRun = 0;

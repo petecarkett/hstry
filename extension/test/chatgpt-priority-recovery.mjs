@@ -85,6 +85,10 @@ assert.equal(nextContinuationPriority(queue, receipts,
 assert.equal(nextContinuationPriority(queue, receipts, { pending: pending(),
   ignoredFailures: [{ conversationId: id, accountKey: personal.accountKey, projectId: null }] }),
   null, 'user exclusion must remain authoritative');
+assert.equal(nextContinuationPriority(queue, receipts, { pending: pending(),
+  failureDetails: [{ conversationId: id, accountKey: personal.accountKey, projectId: null,
+    resolvedAtMs: null, accessVerification: { code: 'conversation_deleted', canRetry: false } }] }),
+  null, 'deleted conversation must not regenerate a continuation task');
 assert.equal(nextContinuationPriority({ ...queue, duplicate: {
   conversationId: id, projectId: null, indexedSource: 'other-source' } },
   receipts, { pending: pending() }), null, 'ambiguous ownership must fail closed');
@@ -402,6 +406,24 @@ try {
   assert.equal(resumedContinuation.state.pending.parkedPriority, undefined);
   assert.deepEqual(resumedContinuation.state.pending.priorityDoneIds, [inaccessible]);
   assert.equal(ingests.length, 1);
+
+  // An old parked continuation is retired for a matching terminal 404.
+  // The existing once-only native recovery path remains available.
+  requests = []; ingests = []; confirmations = [];
+  mode = 'native-inaccessible';
+  const terminalParked = { ...parked, sourceId: projectOwner.sourceId,
+    accountKey: projectOwner.accountKey, projectId: project };
+  const terminalFailure = { ...failure(projectOwner),
+    nextRetryAtMs: Date.now() + 3_600_000,
+    accessVerification: { code: 'conversation_deleted', canRetry: false } };
+  const retired = await run({ pending: { ...pending(), parkedPriority: terminalParked },
+    failureDetails: [terminalFailure] });
+  assert.equal(retired.state.pending.parkedPriority, undefined);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  assert.equal(retired.state.failureDetails[0].accessVerification.nativeStatus, 404);
+  assert.equal(retired.state.failureDetails[0].nextRetryAtMs, undefined);
+  assert.equal(retired.state.failureDetails[0].resolvedAtMs, null);
+  mode = 'healthy';
 
   // A staged partial native response cannot be discarded when its worker
   // backoff outlasts the ordinary scan, nor retried through the old endpoint.
