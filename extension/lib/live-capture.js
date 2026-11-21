@@ -185,7 +185,11 @@ export function nextContinuationPriority(queue, receipts, state) {
           typeof matching[0].accountId !== 'string')) ||
         (state.ignoredFailures ?? []).some(entry =>
           entry.conversationId === id && entry.accountKey === matching[0].accountKey &&
-          (entry.projectId ?? null) === capture.projectId)) return null;
+          (entry.projectId ?? null) === capture.projectId) ||
+        (state.failureDetails ?? []).some(entry => !entry.resolvedAtMs &&
+          entry.conversationId === id && entry.accountKey === matching[0].accountKey &&
+          (entry.projectId ?? null) === capture.projectId &&
+          entry.accessVerification?.canRetry === false)) return null;
     return { conversationId: id, sourceId: capture.sourceId,
       accountKey: matching[0].accountKey, projectId: capture.projectId,
       kind: 'continuation' };
