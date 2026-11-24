@@ -169,18 +169,29 @@ pub async fn ingest_live_capture(
             .execute(&mut *tx).await?;
         id.to_string()
     };
-    let prev = sqlx::query(
-        "SELECT id,idx,content,metadata FROM messages WHERE conversation_id=? AND client_id=? ORDER BY idx LIMIT 1"
-    ).bind(&hstry_id).bind(message.to_string()).fetch_optional(&mut *tx).await?;
-    let status = if let Some(row) = prev {
-        let idx: i64 = row.get("idx");
+    // A live observation may be a streaming edit or a different branch of an
+    // already verified message. Never overwrite the canonical row or its proof.
+    let existing = sqlx::query(
+        "SELECT id,idx,content FROM messages WHERE conversation_id=? AND client_id=? ORDER BY idx DESC",
+    )
+    .bind(&hstry_id)
+    .bind(message.to_string())
+    .fetch_all(&mut *tx)
+    .await?;
+    let canonical_matches = existing.iter().any(|row| {
+        row.get::<i64, _>("idx") < LIVE_BASE && row.get::<String, _>("content") == capture.content
+    });
+    let provisional = existing
+        .iter()
+        .find(|row| row.get::<i64, _>("idx") >= LIVE_BASE);
+    let status = if canonical_matches {
+        "unchanged"
+    } else if let Some(row) = provisional {
         let id: String = row.get("id");
         let content: String = row.get("content");
         if content == capture.content {
             "unchanged"
         } else {
-            // Update the SAME message ID in place, including an existing canonical
-            // row, so active editing cannot create a duplicate search result.
             sqlx::query("UPDATE messages SET content=?,metadata=? WHERE id=?")
                 .bind(&capture.content)
                 .bind(
@@ -190,11 +201,7 @@ pub async fn ingest_live_capture(
                 .bind(&id)
                 .execute(&mut *tx)
                 .await?;
-            if idx < LIVE_BASE {
-                "updated-canonical"
-            } else {
-                "updated"
-            }
+            "updated"
         }
     } else {
         let next: i64 = sqlx::query_scalar(

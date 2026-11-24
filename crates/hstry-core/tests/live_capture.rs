@@ -132,6 +132,61 @@ async fn live_turns_search_and_merge_without_duplicates() -> Result<()> {
         .await?;
     assert_eq!(db.get_messages(id).await?.len(), 1);
 
+    // A matching canonical observation is already verified: do not duplicate it.
+    live.content = "distinctive canonical needle final".into();
+    assert_eq!(
+        ingest_live_capture(&db, source, &live).await?.status,
+        "unchanged"
+    );
+    assert_eq!(db.get_messages(id).await?.len(), 1);
+
+    // A later browser observation must never downgrade or overwrite the
+    // verified canonical message, even when its upstream message ID matches.
+    live.content = "distinctive later live observation gamma".into();
+    assert_eq!(
+        ingest_live_capture(&db, source, &live).await?.status,
+        "created"
+    );
+    let observed = db.get_messages(id).await?;
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].idx, 0);
+    assert_eq!(observed[0].content, "distinctive canonical needle final");
+    assert!(observed[0].metadata.get("liveProvisional").is_none());
+    assert!(observed[1].idx >= 1_000_000_000);
+    assert_eq!(observed[1].client_id.as_deref(), Some(message));
+    assert_eq!(observed[1].content, live.content);
+    assert_eq!(observed[1].metadata["liveProvisional"], true);
+    assert_eq!(
+        db.read_page(id, ReadOptions::default())
+            .await?
+            .unverified_live_messages,
+        1
+    );
+    assert_eq!(
+        ingest_live_capture(&db, source, &live).await?.status,
+        "unchanged"
+    );
+    live.content = "distinctive later live observation delta".into();
+    assert_eq!(
+        ingest_live_capture(&db, source, &live).await?.status,
+        "updated"
+    );
+    let observed = db.get_messages(id).await?;
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].content, "distinctive canonical needle final");
+    assert!(observed[0].metadata.get("liveProvisional").is_none());
+    assert_eq!(observed[1].content, live.content);
+    let mut refreshed = canonical.clone();
+    refreshed.messages[0].content = live.content.clone();
+    let result = ingest_batch(&db, source, vec![refreshed]).await?;
+    db.rebuild_conversation_summaries(&result.affected_conversation_ids)
+        .await?;
+    let confirmed = db.get_messages(id).await?;
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(confirmed[0].idx, 0);
+    assert_eq!(confirmed[0].content, live.content);
+    assert!(confirmed[0].metadata.get("liveProvisional").is_none());
+
     // A real project move must NOT retain a stale name from the old project.
     let destination = "g-p-11111111111111111111111111111111";
     let mut moved = canonical.clone();
