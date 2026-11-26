@@ -102,10 +102,11 @@
 
   async function renameUsingChatGPT(oldTitle, newTitle, path) {
     if (location.pathname !== path || document.title !== oldTitle ||
-        document.querySelector('[role="menu"], input[name="title-editor"]') ||
+        document.querySelector('[role="menu"], input[name="title-editor"], input[data-inline-rename-input="true"]') ||
         (editableElement()?.textContent || editableElement()?.value || '').trim()) return false;
     const header = [...document.querySelectorAll('main button[aria-haspopup="menu"]')]
-      .find(button => button.textContent?.trim() === oldTitle);
+      .find(button => button.textContent?.trim() === oldTitle) ??
+      document.querySelector('main button[aria-label="Chat actions"][aria-haspopup="menu"]');
     if (!header) return false;
     // ChatGPT's Radix title menu listens to pointerdown, not element.click().
     header.dispatchEvent(new PointerEvent('pointerdown', {
@@ -115,7 +116,11 @@
     await pause(140);
     if (location.pathname !== path) return false;
     const rename = [...document.querySelectorAll('[role="menuitem"]')]
-      .find(item => item.textContent?.trim().toLowerCase() === 'rename');
+      .find(item => {
+        const label = item.textContent?.trim().toLowerCase();
+        return label === 'rename' ||
+          (label === 'renamer' && item.getAttribute('aria-keyshortcuts') === 'R');
+      });
     if (!rename) return false;
     rename.click();
     await pause(140);
@@ -127,11 +132,20 @@
     setter.call(editor, newTitle);
     editor.dispatchEvent(new Event('input', { bubbles: true }));
     await pause(75);
-    const save = [...(editor.closest('[role="dialog"]')?.querySelectorAll('button[type="submit"]') ?? [])]
-      .find(button => button.textContent?.trim() === 'Save' && !button.disabled);
-    if (!save || location.pathname !== path || document.title !== oldTitle ||
-        editor.value !== newTitle) return false;
-    save.click();
+    if (editor.matches?.('[data-inline-rename-input="true"]')) {
+      // The current ChatGPT header commits its inline title on Enter.
+      if (location.pathname !== path || document.title !== oldTitle ||
+          editor.value !== newTitle) return false;
+      editor.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true, cancelable: true, key: 'Enter', code: 'Enter',
+      }));
+    } else {
+      const save = [...(editor.closest('[role="dialog"]')?.querySelectorAll('button[type="submit"]') ?? [])]
+        .find(button => button.textContent?.trim() === 'Save' && !button.disabled);
+      if (!save || location.pathname !== path || document.title !== oldTitle ||
+          editor.value !== newTitle) return false;
+      save.click();
+    }
     for (let i = 0; i < 10; i++) {
       await pause(200);
       if (location.pathname !== path) break;
