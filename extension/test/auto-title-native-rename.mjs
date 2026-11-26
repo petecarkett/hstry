@@ -62,3 +62,80 @@ assert.equal(await renameUsingChatGPT(original, named, path), false,
   'already renamed conversation cannot be renamed again');
 assert.equal(saved, 1);
 console.log('PASS native ChatGPT Rename: Radix pointerdown, input event, Save, read-back, no retry');
+
+// Current ChatGPT UI: an icon-only Chat actions menu, RenameR shortcut label,
+// and an inline Chat title editor which commits on Enter (no Save dialog).
+{
+  let menuOpen = false, inlineOpen = false, pointerOpened = false;
+  let inputDispatched = false, commits = 0;
+  const oldTitle = 'QA verification';
+  const newTitle = '2026-11-26 19:07 — 1hood — QA verification';
+  class InlineInput {
+    constructor() { this._value = oldTitle; }
+    get value() { return this._value; }
+    set value(value) { this._value = value; }
+    matches(selector) { return selector === '[data-inline-rename-input="true"]'; }
+    dispatchEvent(event) {
+      if (event.type === 'input') inputDispatched = true;
+      if (event.type === 'keydown' && event.key === 'Enter') {
+        assert(inputDispatched, 'React input must update before Enter');
+        commits++;
+        doc.title = this.value;
+        inlineOpen = false;
+      }
+    }
+    closest() { return null; }
+  }
+  const inlineEditor = new InlineInput();
+  const chatActions = {
+    textContent: '',
+    dispatchEvent(event) {
+      assert.equal(event.type, 'pointerdown');
+      pointerOpened = true;
+      menuOpen = true;
+    },
+  };
+  const renameMenuItem = {
+    textContent: 'RenameR',
+    getAttribute(name) { return name === 'aria-keyshortcuts' ? 'R' : null; },
+    click() { assert(menuOpen); menuOpen = false; inlineOpen = true; },
+  };
+  const doc = {
+    title: oldTitle,
+    querySelector(selector) {
+      if (selector.includes('input[data-inline-rename-input="true"]') && inlineOpen) return inlineEditor;
+      if (selector === 'main button[aria-label="Chat actions"][aria-haspopup="menu"]') return chatActions;
+      if (selector === 'input[name="title-editor"], input[aria-label="Chat title"]') {
+        return inlineOpen ? inlineEditor : null;
+      }
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === 'main button[aria-haspopup="menu"]') return [];
+      if (selector === '[role="menuitem"]') return menuOpen ? [renameMenuItem] : [];
+      return [];
+    },
+  };
+  const inlineContext = {
+    document: doc, location: { pathname: path },
+    editableElement: () => ({ value: '', textContent: '' }),
+    pause: async () => {}, HTMLInputElement: InlineInput,
+    PointerEvent: class { constructor(type, init) { Object.assign(this, { type, ...init }); } },
+    Event: class { constructor(type, init) { Object.assign(this, { type, ...init }); } },
+    KeyboardEvent: class { constructor(type, init) { Object.assign(this, { type, ...init }); } },
+  };
+  const runInline = vm.runInNewContext(`(function () { ${helper}\nreturn renameUsingChatGPT; })()`, inlineContext);
+  inlineOpen = true;
+  assert.equal(await runInline(oldTitle, newTitle, path), false,
+    'never take over an inline title the user is editing');
+  inlineOpen = false;
+  assert.equal(await runInline(oldTitle, newTitle, path), true,
+    'current Chat actions and inline editor must rename successfully');
+  assert(pointerOpened, 'Chat actions menu must open via pointerdown');
+  assert.equal(commits, 1, 'inline rename must commit exactly once');
+  assert.equal(doc.title, newTitle);
+  assert.equal(await runInline(oldTitle, newTitle, path), false,
+    'readback prevents any second title write');
+  assert.equal(commits, 1);
+}
+console.log('PASS current Chat actions + inline title editor: native Enter, once-only commit');
