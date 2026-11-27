@@ -95,15 +95,25 @@
       firstSubmittedAtMs = null; manualTitleEdit = false; titleTargetPath = null;
       lastObservedTitle = ''; titleStableSinceMs = 0; clearTimeout(titleWaitTimer);
     }
-    if (action?.getAttribute?.('role') === 'menuitem' && /^rename$/i.test(name)) {
+    if (action?.getAttribute?.('role') === 'menuitem' &&
+        (/^rename$/i.test(name) || (/^renamer$/i.test(name) && action.getAttribute('aria-keyshortcuts') === 'R'))) {
       manualTitleEdit = true;
     }
   }, true);
 
   async function renameUsingChatGPT(oldTitle, newTitle, path) {
-    if (location.pathname !== path || document.title !== oldTitle ||
-        document.querySelector('[role="menu"], input[name="title-editor"], input[data-inline-rename-input="true"]') ||
-        (editableElement()?.textContent || editableElement()?.value || '').trim()) return false;
+    const stillSame = () => location.pathname === path && document.title === oldTitle &&
+      !manualTitleEdit && !(editableElement()?.textContent || editableElement()?.value || '').trim();
+    const waitFor = async read => {
+      for (let i = 0; i <= 20 && stillSame(); i++) {
+        const found = read();
+        if (found) return found;
+        if (i < 20) await pause(100);
+      }
+      return null;
+    };
+    if (!stillSame() ||
+        document.querySelector('[role="menu"], input[name="title-editor"], input[data-inline-rename-input="true"]')) return false;
     const header = [...document.querySelectorAll('main button[aria-haspopup="menu"]')]
       .find(button => button.textContent?.trim() === oldTitle) ??
       document.querySelector('main button[aria-label="Chat actions"][aria-haspopup="menu"]');
@@ -113,20 +123,16 @@
       bubbles: true, pointerId: 1, pointerType: 'mouse',
       button: 0, buttons: 1, isPrimary: true,
     }));
-    await pause(140);
-    if (location.pathname !== path) return false;
-    const rename = [...document.querySelectorAll('[role="menuitem"]')]
+    const rename = await waitFor(() => [...document.querySelectorAll('[role="menuitem"]')]
       .find(item => {
         const label = item.textContent?.trim().toLowerCase();
         return label === 'rename' ||
           (label === 'renamer' && item.getAttribute('aria-keyshortcuts') === 'R');
-      });
-    if (!rename) return false;
+      }));
+    if (!rename || !stillSame()) return false;
     rename.click();
-    await pause(140);
-    const editor = document.querySelector('input[name="title-editor"], input[aria-label="Chat title"]');
-    if (!editor || location.pathname !== path || document.title !== oldTitle ||
-        editor.value?.trim() !== oldTitle) return false;
+    const editor = await waitFor(() => document.querySelector('input[name="title-editor"], input[aria-label="Chat title"]'));
+    if (!editor || !stillSame() || editor.value?.trim() !== oldTitle) return false;
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
     if (!setter) return false;
     setter.call(editor, newTitle);
@@ -134,16 +140,14 @@
     await pause(75);
     if (editor.matches?.('[data-inline-rename-input="true"]')) {
       // The current ChatGPT header commits its inline title on Enter.
-      if (location.pathname !== path || document.title !== oldTitle ||
-          editor.value !== newTitle) return false;
+      if (!stillSame() || editor.value !== newTitle) return false;
       editor.dispatchEvent(new KeyboardEvent('keydown', {
         bubbles: true, cancelable: true, key: 'Enter', code: 'Enter',
       }));
     } else {
-      const save = [...(editor.closest('[role="dialog"]')?.querySelectorAll('button[type="submit"]') ?? [])]
-        .find(button => button.textContent?.trim() === 'Save' && !button.disabled);
-      if (!save || location.pathname !== path || document.title !== oldTitle ||
-          editor.value !== newTitle) return false;
+      const save = await waitFor(() => [...(editor.closest('[role="dialog"]')?.querySelectorAll('button[type="submit"]') ?? [])]
+        .find(button => button.textContent?.trim() === 'Save' && !button.disabled));
+      if (!save || !stillSame() || editor.value !== newTitle) return false;
       save.click();
     }
     for (let i = 0; i < 10; i++) {
