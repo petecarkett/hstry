@@ -545,19 +545,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       if (sender.id !== chrome.runtime.id || sender.tab) return { ok: false };
       await startupReady;
-      const [settings, status] = await Promise.all([getSettings(), getStatus()]);
-      const entry = status.chatgpt;
+      const settings = await getSettings();
       if (!settings.token || !settings.providers.chatgpt ||
-          activeProviders.has('chatgpt') || entry?.running) {
+          activeProviders.has('chatgpt')) {
         return { ok: false, error: 'ChatGPT sync is disabled or already running' };
       }
-      const state = recheckManualReview(entry?.state, message.identity);
-      if (!state) return { ok: false, error: 'No matching manual-review history' };
-      await setStatusEntry('chatgpt', { ...entry, state, continuationPending: true });
-      const delay = Math.max(0.5,
-        (nextAllowedAfterRateLimit('chatgpt', entry) - Date.now()) / 60_000);
-      await scheduleContinuation('chatgpt', delay);
-      return { ok: true };
+      // Reuse the provider's existing single-writer guard while changing its
+      // checkpoint; an alarm must not race this read/modify/write.
+      activeProviders.add('chatgpt');
+      try {
+        const status = await getStatus();
+        const entry = status.chatgpt;
+        if (entry?.running) return { ok: false, error: 'ChatGPT sync is running' };
+        const state = recheckManualReview(entry?.state, message.identity);
+        if (!state) return { ok: false, error: 'No matching manual-review history' };
+        await setStatusEntry('chatgpt', { ...entry, state, continuationPending: true });
+        const delay = Math.max(0.5,
+          (nextAllowedAfterRateLimit('chatgpt', entry) - Date.now()) / 60_000);
+        await scheduleContinuation('chatgpt', delay);
+        return { ok: true };
+      } finally {
+        activeProviders.delete('chatgpt');
+      }
     })().then(sendResponse).catch(error =>
       sendResponse({ ok: false, error: error.message }));
     return true;
