@@ -3,7 +3,7 @@ import './handoff-background.js';
 // new/updated conversations to a local hstry-api instance (POST /ingest).
 
 import { NotLoggedInError } from './lib/common.js';
-import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName, conversationFromUrl, proposedWorkspaceChatTitle, nextArchivedTaskNumber, taskFromHstryContinuation, nextContinuationPriority } from './lib/live-capture.js';
+import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName, conversationFromUrl, proposedWorkspaceChatTitle, nextArchivedTaskNumber, taskFromHstryContinuation, nextContinuationPriority, recheckManualReview } from './lib/live-capture.js';
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS } from './providers/index.js';
 import { nextNativeRecoveryPriority, workspaceOnlyChatGPTState } from './providers/chatgpt.js';
 import { badgeState, failureStatusMessage } from './ui.js';
@@ -541,6 +541,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // hold the channel open waiting for it — status flows to the UI via
   // chrome.storage instead. Returning true here would reproduce the
   // "message channel closed before a response was received" error.
+  if (message?.type === 'recheckManualReview') {
+    (async () => {
+      if (sender.id !== chrome.runtime.id || sender.tab) return { ok: false };
+      await startupReady;
+      const [settings, status] = await Promise.all([getSettings(), getStatus()]);
+      const entry = status.chatgpt;
+      if (!settings.token || !settings.providers.chatgpt ||
+          activeProviders.has('chatgpt') || entry?.running) {
+        return { ok: false, error: 'ChatGPT sync is disabled or already running' };
+      }
+      const state = recheckManualReview(entry?.state, message.identity);
+      if (!state) return { ok: false, error: 'No matching manual-review history' };
+      await setStatusEntry('chatgpt', { ...entry, state, continuationPending: true });
+      const delay = Math.max(0.5,
+        (nextAllowedAfterRateLimit('chatgpt', entry) - Date.now()) / 60_000);
+      await scheduleContinuation('chatgpt', delay);
+      return { ok: true };
+    })().then(sendResponse).catch(error =>
+      sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
   if (message?.type === 'syncNow') {
     runSync('manual');
     sendResponse({ ok: true });

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { syncChatGPT, nextNativeRecoveryPriority } from '../providers/chatgpt.js';
-import { nextContinuationPriority } from '../lib/live-capture.js';
+import { nextContinuationPriority, recheckManualReview } from '../lib/live-capture.js';
 
 const id = '11111111-2222-4333-8444-555555555555';
 const inaccessible = '66666666-7777-4888-8999-000000000000';
@@ -125,6 +125,10 @@ globalThis.fetch = async (input) => {
     if (mode === 'native-inaccessible')
       return Response.json({ detail: { code: 'conversation_inaccessible', can_retry: false } },
         { status: 404 });
+    if (mode === 'native-generic-404')
+      return Response.json({ detail: 'Not found' }, { status: 404 });
+    if (mode === 'native-timeout')
+      throw Object.assign(new Error('transient timeout'), { name: 'TimeoutError' });
     if (mode === 'native-rate-limit')
       return new Response('', { status: 429, headers: { 'retry-after': '60' } });
     if (mode === 'native-empty')
@@ -423,6 +427,124 @@ try {
   assert.equal(retired.state.failureDetails[0].accessVerification.nativeStatus, 404);
   assert.equal(retired.state.failureDetails[0].nextRetryAtMs, undefined);
   assert.equal(retired.state.failureDetails[0].resolvedAtMs, null);
+  mode = 'healthy';
+
+  // A full diagnostic store cannot erase 18 failed recovery attempts or
+  // keep retrying an explicitly terminal captured chat indefinitely.
+  requests = []; ingests = []; mode = 'native-inaccessible';
+  const staleResolved = Array.from({ length: 99 }, (_, i) => ({
+    ...failure(personal), conversationId: `00000000-0000-4000-8000-${String(i + 1).padStart(12, '0')}`,
+    resolvedAtMs: Date.now() - 60_000,
+  }));
+  const unrelatedUnresolved = { ...failure(personal), conversationId: id,
+    accessVerification: undefined };
+  const saturated = { pending: { ...pending(), scopeIndex: 2,
+    parkedPriority: { ...parked, attempts: 18, nextRetryAtMs: Date.now() - 1 },
+    untrackedFailures: 18 },
+    failureDetails: [unrelatedUnresolved, ...staleResolved] };
+  const terminalRecorded = await run(saturated);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  const finalFailure = terminalRecorded.state.failureDetails.find(x =>
+    x.conversationId === inaccessible && x.projectId === null && !x.resolvedAtMs);
+  assert.equal(finalFailure?.accessVerification?.code, 'conversation_inaccessible',
+    'evict a resolved diagnostic and retain the exact verified terminal failure');
+  assert.equal(finalFailure?.accessVerification?.canRetry, false);
+  assert.equal(terminalRecorded.state.pending?.parkedPriority, undefined);
+  assert.equal(terminalRecorded.state.pending?.priority, undefined);
+  assert.equal(terminalRecorded.state.failureDetails.length, 100);
+  assert.equal(terminalRecorded.state.pending?.untrackedFailures, 18,
+    'never silently treat old untracked observations as recovered');
+  assert.equal(nextContinuationPriority({ qa: { conversationId: inaccessible,
+    messageId, projectId: null, indexedSource: personal.sourceId } }, {},
+    { ...terminalRecorded.state, pending: pending() }), null,
+  'verified terminal failure cannot regenerate an ordinary capture priority');
+
+  // An old count of timeouts cannot count as twelve proven HTTP 404s.
+  requests = []; ingests = []; mode = 'native-generic-404';
+  const historical = { ...parked, attempts: 19, nextRetryAtMs: Date.now() - 1 };
+  let candidate = await run({ pending: { ...pending(), scopeIndex: 2,
+    parkedPriority: historical }, failureDetails: [] });
+  assert.equal(candidate.state.pending.priority?.generic404Streak, 1,
+    'one new 404 is not proof of repeated inaccessibility');
+  assert.equal(candidate.state.failureDetails[0]?.manualReviewPending, undefined);
+  candidate.state.pending.priority.nextRetryAtMs = Date.now() - 1;
+  mode = 'native-timeout';
+  candidate = await run(candidate.state);
+  assert.equal(candidate.state.pending.priority?.generic404Streak, 0,
+    'a transient timeout breaks consecutive 404 evidence');
+  candidate.state.pending.priority.nextRetryAtMs = Date.now() - 1;
+  mode = 'native-generic-404';
+  candidate = await run(candidate.state);
+  assert.equal(candidate.state.pending.priority?.generic404Streak, 1);
+  candidate.state.pending.priority.nextRetryAtMs = Date.now() - 1;
+  candidate = await run(candidate.state);
+  assert.equal(candidate.state.pending.priority?.generic404Streak, 2);
+  candidate.state.pending.priority.nextRetryAtMs = Date.now() - 1;
+  candidate = await run(candidate.state);
+  assert.equal(candidate.state.failureDetails[0]?.manualReviewPending, true,
+    'three consecutive 404 responses queue manual review without deleting history');
+
+  // Unknown 404 remains unresolved; after a bounded number of attempts it
+  // must enter manual review, not become a fabricated deletion or repeat forever.
+  requests = []; ingests = []; mode = 'native-generic-404';
+  const genericParked = { ...parked, attempts: 19, generic404Streak: 2,
+    nextRetryAtMs: Date.now() - 1 };
+  const reviewState = { pending: { ...pending(), scopeIndex: 2,
+    parkedPriority: genericParked }, failureDetails: [] };
+  const manual = await run(reviewState);
+  assert.deepEqual(requests, ['/backend-api/conversations/' + inaccessible]);
+  const reviewFailure = manual.state.failureDetails.find(x =>
+    x.conversationId === inaccessible && x.projectId === null && !x.resolvedAtMs);
+  assert.equal(reviewFailure?.manualReviewPending, true);
+  assert.equal(reviewFailure?.accessVerification?.canRetry, undefined,
+    'generic 404 must not be labelled a confirmed terminal deletion');
+  assert.equal(manual.state.pending?.parkedPriority, undefined);
+  assert.equal(manual.state.pending?.priority, undefined);
+  assert.equal(nextNativeRecoveryPriority({ ...manual.state, pending: pending() }), null);
+  const identity = { conversationId: inaccessible, sourceId: personal.sourceId,
+    accountKey: personal.accountKey, projectId: null };
+  assert.equal(recheckManualReview(manual.state,
+    { ...identity, accountKey: 'other' }), null,
+    'recheck is limited to the precise stored source/account/project');
+  assert.equal(recheckManualReview(manual.state,
+    { ...identity, projectId: project }), null);
+  assert.equal(recheckManualReview(manual.state,
+    { ...identity, conversationId: 'not-a-uuid' }), null);
+  assert.equal(recheckManualReview({ ...manual.state, failureDetails: [
+    ...manual.state.failureDetails, { ...manual.state.failureDetails[0],
+      accessVerification: { code: 'conversation_deleted', canRetry: false } } ] },
+    identity), null, 'explicitly terminal evidence cannot be requeued');
+  const duplicated = recheckManualReview({ ...manual.state, failureDetails: [
+    ...manual.state.failureDetails, { ...manual.state.failureDetails[0] } ] }, identity);
+  assert(duplicated && duplicated.failureDetails.every(f => !f.manualReviewPending),
+    'one explicit recheck resumes all records for the exact scoped history');
+  const renewed = recheckManualReview(manual.state, identity);
+  assert(renewed && renewed !== manual.state);
+  assert.equal(renewed.failureDetails[0].manualReviewPending, undefined,
+    'user recheck returns the same unresolved evidence to the normal queue');
+  assert.equal(manual.state.failureDetails[0].manualReviewPending, true,
+    'a recheck must not mutate the original persisted object');
+  assert.equal(nextContinuationPriority({ qa: { conversationId: inaccessible,
+    messageId, projectId: null, indexedSource: personal.sourceId } }, {},
+    { ...renewed, pending: pending() })?.conversationId, inaccessible,
+    'ordinary recovery can proceed after a narrowly authorised recheck');
+  assert.equal(nextContinuationPriority({ qa: { conversationId: inaccessible,
+    messageId, projectId: null, indexedSource: personal.sourceId } }, {},
+    { ...manual.state, pending: pending() }), null,
+    'manual review keeps captured content without recreating the blocked task');
+  // If every diagnostic is still unresolved, preserve all 100 records and
+  // the original retry instead of silently losing the new untracked failure.
+  requests = []; mode = 'native-generic-404';
+  const noSpace = { pending: { ...pending(), scopeIndex: 2,
+    parkedPriority: genericParked },
+    failureDetails: [unrelatedUnresolved, ...staleResolved.map(f => ({
+      ...f, resolvedAtMs: null }))] };
+  const blocked = await run(noSpace);
+  assert.equal(blocked.state.failureDetails.length, 100);
+  assert.equal(blocked.state.pending?.untrackedFailures, 1);
+  assert.equal(blocked.state.pending?.priority?.conversationId, inaccessible,
+    'do not retire a history until its unresolved failure can be retained');
+  assert(blocked.state.pending.priority.nextRetryAtMs > Date.now());
   mode = 'healthy';
 
   // A staged partial native response cannot be discarded when its worker

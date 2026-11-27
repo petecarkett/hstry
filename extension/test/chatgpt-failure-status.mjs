@@ -60,6 +60,9 @@ try {
   });
   assert.equal(legacyKnown.failures,2,
     'out-of-capacity failures remain reported until a fresh full sweep');
+  assert.equal(legacyKnown.state.untrackedFailures,2,
+    'untracked failures persist after the saved pending scan is completed');
+  assert.equal(legacyKnown.state.pending,undefined);
 
   // A successful list read clears the previous deferred HTTP code while
   // preserving its historical timestamp separately for diagnostics.

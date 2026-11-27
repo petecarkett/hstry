@@ -189,7 +189,8 @@ export function nextContinuationPriority(queue, receipts, state) {
         (state.failureDetails ?? []).some(entry => !entry.resolvedAtMs &&
           entry.conversationId === id && entry.accountKey === matching[0].accountKey &&
           (entry.projectId ?? null) === capture.projectId &&
-          entry.accessVerification?.canRetry === false)) return null;
+          (entry.accessVerification?.canRetry === false ||
+           entry.manualReviewPending === true))) return null;
     return { conversationId: id, sourceId: capture.sourceId,
       accountKey: matching[0].accountKey, projectId: capture.projectId,
       kind: 'continuation' };
@@ -216,6 +217,30 @@ export function nextContinuationPriority(queue, receipts, state) {
     if (task) return task;
   }
   return null;
+}
+
+// Restore a user-selected unresolved history to the existing paced recovery
+// path, without clearing its provenance or unrelated checkpoint state.
+export function recheckManualReview(state, identity) {
+  if (!UUID.test(identity?.conversationId ?? '')) return null;
+  const records = state?.failureDetails ?? [];
+  const sameScope = entry => entry.conversationId === identity.conversationId &&
+    entry.accountKey === identity.accountKey &&
+    entry.sourceId === identity.sourceId &&
+    (entry.projectId ?? null) === (identity.projectId ?? null);
+  if (records.some(entry => sameScope(entry) && !entry.resolvedAtMs &&
+      entry.accessVerification?.canRetry === false)) return null;
+  const eligible = entry => sameScope(entry) && entry.manualReviewPending === true &&
+    !entry.resolvedAtMs;
+  if (!records.some(eligible)) return null;
+  const failureDetails = records.map(entry => {
+    if (!eligible(entry)) return entry;
+    const next = { ...entry };
+    delete next.manualReviewPending;
+    delete next.nextRetryAtMs;
+    return next;
+  });
+  return { ...state, failureDetails };
 }
 
 export function appendLiveCaptures(current, items) {

@@ -36,6 +36,27 @@ function providerCard(name, entry, enabled) {
       const origin = failure.projectId ? 'Project' : 'Personal';
       row.textContent = `${origin} ${failure.conversationId}: ${failure.errorType}` +
         failureDisposition(failure);
+      if (failure.manualReviewPending && !failure.resolvedAtMs) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = 'Recheck';
+        button.addEventListener('click', async () => {
+          button.disabled = true;
+          const identity = { conversationId: failure.conversationId,
+            sourceId: failure.sourceId, accountKey: failure.accountKey,
+            projectId: failure.projectId ?? null };
+          try {
+            const result = await chrome.runtime.sendMessage({
+              type: 'recheckManualReview', identity });
+            if (!result?.ok) throw new Error(result?.error ?? 'Recheck unavailable');
+            el('notice').textContent = 'History recheck queued; normal rate limits apply.';
+          } catch (error) {
+            button.disabled = false;
+            el('notice').textContent = error.message;
+          }
+        });
+        row.append(' ', button);
+      }
       list.appendChild(row);
     }
     disclosure.appendChild(list);
