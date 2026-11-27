@@ -46,6 +46,7 @@ const doc = {
 };
 const context = {
   document: doc,
+  manualTitleEdit: false,
   location: { pathname: path },
   editableElement: () => ({ value: '', textContent: '' }),
   pause: async () => {},
@@ -67,6 +68,8 @@ console.log('PASS native ChatGPT Rename: Radix pointerdown, input event, Save, r
 // and an inline Chat title editor which commits on Enter (no Save dialog).
 {
   let menuOpen = false, inlineOpen = false, pointerOpened = false;
+  let clock = 0, menuReadyAt = 0, editorReadyAt = 0;
+  let menuDelay = 450, onPause = () => {};
   let inputDispatched = false, commits = 0;
   const oldTitle = 'QA verification';
   const newTitle = '2026-11-26 19:07 — 1hood — QA verification';
@@ -93,12 +96,13 @@ console.log('PASS native ChatGPT Rename: Radix pointerdown, input event, Save, r
       assert.equal(event.type, 'pointerdown');
       pointerOpened = true;
       menuOpen = true;
+      menuReadyAt = clock + menuDelay;
     },
   };
   const renameMenuItem = {
     textContent: 'RenameR',
     getAttribute(name) { return name === 'aria-keyshortcuts' ? 'R' : null; },
-    click() { assert(menuOpen); menuOpen = false; inlineOpen = true; },
+    click() { assert(menuOpen && clock >= menuReadyAt); menuOpen = false; inlineOpen = true; editorReadyAt = clock + 550; },
   };
   const doc = {
     title: oldTitle,
@@ -106,20 +110,20 @@ console.log('PASS native ChatGPT Rename: Radix pointerdown, input event, Save, r
       if (selector.includes('input[data-inline-rename-input="true"]') && inlineOpen) return inlineEditor;
       if (selector === 'main button[aria-label="Chat actions"][aria-haspopup="menu"]') return chatActions;
       if (selector === 'input[name="title-editor"], input[aria-label="Chat title"]') {
-        return inlineOpen ? inlineEditor : null;
+        return inlineOpen && clock >= editorReadyAt ? inlineEditor : null;
       }
       return null;
     },
     querySelectorAll(selector) {
       if (selector === 'main button[aria-haspopup="menu"]') return [];
-      if (selector === '[role="menuitem"]') return menuOpen ? [renameMenuItem] : [];
+      if (selector === '[role="menuitem"]') return menuOpen && clock >= menuReadyAt ? [renameMenuItem] : [];
       return [];
     },
   };
   const inlineContext = {
-    document: doc, location: { pathname: path },
+    document: doc, manualTitleEdit: false, location: { pathname: path },
     editableElement: () => ({ value: '', textContent: '' }),
-    pause: async () => {}, HTMLInputElement: InlineInput,
+    pause: async ms => { clock += ms; onPause(); }, HTMLInputElement: InlineInput,
     PointerEvent: class { constructor(type, init) { Object.assign(this, { type, ...init }); } },
     Event: class { constructor(type, init) { Object.assign(this, { type, ...init }); } },
     KeyboardEvent: class { constructor(type, init) { Object.assign(this, { type, ...init }); } },
@@ -130,12 +134,33 @@ console.log('PASS native ChatGPT Rename: Radix pointerdown, input event, Save, r
     'never take over an inline title the user is editing');
   inlineOpen = false;
   assert.equal(await runInline(oldTitle, newTitle, path), true,
-    'current Chat actions and inline editor must rename successfully');
+    'delayed Chat actions menu and inline editor must rename successfully');
   assert(pointerOpened, 'Chat actions menu must open via pointerdown');
   assert.equal(commits, 1, 'inline rename must commit exactly once');
   assert.equal(doc.title, newTitle);
   assert.equal(await runInline(oldTitle, newTitle, path), false,
     'readback prevents any second title write');
   assert.equal(commits, 1);
+
+  // An absent control times out without a write or second click.
+  doc.title = oldTitle;
+  inlineEditor.value = oldTitle;
+  menuDelay = 3000;
+  const timeoutStart = clock;
+  assert.equal(await runInline(oldTitle, newTitle, path), false);
+  assert.equal(clock - timeoutStart, 2000, 'bounded menu readiness wait');
+  assert.equal(commits, 1, 'never commit if menu is unavailable');
+
+  // User ownership and navigation changes must abort a wait immediately.
+  menuOpen = false;
+  menuDelay = 450;
+  onPause = () => { inlineContext.manualTitleEdit = true; };
+  assert.equal(await runInline(oldTitle, newTitle, path), false);
+  assert.equal(commits, 1, 'manual rename cancels the automation');
+  inlineContext.manualTitleEdit = false;
+  menuOpen = false;
+  onPause = () => { inlineContext.location.pathname = '/c/different'; };
+  assert.equal(await runInline(oldTitle, newTitle, path), false);
+  assert.equal(commits, 1, 'navigation cancels the automation');
 }
-console.log('PASS current Chat actions + inline title editor: native Enter, once-only commit');
+console.log('PASS delayed native rename: bounded wait, manual/navigation guards, once-only commit');
