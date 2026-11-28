@@ -7,6 +7,8 @@ const handlers = {};
 const recent = Math.floor(Date.now() / 1000) - 7200;
 let statusWrites = 0;
 const calls = [];
+const scheduledAlarms = [];
+let alarmDuringRecheckWrite = false;
 const stored = {
   settings: { token: 'local-fixture', port: 41770, intervalMinutes: 15, providers: { chatgpt: true } },
   liveCaptureQueue: {},
@@ -39,13 +41,23 @@ globalThis.chrome = {
         if (Array.isArray(key)) return Object.fromEntries(key.map(k => [k, clone(stored[k])]));
         return clone(stored);
       },
-      async set(values) { if (Object.hasOwn(values, 'status')) statusWrites++; Object.assign(stored, clone(values)); },
+      async set(values) {
+        if (alarmDuringRecheckWrite && values.status?.chatgpt?.state?.failureDetails?.some(f =>
+          f.conversationId === '66666666-7777-4888-8999-000000000000' &&
+          !f.manualReviewPending) && !values.status.chatgpt.running) {
+          alarmDuringRecheckWrite = false;
+          handlers.alarm({ name: 'hstry-sync-continue-chatgpt' });
+          await new Promise(resolve => setTimeout(resolve, 12));
+        }
+        if (Object.hasOwn(values, 'status')) statusWrites++;
+        Object.assign(stored, clone(values));
+      },
     },
     session: { async get(key) { return { [key]: clone(sessionStore[key]) }; },
       async set(values) { Object.assign(sessionStore, clone(values)); },
       async remove(key) { delete sessionStore[key]; } },
   },
-  alarms: { create: async () => {}, get: async () => null,
+  alarms: { create: async (name, config) => scheduledAlarms.push({ name, config }), get: async () => null,
     getAll: async () => [], onAlarm: { addListener(fn) { handlers.alarm = fn; } } },
   action: { onClicked: events, setBadgeBackgroundColor: async () => {}, setBadgeText: async () => {} },
   tabs: { onUpdated: events, onActivated: events, onRemoved: events,
@@ -94,6 +106,43 @@ try {
   // A full pending status is multi-megabytes in a real browser.
   assert(statusWrites <= 5,
     'avoid rewriting the entire status for transient progress ticks; persist at checkpoint and completion');
+  // Explicit manual recheck is scoped, single-click and alarm-paced; it
+  // must neither reset the archive scan nor trigger an immediate network read.
+  const qaId = '66666666-7777-4888-8999-000000000000';
+  const identity = { conversationId: qaId, sourceId: 'chatgpt-web',
+    accountKey: 'default', projectId: null };
+  const review = { ...identity, manualReviewPending: true, resolvedAtMs: null,
+    errorType: 'HTTP 404', attempts: 19 };
+  delete stored.status.chatgpt.state.pending;
+  stored.status.chatgpt.state.failureDetails = [review];
+  delete stored.status.chatgpt.nextAllowedAtMs;
+  delete stored.status.chatgpt.state.lastRateLimitAtMs;
+  const send = (identity, sender = { id: 'fixture' }) => new Promise(resolve =>
+    handlers.message({ type: 'recheckManualReview', identity }, sender, resolve));
+  assert.equal((await send({ ...identity, accountKey: 'wrong' })).ok, false);
+  assert.equal((await send(identity, { id: 'fixture', tab: { id: 1 } })).ok, false,
+    'content scripts cannot invoke the popup-only manual retry');
+  assert.equal(stored.status.chatgpt.state.failureDetails[0].manualReviewPending, true);
+  const beforeManualReads = calls.length;
+  const beforeAlarms = scheduledAlarms.length;
+  alarmDuringRecheckWrite = true;
+  assert.equal((await send(identity)).ok, true,
+    'exact user-selected history can re-enter the paced sync route');
+  assert.equal(stored.status.chatgpt.state.failureDetails[0].manualReviewPending, undefined);
+  assert.equal(stored.status.chatgpt.state.pending, undefined,
+    'manual recheck does not invent or rewind a historical scan cursor');
+  assert.equal(stored.status.chatgpt.continuationPending, true);
+  assert.equal(alarmDuringRecheckWrite, false,
+    'the conflicting continuation alarm ran during the checkpoint write');
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(calls.length, beforeManualReads,
+    'a racing continuation alarm must not start a sync during manual recheck');
+  assert.equal(stored.status.chatgpt.state.failureDetails[0].manualReviewPending, undefined,
+    'a racing worker must not overwrite the manual recheck state');
+  assert(scheduledAlarms.length >= beforeAlarms + 1);
+  assert.equal(scheduledAlarms.at(-1).name, 'hstry-sync-continue-chatgpt');
+  assert(scheduledAlarms.at(-1).config.delayInMinutes >= 0.5);
+  assert.equal((await send(identity)).ok, false, 'repeated clicks cannot enqueue duplicate work');
 } finally {
   globalThis.fetch = realFetch;
   globalThis.chrome = realChrome;

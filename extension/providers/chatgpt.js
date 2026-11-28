@@ -37,6 +37,7 @@ const paceMs = state => Math.max(PACE_MIN_MS, Math.min(PACE_MAX_MS,
 const slower = state => ({ ...state, paceMs: Math.min(PACE_MAX_MS, paceMs(state) * 2),
   healthyReads: 0 });
 const FAILURE_DETAIL_LIMIT = 100;
+const CONTINUATION_REVIEW_AFTER_404 = 3;
 // Retry individual failed details outside the normal page cursor. Keep Chrome
 // service worker requests below its idle deadline; back off between attempts.
 const RETRY_BASE_MS = 30 * 60_000;
@@ -767,7 +768,8 @@ export function nextNativeRecoveryPriority(state) {
       (Number.isFinite(pending.lastPriorityProcessed) &&
         pending.processed - pending.lastPriorityProcessed < 3)) return null;
   const failure = (state.failureDetails ?? []).find(item =>
-    !item.resolvedAtMs && !sameRecoveryTarget(item, pending.parkedPriority) &&
+    !item.resolvedAtMs && !item.manualReviewPending &&
+    !sameRecoveryTarget(item, pending.parkedPriority) &&
     !item.accessVerification?.nativeCheckedAtMs &&
     CHAT_ID.test(item.conversationId ?? '') &&
     (isNonRetryableAccess(item) || (
@@ -791,6 +793,7 @@ function unresolvedFailureCount(state) {
   return Math.max(
     records.filter(record => !record.resolvedAtMs).length,
     state?.pending?.untrackedFailures ?? 0,
+    state?.untrackedFailures ?? 0,
     // Older checkpoints without detail IDs cannot prove earlier failures recovered.
     records.length === 0 ? (state?.pending?.failures ?? 0) : 0,
   );
@@ -1137,23 +1140,51 @@ export async function syncChatGPT({
           pending.lastPriorityProcessed = pending.processed;
         } else {
           const attempts = (task.attempts ?? 0) + 1;
-          pending.priority = { ...task, attempts,
-            nextRetryAtMs: now + retryDelayMs(attempts) };
-          if (task.kind === 'continuation' &&
-              !failureDetails.some(f => f.conversationId === task.conversationId &&
-                f.accountKey === owner.accountKey && !f.resolvedAtMs)) {
-            if (failureDetails.length < FAILURE_DETAIL_LIMIT) {
-              failureDetails.push({ conversationId: task.conversationId,
+          const nextRetryAtMs = now + retryDelayMs(attempts);
+          const terminal = isTerminalAccessCode(error.code) && error.canRetry === false;
+          const generic404Streak = error.status === 404 && !terminal
+            ? (task.generic404Streak ?? 0) + 1 : 0;
+          const manualReview = task.kind === 'continuation' &&
+            generic404Streak >= CONTINUATION_REVIEW_AFTER_404;
+          let tracked = false;
+          if (task.kind === 'continuation') {
+            let failure = failureDetails.find(f => !f.resolvedAtMs &&
+              f.conversationId === task.conversationId &&
+              f.accountKey === owner.accountKey &&
+              f.sourceId === owner.sourceId &&
+              (f.projectId ?? null) === (owner.projectId ?? null));
+            if (!failure && failureDetails.length >= FAILURE_DETAIL_LIMIT) {
+              const index = failureDetails.findIndex(f => f.resolvedAtMs);
+              if (index >= 0) failureDetails.splice(index, 1);
+            }
+            if (!failure && failureDetails.length < FAILURE_DETAIL_LIMIT) {
+              failure = { conversationId: task.conversationId,
                 accountId: owner.accountId, accountKey: owner.accountKey,
                 projectId: owner.projectId ?? null, sourceId: owner.sourceId,
-                errorType: failureType(error), lastFailedAtMs: now, attempts: 1,
-                ...(error.canRetry === false ? { accessVerification: {
-                  code: error.code, canRetry: false, source: 'native paginated detail',
-                  verifiedAtMs: now } } : {}),
-                resolvedAtMs: null });
+                resolvedAtMs: null };
+              failureDetails.push(failure);
+            }
+            if (failure) {
+              Object.assign(failure, { errorType: failureType(error),
+                errorDiagnostic: failureDiagnostic(error), attempts,
+                lastFailedAtMs: now });
+              if (terminal) failure.accessVerification = {
+                code: error.code, canRetry: false,
+                source: 'native paginated detail', verifiedAtMs: now };
+              if (manualReview) failure.manualReviewPending = true;
+              if (terminal || manualReview) delete failure.nextRetryAtMs;
+              else failure.nextRetryAtMs = nextRetryAtMs;
+              tracked = true;
             } else {
               pending.untrackedFailures = (pending.untrackedFailures ?? 0) + 1;
             }
+          }
+          if ((terminal || manualReview) && tracked) {
+            // Preserve the unresolved record; never claim a missing history recovered.
+            delete pending.priority;
+            pending.lastPriorityProcessed = pending.processed;
+          } else {
+            pending.priority = { ...task, attempts, nextRetryAtMs, generic404Streak };
           }
         }
         await checkpointNow();
@@ -1228,7 +1259,8 @@ export async function syncChatGPT({
   // retry time BEFORE fetching so a killed worker cannot hammer one timeout.
   const now = Date.now();
   const failure = !scanTurn && failureDetails.find(detail =>
-    !detail.resolvedAtMs && detail.sourceId && !isNonRetryableAccess(detail) &&
+    !detail.resolvedAtMs && detail.sourceId && !detail.manualReviewPending &&
+    !isNonRetryableAccess(detail) &&
     !sameRecoveryTarget(detail, pending.priority) &&
     !sameRecoveryTarget(detail, pending.parkedPriority) &&
     !prefersNativeDetail(detail) &&
@@ -1434,6 +1466,8 @@ export async function syncChatGPT({
       // turns. Outstanding browser captures require canonical reconciliation.
       const needsDetail = !isIgnoredConversation(newState, item.id, itemScope) &&
         !isNonRetryableAccess(previousFailure) &&
+        (!previousFailure?.manualReviewPending ||
+          updatedMs > (previousFailure.lastFailedAtMs ?? Infinity)) &&
         (!since || !updatedMs || updatedMs > since || pendingLive.has(item.id)) &&
         (!previousFailure || Date.now() >= retryDueMs);
       if (needsDetail) {
@@ -1612,6 +1646,9 @@ export async function syncChatGPT({
   await report({ phase: 'complete', detected: pending.detected,
     processed: pending.processed, failed: pending.failures });
   const completeState = { ...newState };
+  // Keep historical out-of-capacity failures visible after the scan cursor closes.
+  completeState.untrackedFailures = Math.max(
+    completeState.untrackedFailures ?? 0, pending.untrackedFailures ?? 0);
   // A sweep started before inventory tracking was installed stays partial.
   // Only an entirely enumerated sweep certifies the deduplicated total.
   completeState.conversationInventory = pending.inventory.completeFromStart
@@ -1622,5 +1659,5 @@ export async function syncChatGPT({
       scopeCount: pending.scopes.length, completeness: 'partial' };
   delete completeState.pending;
   return { state: completeState, conversations: total, hasMore: false,
-    failures: outstanding() };
+    failures: unresolvedFailureCount(completeState) };
 }

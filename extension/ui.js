@@ -132,6 +132,7 @@ export function failureDisposition(failure) {
   if (failure.accessVerification?.code === 'conversation_deleted' &&
       failure.accessVerification.canRetry === false) return ' (deleted; not recovered)';
   if (failure.accessVerification?.canRetry === false) return ' (inaccessible; access required)';
+  if (failure.manualReviewPending) return ' (manual review required; not recovered)';
   return '';
 }
 
@@ -141,6 +142,7 @@ export function failureStatusMessage(total, details = []) {
     ['conversation_inaccessible', 'conversation_deleted'].includes(item.accessVerification?.code) &&
     item.accessVerification.canRetry === false);
   const distinct = new Set(inaccessible.map(item => item.conversationId).filter(Boolean)).size;
+  const review = details.filter(item => !item.resolvedAtMs && item.manualReviewPending).length;
   if (distinct && inaccessible.length === total) {
     if (inaccessible.every(item => item.accessVerification.code === 'conversation_deleted')) {
       return `${distinct} distinct deleted conversation(s) across ${inaccessible.length} scope record${inaccessible.length === 1 ? '' : 's'}; not recoverable`;
@@ -148,8 +150,11 @@ export function failureStatusMessage(total, details = []) {
     return `${distinct} distinct inaccessible conversation(s) across ${inaccessible.length} scope record${inaccessible.length === 1 ? '' : 's'}; verify source access or retention`;
   }
   if (distinct) {
-    return `${total} unresolved failure records; ${distinct} distinct inaccessible conversation(s), others remain retryable or untracked`;
+    return `${total} unresolved failure records; ${distinct} distinct inaccessible conversation(s)` +
+      (review ? `; ${review} require manual review; others remain retryable or untracked`
+        : `, others remain retryable or untracked`);
   }
+  if (review) return `${total} unresolved failure record(s); ${review} require manual review`;
   return `${total} unresolved failure record(s); individual conversation status unavailable`;
 }
 

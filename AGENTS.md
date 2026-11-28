@@ -71,21 +71,20 @@ just update       # Update dependencies
 
 Always run `just check-all` before committing significant changes.
 
-## Issue Tracking (trx)
+## Issues and Release Ownership (petecarkett fork)
 
-Use `trx` for all issue tracking. Do NOT use markdown TODOs or external trackers.
+This fork retains the upstream `byteowlz/hstry` `.trx/central` pointer to the
+upstream maintainer's private `/home/wismut/.local/share/trx` store. Those files
+are historical upstream records, not the issue tracker or a live release lock
+for `petecarkett/hstry`. Do not recreate, mirror, or write to that upstream store.
 
-```bash
-trx ready                              # Find unblocked work
-trx create "Title" -t task -p 2        # Create issue (types: bug/feature/task/epic/chore)
-trx update <id> --status in_progress   # Claim task
-trx close <id> -r "Done"               # Complete work
-trx sync                               # Commit .trx/ changes
-```
-
-Priorities: 0=critical, 1=high, 2=medium (default), 3=low, 4=backlog
-
-Always commit `.trx/` with code changes.
+Use this fork's existing GitHub issues and pull requests for task history,
+review, and change attribution. Before shared mutations, establish the owning
+writer and avoid concurrent work in the same checkout. A passing build or
+feature branch does not grant release authority. Merge only through the existing
+review, CI, and protected-release process; verify one release controller,
+a safe extension restart boundary, the exact installed bytes, and rollback.
+Record release evidence in the corresponding pull request.
 
 ## Memory System (byt/mmry)
 

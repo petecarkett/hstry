@@ -67,6 +67,14 @@ check('deleted history is recorded as unrecoverable, not recovered',
   '1 distinct deleted conversation(s) across 1 scope record; not recoverable');
 check('deleted history is not labeled recoverable', failureDisposition(deleted),
   ' (deleted; not recovered)');
+const reviewPending = { conversationId: 'qa', resolvedAtMs: null, manualReviewPending: true };
+check('bounded unresolved failure is labelled manual review, not deleted',
+  failureDisposition(reviewPending), ' (manual review required; not recovered)');
+check('manual review remains an explicit unresolved error',
+  failureStatusMessage(1, [reviewPending]), '1 unresolved failure record(s); 1 require manual review');
+check('manual review does not hide distinct deleted histories',
+  failureStatusMessage(3, [deleted, reviewPending]),
+  '3 unresolved failure records; 1 distinct inaccessible conversation(s); 1 require manual review; others remain retryable or untracked');
 check('zero failures clears status message', failureStatusMessage(0, inaccessible), null);
 check('excluded conversation is never labelled recovered',
   failureDisposition({ resolution: 'excluded-not-recovered', resolvedAtMs: now, accessVerification: { nativeStatus: 404 } }),
