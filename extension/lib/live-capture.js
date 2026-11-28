@@ -126,17 +126,26 @@ export function nextArchivedTaskNumber(nativeTitle, archived, sourceId, projectI
   return number ? number + 1 : null;
 }
 
+// Root URLs alone do not identify the active account. Only a matching
+// account observed on the native first submission permits Workspace naming.
+export function resolveWorkspaceTitleOwner(route, status, nativeAccountId = null) {
+  if (!route) return null;
+  const owner = resolveLiveOwner(route, status);
+  if (!owner?.sourceId?.startsWith('chatgpt-web-')) return null;
+  if (!route.projectId && (!UUID.test(nativeAccountId ?? '') ||
+      owner.accountId.toLowerCase() !== nativeAccountId.toLowerCase())) return null;
+  return owner;
+}
+
 // Chat opening is captured before a rename, not at rename time. Use the same
 // Europe/London timezone for every browser running this workspace workflow.
 export function proposedWorkspaceChatTitle(settings, status, route, nativeTitle,
-    openedAtMs, seriesNumber = null) {
-  // A root chat URL does not establish which account is currently active.
+    openedAtMs, seriesNumber = null, nativeAccountId = null) {
   if (settings?.chatgptWorkspaceOnly !== true || settings?.autoNameNewChats !== true ||
-      settings?.providers?.chatgpt !== true || !route?.projectId ||
+      settings?.providers?.chatgpt !== true || !route ||
       !Number.isSafeInteger(openedAtMs) || openedAtMs < Date.UTC(2015, 0, 1) ||
       openedAtMs > Date.now() + 60_000) return null;
-  const owner = resolveLiveOwner(route, status);
-  if (!owner?.sourceId?.startsWith('chatgpt-web-')) return null;
+  if (!resolveWorkspaceTitleOwner(route, status, nativeAccountId)) return null;
   const project = route.projectId ? resolveLiveProjectName(route, status) : 'Workspace';
   if (!project) return null;
   const title = String(nativeTitle ?? '').trim().replace(/\s+[-|]\s+ChatGPT$/i, '');

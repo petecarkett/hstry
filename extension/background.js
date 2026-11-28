@@ -3,7 +3,7 @@ import './handoff-background.js';
 // new/updated conversations to a local hstry-api instance (POST /ingest).
 
 import { NotLoggedInError } from './lib/common.js';
-import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName, conversationFromUrl, proposedWorkspaceChatTitle, nextArchivedTaskNumber, taskFromHstryContinuation, nextContinuationPriority, recheckManualReview } from './lib/live-capture.js';
+import { appendLiveCaptures, confirmLiveCapture, validLiveCapture, resolveLiveOwner, resolveLiveProjectName, conversationFromUrl, resolveWorkspaceTitleOwner, proposedWorkspaceChatTitle, nextArchivedTaskNumber, taskFromHstryContinuation, nextContinuationPriority, recheckManualReview } from './lib/live-capture.js';
 import { DEFAULT_PROVIDER_SETTINGS, PROVIDERS } from './providers/index.js';
 import { nextNativeRecoveryPriority, workspaceOnlyChatGPTState } from './providers/chatgpt.js';
 import { badgeState, failureStatusMessage } from './ui.js';
@@ -500,15 +500,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       if (sender.id !== chrome.runtime.id || sender.frameId !== 0) return { ok: false };
       const route = conversationFromUrl(message.url);
-      const active = conversationFromUrl(sender.tab?.url);
-      if (!route?.projectId || !active || route.conversationId !== active.conversationId ||
+      if (!route || !Number.isInteger(sender.tab?.id)) return { ok: false };
+      const active = conversationFromUrl((await chrome.tabs.get(sender.tab.id)).url);
+      if (!active || route.conversationId !== active.conversationId ||
           route.projectId !== active.projectId) return { ok: false };
       const settings = await getSettings();
       const status = await getStatus();
       if (!settings.chatgptWorkspaceOnly || !settings.autoNameNewChats ||
           !settings.providers.chatgpt) return { ok: false };
-      const owner = resolveLiveOwner(route, status);
-      if (!owner?.sourceId?.startsWith('chatgpt-web-')) return { ok: false };
+      const owner = resolveWorkspaceTitleOwner(route, status, message.nativeAccountId);
+      if (!owner) return { ok: false };
       // Reuse the installed read-only HSTRY archive. Missing archive data must
       // not invent an ordinal or race another new conversation.
       const endpoint = `http://127.0.0.1:${settings.port}/sessions?source=${encodeURIComponent(owner.sourceId)}&limit=5000`;
@@ -520,9 +521,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sessions.result, owner.sourceId, route.projectId);
       if (!task) return { ok: false };
       const number = nextArchivedTaskNumber(task, sessions.result, owner.sourceId,
-        route.projectId, route.conversationId);
+        route.projectId, route.conversationId, message.openedAtMs);
       const title = proposedWorkspaceChatTitle(settings, status, route, task,
-        message.openedAtMs, number);
+        message.openedAtMs, number, message.nativeAccountId);
       return title ? { ok: true, title } : { ok: false };
     })().then(sendResponse).catch(() => sendResponse({ ok: false }));
     return true;

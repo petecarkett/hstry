@@ -17,7 +17,7 @@ function mount(fetchHandler) {
   const location = { origin: 'https://chatgpt.com',
     href: 'https://chatgpt.com' + path, pathname: path };
   const context = {
-    location, URL, Reflect,
+    location, URL, Reflect, Headers,
     fetch: fetchHandler,
     CustomEvent: class {
       constructor(type, options) { this.type = type; this.detail = options.detail; }
@@ -63,6 +63,34 @@ const success = mount(async () => result(200, rejected));
 await success.context.fetch('/backend-api/f/conversation', request);
 await settle();
 assert.equal(success.events.length, 0, 'successful responses are ignored');
+const accountId = '88888888-aaaa-4bbb-8ccc-dddddddddddd';
+const accountRequest = { ...request, headers: { 'chatgpt-account-id': accountId,
+  Authorization: 'Bearer fixture-not-a-real-secret' } };
+const accountSuccess = mount(async () => result(200, {}));
+await accountSuccess.context.fetch('/backend-api/f/conversation', accountRequest);
+await settle();
+assert.equal(accountSuccess.events.length, 1);
+assert.equal(accountSuccess.events[0].type, 'hstry:native-submit-account');
+assert.equal(accountSuccess.events[0].detail.path, path);
+assert.equal(accountSuccess.events[0].detail.accountId, accountId);
+assert(Number.isFinite(accountSuccess.events[0].detail.requestedAt));
+assert.deepEqual(Object.keys(accountSuccess.events[0].detail).sort(), ['accountId', 'path', 'requestedAt']);
+const accountFailure = mount(async () => result(400, rejected));
+await accountFailure.context.fetch('/backend-api/f/conversation', accountRequest);
+await settle();
+assert.deepEqual(accountFailure.events.map(e => e.type), ['hstry:conversation-too-large']);
+const legacyFetch = async () => result(200, {});
+Object.defineProperty(legacyFetch, '__hstryTooLargeObserver', { value: true });
+const upgraded = mount(legacyFetch);
+await upgraded.context.fetch('/backend-api/f/conversation', accountRequest);
+await settle();
+assert.deepEqual(upgraded.events.map(e => e.type), ['hstry:native-submit-account'],
+  'an old open tab gains account evidence without requiring a reload');
+const upgradedFetch = upgraded.context.fetch;
+vm.runInNewContext(script, upgraded.context, { filename: 'handoff-network.js' });
+assert.equal(upgraded.context.fetch, upgradedFetch, 'upgrade must not stack new observers');
+
+
 
 const malformedBody = mount(async () => result(400, rejected));
 await malformedBody.context.fetch('/backend-api/f/conversation',

@@ -13,6 +13,25 @@ function replyAsync(sendResponse, task) {
   return true;
 }
 
+// A lost START reply can leave a durable receipt without a source-page
+// intent. Only its original, still-unmoved tab may recover the saved token.
+async function resumeSourceReceipt(source, tabId, receipt) {
+  if (receipt?.status !== 'started' || receipt.tabId !== tabId ||
+      receipt.originalUrl !== source.original) return null;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (parseConversationUrl(tab?.url || '')?.original !== source.original ||
+      (tab.pendingUrl && parseConversationUrl(tab.pendingUrl)?.original !== source.original)) return null;
+  const key = PREFIX + tabId;
+  const record = (await chrome.storage.session.get(key))[key];
+  if (record?.sourceTabId !== tabId || record.original !== source.original ||
+      record.project !== source.project || typeof record.prompt !== 'string' ||
+      !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(record.intentToken || '') ||
+      !Number.isFinite(record.createdAt) || Date.now() < record.createdAt ||
+      Date.now() - record.createdAt >= MAX_AGE_MS) return null;
+  return { tabId, landingUrl: source.landing, sourceUrl: source.original,
+    intentToken: record.intentToken, intentCreatedAt: record.createdAt };
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.type !== 'string' || !msg.type.startsWith(TYPE)) return false;
   const senderTab = sender.tab;
@@ -40,7 +59,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         receipt.status === 'completed' && destination &&
         destination.project === source.project && destination.id !== source.id;
       if (msg.type === 'HSTRY_TAKEOVER_STATUS') {
-        return { found: true, status: receipt.status, hasDestination: !!verified };
+        const resume = msg.resumePending === true
+          ? await resumeSourceReceipt(source, senderTab.id, receipt) : null;
+        return { found: true, status: receipt.status, hasDestination: !!verified,
+          ...(resume ? { resume } : {}) };
       }
       if (!verified) throw new Error(
         'This continuation has no verified destination link. Do not start a duplicate.');
@@ -88,11 +110,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { existing: true, completed: true, tabId: prior.tabId };
       }
       if (Number.isInteger(prior?.tabId)) {
+        const resume = await resumeSourceReceipt(parsed, senderTab.id, prior);
+        if (resume) return resume;
         const tab = await chrome.tabs.get(prior.tabId).catch(() => null);
+        // A started receipt with missing/expired intent cannot safely be
+        // replaced: the original submission may already have happened.
+        if (tab?.id === senderTab.id && parseConversationUrl(tab.url)?.original === parsed.original) {
+          throw new Error('Saved continuation cannot be verified. Do not start a duplicate.');
+        }
         // Reuse a previous continuation, including one opened by older builds.
-        // If the same source tab never navigated, allow a safe retry in place.
-        if (tab?.url?.startsWith('https://chatgpt.com/') &&
-            !(tab.id === senderTab.id && parseConversationUrl(tab.url)?.original === parsed.original)) {
+        if (tab?.url?.startsWith('https://chatgpt.com/')) {
           const previous = (await chrome.storage.session.get(PREFIX + tab.id))[PREFIX + tab.id];
           if (previous?.original !== parsed.original ||
               !isContinuationDestinationPath(parsed, new URL(tab.url).pathname, true)) {
@@ -131,7 +158,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           status: 'started', tabId, startedAt, automatic, originalUrl: parsed.original,
         } });
         return { tabId, pendingCaptures: pending, landingUrl: parsed.landing,
-          sourceUrl: parsed.original, intentToken };
+          sourceUrl: parsed.original, intentToken, intentCreatedAt: startedAt };
       } catch (error) {
         // Failed persistence leaves the source page in place. Clear partial
         // receipts so the same tab can retry safely.
@@ -175,20 +202,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       // The sender tab and its live SPA path must agree. Never trust a stale
       // document URL when several ChatGPT projects are changing at once.
-      if (msg.pagePath !== current.pathname ||
-          !isContinuationDestinationPath(original, current.pathname,
-            msg.type === 'HSTRY_TAKEOVER_DONE')) {
-        if (msg.type === 'HSTRY_TAKEOVER_DONE') {
-          throw new Error('Continuation destination changed project before completion.');
-        }
-        return { found: false };
-      }
       const sourceKey = SOURCE_PREFIX + original.id;
       if (msg.type === 'HSTRY_TAKEOVER_DONE') {
-        const destination = parseConversationUrl('https://chatgpt.com' + current.pathname);
+        if (!isContinuationDestinationPath(original, msg.pagePath, true)) {
+          throw new Error('Continuation destination changed project before completion.');
+        }
+        const destination = parseConversationUrl('https://chatgpt.com' + msg.pagePath);
         if (!destination || destination.project !== original.project ||
             destination.id === original.id) {
           throw new Error('ChatGPT has not created the destination conversation yet.');
+        }
+        // sender.tab is a snapshot. The native SPA can expose its new path
+        // before Chrome commits the tab URL. Re-read the actual tab; only the
+        // original landing is eligible for a bounded receipt-only retry.
+        const tab = await chrome.tabs.get(senderTab.id);
+        const live = new URL(tab.url || 'https://invalid.invalid/');
+        if (live.protocol !== 'https:' || !['chatgpt.com', 'chat.openai.com'].includes(live.hostname)) {
+          throw new Error('Takeover destination is not ChatGPT.');
+        }
+        if (live.pathname !== msg.pagePath) {
+          if (isContinuationDestinationPath(original, live.pathname)) return { found: false, pending: true };
+          throw new Error('Continuation destination changed project before completion.');
         }
         const prior = (await chrome.storage.local.get(sourceKey))[sourceKey];
         if (prior?.tabId != null && prior.tabId !== senderTab.id) {
@@ -203,6 +237,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.storage.session.remove(key);
         return { found: false, completed: true };
       }
+      if (msg.pagePath !== current.pathname ||
+          !isContinuationDestinationPath(original, current.pathname)) return { found: false };
       const receipt = (await chrome.storage.local.get(sourceKey))[sourceKey];
       if (receipt?.status === 'completed') return { found: false, completed: true };
       return { found: true, prompt: record.prompt, original: record.original,

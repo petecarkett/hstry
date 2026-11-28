@@ -14,7 +14,8 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
   let clickButton = null;
   let continuationButton = null, continuationClick = null;
   const opens = [];
-  let assignedUrl = null;
+  let assignedUrl = null, assignments = 0;
+  let heldStart = null;
   const sent = [];
   const events = new Map();
   const timers = new Map();
@@ -75,7 +76,7 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
   };
   const location = { pathname: path, get href() { return 'https://chatgpt.com' + this.pathname; },
     reload() { throw Error('reload unexpected'); },
-    assign(url) { assignedUrl = url; } };
+    assign(url) { assignedUrl = url; assignments++; } };
   const context = {
     document, location, URL,
     addEventListener(type, handler) { events.set(`window:${type}`, handler); },
@@ -96,11 +97,12 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
             return;
           }
           sent.push(message);
-          if (hangStart && message.type === 'HSTRY_TAKEOVER_START') return;
-          queueMicrotask(() => done({ ok: true, tabId: 600,
+          const reply = () => done({ ok: true, tabId: 600,
             landingUrl: 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood',
             sourceUrl: 'https://chatgpt.com' + path,
-            intentToken: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' }));
+            intentToken: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' });
+          if (hangStart && message.type === 'HSTRY_TAKEOVER_START') { heldStart = reply; return; }
+          queueMicrotask(reply);
         },
       },
     },
@@ -133,6 +135,10 @@ function mount(initialWarning, previous = null, active = false, draft = '', scre
     get continuationButton() { return continuationButton; },
     clickContinuation() { continuationClick?.(); },
     get assignedUrl() { return assignedUrl; },
+    get assignments() { return assignments; },
+    releaseStart() { heldStart?.(); },
+    setDraft(value) { draft = value; },
+    setAttachment(value) { hasAttachment = value; },
     get button() { return button; },
     flush, mutate() { if (observing) observer(); },
     redrawPanel() { button = null; if (observing) observer(); },
@@ -451,6 +457,44 @@ await tick();
 assert.equal(hungStart.button.disabled, false,
   'unanswered START must not leave the chat button disabled indefinitely');
 assert.equal(hungStart.sent.length, 1, 'timeout must not create a duplicate handoff');
+hungStart.releaseStart();
+await tick();
+assert.equal(hungStart.assignedUrl, 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood',
+  'late START acknowledgement must still navigate the original source');
+assert.equal(hungStart.assignments, 1);
+assert.equal(hungStart.sent.length, 1);
+
+const resumeReceipt = { status: 'started', hasDestination: false, resume: {
+  tabId: 600, landingUrl: 'https://chatgpt.com/g/g-p-6818bc97551c8191865a07d09f7b3678-1hood',
+  sourceUrl: 'https://chatgpt.com' + path,
+  intentToken: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', intentCreatedAt: Date.now(),
+} };
+const lostAck = mount(true, null, false, '', warning, true, '', '', false, null, true, resumeReceipt);
+lostAck.flush();
+lostAck.manualClick();
+lostAck.flush();
+await tick();
+assert.equal(lostAck.assignments, 1, 'a lost reply recovers its existing durable receipt');
+assert.equal(lostAck.sent.length, 1, 'read-only recovery never submits another START');
+assert.equal(JSON.parse(lostAck.sourceIntent).token, resumeReceipt.resume.intentToken);
+lostAck.releaseStart();
+await tick();
+assert.equal(lostAck.assignments, 1, 'a later original reply cannot navigate twice');
+
+for (const changed of ['draft', 'attachment', 'path']) {
+  const delayed = mount(true, null, false, '', warning, true, '', '', false, null, true, resumeReceipt);
+  delayed.flush();
+  delayed.manualClick();
+  if (changed === 'draft') delayed.setDraft('new unsent text');
+  if (changed === 'attachment') delayed.setAttachment(true);
+  if (changed === 'path') delayed.setPath('/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+  delayed.flush();
+  delayed.releaseStart();
+  await tick();
+  assert.equal(delayed.assignments, 0, `delayed acknowledgement must preserve changed ${changed}`);
+  assert.equal(delayed.sourceIntent, undefined);
+}
+
 
 // A completed continuation is discoverable when the original chat is reopened
 // in a fresh browser window, with no new-chat action until the user clicks.
