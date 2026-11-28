@@ -4,7 +4,8 @@
   if (window !== window.top || typeof window.fetch !== 'function') return;
   const originalFetch = window.fetch;
   const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
-  if (originalFetch.__hstryTooLargeObserver) return;
+  if (originalFetch.__hstryNativeSubmitAccountObserver) return;
+  const legacyObserver = originalFetch.__hstryTooLargeObserver === true;
   const observedFetch = function(resource, options) {
     const result = Reflect.apply(originalFetch, this, arguments);
     try {
@@ -15,7 +16,7 @@
       // them before the DOM observer can see them. Capture its successful text
       // responses without making another network request or altering the page.
       const native = new RegExp('^/backend-api/conversations/(' + UUID + ')(?:/messages)?$', 'i').exec(url.pathname);
-      if (native && method === 'GET') {
+      if (native && method === 'GET' && !legacyObserver) {
         const sourcePath = location.pathname;
         const id = native[1].toLowerCase();
         if (!sourcePath.toLowerCase().endsWith('/c/' + id)) return result;
@@ -42,8 +43,22 @@
       }
       if (url.pathname !== '/backend-api/f/conversation' || method !== 'POST') return result;
       const sourcePath = location.pathname;
+      const requestedAt = Date.now();
+      let nativeAccountId = null;
+      try {
+        // Observe only the non-secret account identifier on the existing
+        // native request. Never forward credentials, headers or its body.
+        const account = new Headers(options?.headers ?? resource?.headers).get('chatgpt-account-id');
+        if ((sourcePath === '/' || new RegExp('^/c/' + UUID + '/?$', 'i').test(sourcePath)) &&
+            new RegExp('^' + UUID + '$', 'i').test(account ?? '')) nativeAccountId = account;
+      } catch { /* A missing account identity leaves root naming disabled. */ }
       void result.then(async response => {
-        if (response.status < 400) return;
+        if (response.ok && nativeAccountId) {
+          window.dispatchEvent(new CustomEvent('hstry:native-submit-account', {
+            detail: { path: sourcePath, requestedAt, accountId: nativeAccountId },
+          }));
+        }
+        if (legacyObserver || response.status < 400) return;
         const error = await response.clone().json();
         if (error?.detail?.code !== 'conversation_too_large') return;
         let failedMessage = '', includesAttachments = false, oversized = false;
@@ -75,6 +90,9 @@
     } catch { /* Observing a request must never affect ChatGPT's own fetch. */ }
     return result;
   };
+  // An already-open 0.4.65 page keeps its original observer. On upgrade,
+  // delegate its existing capture/rejection work rather than duplicate it.
   Object.defineProperty(observedFetch, '__hstryTooLargeObserver', { value: true });
+  Object.defineProperty(observedFetch, '__hstryNativeSubmitAccountObserver', { value: true });
   window.fetch = observedFetch;
 })();

@@ -184,8 +184,24 @@ const falseStart = await send(foreignChat, 'HSTRY_TAKEOVER_START', 1, true,
   foreignChat, { sourceUrl: original });
 assert.equal(falseStart.ok, false,
   'tab and current page must agree on the exact source conversation and project');
+// Chrome's committed tab URL can lag the SPA path after the native send.
+// A same-project landing is a pending receipt, not a failed project change.
+tabs.get(1).url = landing;
+const delayedDone = await send(landing, 'HSTRY_TAKEOVER_DONE', 1, false, landing,
+  { pagePath: new URL(newChat).pathname });
+assert.equal(delayedDone.ok, true);
+assert.equal(delayedDone.pending, true);
+assert.equal(local.get('hstryTakeoverSource:' + sourceId).status, 'started');
+assert.equal(session.has('hstryTakeoverTab:1'), true);
+// A real change to another project must not be accepted even with a stale
+// sender snapshot claiming the expected destination.
+tabs.get(1).url = foreignChat;
+const movedDone = await send(newChat, 'HSTRY_TAKEOVER_DONE', 1);
+assert.equal(movedDone.ok, false);
+assert.equal(session.has('hstryTakeoverTab:1'), true);
 tabs.get(1).url = newChat;
-const done = await send(newChat, 'HSTRY_TAKEOVER_DONE', 1);
+const done = await send(landing, 'HSTRY_TAKEOVER_DONE', 1, false, landing,
+  { pagePath: new URL(newChat).pathname });
 assert.equal(done.ok, true);
 assert.equal(done.completed, true);
 assert.equal(session.has('hstryTakeoverTab:1'), false);
@@ -223,13 +239,21 @@ assert.equal(tabs.get(4).url, initialUrl, 'successful START does not navigate be
 assert.equal(recovered.landingUrl, 'https://chatgpt.com/');
 assert.equal(updates, 0);
 
-const waiting = await send(another, 'HSTRY_TAKEOVER_START', 5, true);
+const waiting = await send(another, 'HSTRY_TAKEOVER_START', 5, false, another, { failedMessage: 'preserve the original rejected draft' });
 assert.equal(waiting.ok, true);
 assert.equal(tabs.get(5).url, another, 'acknowledged START leaves the page in place for navigation');
 assert.equal(session.has('hstryTakeoverTab:5'), true);
-const retried = await send(another, 'HSTRY_TAKEOVER_START', 5, false);
+const savedWaiting = session.get('hstryTakeoverTab:5');
+const resumeStatus = await send(another, 'HSTRY_TAKEOVER_STATUS', 5, false, another, { resumePending: true });
+assert.equal(resumeStatus.resume.intentToken, savedWaiting.intentToken, 'lost ACK can recover only its existing source-tab intent');
+assert.equal(resumeStatus.resume.intentCreatedAt, savedWaiting.createdAt);
+const unrelatedStatus = await send(another, 'HSTRY_TAKEOVER_STATUS', 2, false, another, { resumePending: true });
+assert.equal(unrelatedStatus.resume, undefined, 'another tab cannot recover a source-tab token');
+const retried = await send(another, 'HSTRY_TAKEOVER_START', 5, true);
 assert.equal(retried.ok, true, 'same original tab can recover without starting a new tab');
 assert.equal(retried.landingUrl, 'https://chatgpt.com/');
+assert.equal(retried.intentToken, waiting.intentToken);
+assert.deepEqual(session.get('hstryTakeoverTab:5'), savedWaiting, 'retry must preserve the original prompt, age and classification');
 assert.equal(tabs.get(5).url, another, 'repeat acknowledgments never navigate the worker');
 assert.equal(updates, 0);
 assert.equal(creates, 0);

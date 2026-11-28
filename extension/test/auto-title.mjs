@@ -33,6 +33,19 @@ assert.equal(title(settings, { chatgpt: { state: { pending: { scopes: [
   { ...scope, projectId: null, projectName: null } ] } } } },
   { ...route, projectId: null }), null,
   'unprojected chats are not safe to rename from cached Workspace ownership');
+// Root Workspace chats are eligible only when the actual native submission
+// supplies a matching account identity. A cached Workspace scope alone cannot
+// distinguish a root chat in the Personal account.
+const rootAccount = '88888888-aaaa-4bbb-8ccc-dddddddddddd';
+const rootRoute = { ...route, projectId: null };
+const rootStatus = { chatgpt: { state: { pending: { scopes: [
+  { ...scope, projectId: null, projectName: null, accountId: rootAccount } ] } } } };
+assert.equal(proposedWorkspaceChatTitle(settings, rootStatus, rootRoute, 'Archive recovery', at, null, rootAccount),
+  '2026-11-07 17:28 — Workspace — Archive recovery');
+assert.equal(proposedWorkspaceChatTitle(settings, rootStatus, rootRoute, 'Archive recovery', at, null,
+  '11111111-1111-4111-8111-111111111111'), null, 'a different active account cannot rename a root chat');
+assert.equal(proposedWorkspaceChatTitle(settings, rootStatus, rootRoute, 'Archive recovery', at), null);
+
 for (const flag of ['autoNameNewChats', 'chatgptWorkspaceOnly']) {
   assert.equal(title({ ...settings, [flag]: false }), null, `${flag} must be enabled`);
 }

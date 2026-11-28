@@ -164,3 +164,49 @@ console.log('PASS native ChatGPT Rename: Radix pointerdown, input event, Save, r
   assert.equal(commits, 1, 'navigation cancels the automation');
 }
 console.log('PASS delayed native rename: bounded wait, manual/navigation guards, once-only commit');
+
+// The real title scheduler must not make an unverified root-account write,
+// consume an unconfirmed handoff, or burn its only write on a stale proposal.
+{
+  const start = script.indexOf('  function maybeNameNewChat()');
+  const end = script.indexOf('  // Only a real user submission', start);
+  assert(start !== -1 && end > start);
+  const rootPath = '/c/99999999-aaaa-4bbb-8ccc-dddddddddddd';
+  const accountId = '88888888-aaaa-4bbb-8ccc-dddddddddddd';
+  const source = 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111';
+  const doc = { title: 'Continue Existing Work', querySelector: selector =>
+    selector.includes('stop-button') ? null : selector.includes('assistant') ? {} :
+      selector.includes('data-user-message-bubble') ? { innerText: 'collapsed first turn' } : null };
+  const writes = [], proposals = [], deferred = [];
+  const context = {
+    document: doc, location: { pathname: rootPath, href: 'https://chatgpt.com'+rootPath },
+    Date: { now: () => 10000 }, clearTimeout() {}, setTimeout() {}, scheduleWarningCheck() {},
+    isLanding: path => path === '/', landingPath: '/', newChatLanding: true,
+    newChatSubmitted: true, firstSubmittedAtMs: 1000, firstSubmittedPath: '/',
+    firstSubmittedText: null, titleAccount: null, titlePredecessorUrl: source,
+    titleHandoffDestination: null, autoTitleAttempted: false, titleProposalInFlight: false,
+    manualTitleEdit: false, titleTargetPath: null, lastObservedTitle: doc.title,
+    titleStableSinceMs: 1000, titleWaitTimer: null, lastProposedTitle: null,
+    send: proposal => { proposals.push(proposal); return new Promise(resolve => deferred.push(resolve)); },
+    renameUsingChatGPT: async (old, named, path) => { writes.push({old,named,path}); doc.title=named; return true; },
+  };
+  const schedule = vm.runInNewContext(`(function () { ${script.slice(start,end)}\nreturn maybeNameNewChat; })()`, context);
+  schedule(); assert.equal(proposals.length, 0, 'root requires native account evidence');
+  context.titleAccount = { path: '/', accountId };
+  schedule(); assert.equal(proposals.length, 0, 'automatic continuation must have a verified receipt');
+  context.titleHandoffDestination = rootPath;
+  schedule(); assert.equal(proposals.length, 1);
+  assert.equal(proposals[0].nativeAccountId, accountId);
+  assert.equal(proposals[0].predecessorUrl, source, 'do not scrape a collapsed takeover bubble');
+  doc.title = 'Archive recovery';
+  deferred.shift()({ok:true,title:'2026-11-28 00:00 — Workspace — Old native title'});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(writes.length, 0, 'late proposal must not rename a newer native title');
+  context.lastObservedTitle = doc.title; context.titleStableSinceMs = 1000;
+  schedule(); assert.equal(proposals.length, 2);
+  deferred.shift()({ok:true,title:'2026-11-28 00:00 — Workspace — Archive recovery'});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(writes.length, 1);
+  schedule(); assert.equal(proposals.length, 2, 'confirmed native write is never repeated');
+}
+console.log('PASS root continuation title: verified account and receipt, current title, exactly one native write');

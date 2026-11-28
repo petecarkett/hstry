@@ -67,7 +67,7 @@
   let resumeWhenComposerReady = false;
   let submittedPath = null;
   let autoAttemptedPath = null;
-  let started = false;
+  let startAttempt = 0;
   let detectionTimer;
   let handoffStarted = false;
   let checkingHandoff = false;
@@ -80,7 +80,9 @@
   let newChatLanding = isLanding(location.pathname);
   let landingPath = location.pathname;
   let newChatSubmitted = false, autoTitleAttempted = false, manualTitleEdit = false;
-  let firstSubmittedAtMs = null;
+  let firstSubmittedAtMs = null, firstSubmittedPath = null, titleAccount = null, titlePredecessorUrl = null;
+  let firstSubmittedText = null, titleHandoffDestination = null;
+  let titleProposalInFlight = false, lastProposedTitle = null;
   let titleTargetPath = null, lastObservedTitle = '', titleStableSinceMs = 0, titleWaitTimer = null;
   document.addEventListener('click', event => {
     if (!event.isTrusted) return;
@@ -92,7 +94,9 @@
       sessionStorage.removeItem(INTENT_KEY);
       newChatLanding = true; landingPath = location.pathname;
       newChatSubmitted = false; autoTitleAttempted = false;
-      firstSubmittedAtMs = null; manualTitleEdit = false; titleTargetPath = null;
+      firstSubmittedAtMs = null; firstSubmittedPath = null; titleAccount = null; titlePredecessorUrl = null;
+      firstSubmittedText = null; titleHandoffDestination = null;
+      lastProposedTitle = null; manualTitleEdit = false; titleTargetPath = null;
       lastObservedTitle = ''; titleStableSinceMs = 0; clearTimeout(titleWaitTimer);
     }
     if (action?.getAttribute?.('role') === 'menuitem' &&
@@ -160,7 +164,7 @@
 
   function maybeNameNewChat() {
     if (!newChatLanding || !newChatSubmitted || !firstSubmittedAtMs ||
-        autoTitleAttempted || manualTitleEdit) return;
+        autoTitleAttempted || titleProposalInFlight || manualTitleEdit) return;
     const path = location.pathname;
     if (isLanding(path) || path === landingPath || !/\/c\/[0-9a-f-]{36}\/?$/i.test(path)) return;
     if (titleTargetPath && path !== titleTargetPath) return;
@@ -179,19 +183,44 @@
       return;
     }
     clearTimeout(titleWaitTimer);
-    autoTitleAttempted = true;
+    const root = /^\/c\/[0-9a-f-]{36}\/?$/i.test(path);
+    if (titlePredecessorUrl && titleHandoffDestination !== path) return;
+    const firstUser = document.querySelector('[data-user-message-bubble="true"]')?.innerText || '';
+    if (root && (firstSubmittedPath !== '/' || !titleAccount ||
+        (titleAccount.path !== '/' && titleAccount.path !== path) ||
+        (!titlePredecessorUrl && (!firstSubmittedText || normalizeTitlePrompt(firstUser) !== firstSubmittedText)))) return;
+    if (lastProposedTitle === originalTitle) return;
+    lastProposedTitle = originalTitle;
+    titleProposalInFlight = true;
     void (async () => {
       if (location.pathname !== path || document.title !== originalTitle || manualTitleEdit) return;
-      const firstUser = document.querySelector('[data-user-message-bubble="true"]')?.innerText || '';
       const handoff = /^(?:continue the unfinished work|take over from this chat|resume (?:this|the) (?:chat|conversation))/i.test(firstUser.trim());
-      const predecessorUrl = handoff ? firstUser.match(/https:\/\/chatgpt\.com\/(?:g\/[^\s)]+?\/)?c\/[0-9a-f-]{36}/i)?.[0] : null;
+      const predecessorUrl = titlePredecessorUrl ?? (handoff ? firstUser.match(/https:\/\/chatgpt\.com\/(?:g\/[^\s)]+?\/)?c\/[0-9a-f-]{36}/i)?.[0] : null);
       const result = await send({ type: 'hstryAutoTitleProposal', url: location.href,
         title: originalTitle, openedAtMs: firstSubmittedAtMs,
-        predecessorUrl });
-      if (result?.ok && result.title && result.title !== originalTitle && !manualTitleEdit) {
+        predecessorUrl, nativeAccountId: root ? titleAccount.accountId : null });
+      if (result?.ok && result.title && result.title !== originalTitle && !manualTitleEdit &&
+          location.pathname === path && document.title === originalTitle) {
+        // Never retry a native write, even if its response is uncertain.
+        autoTitleAttempted = true;
         await renameUsingChatGPT(originalTitle, result.title, path);
       }
-    })().catch(() => {}); // UI changes fail closed; never affect history capture.
+    })().catch(() => {}).finally(() => {
+      titleProposalInFlight = false;
+      // The native title can change while a read-only proposal is in flight.
+      if (!autoTitleAttempted && location.pathname === path && document.title !== originalTitle) scheduleWarningCheck();
+    }); // UI changes fail closed; never affect history capture.
+  }
+
+  const normalizeTitlePrompt = text => String(text || '').replace(/\s+/g, ' ').trim();
+  function rememberFirstTitleSubmit() {
+    if (firstSubmittedAtMs) return;
+    firstSubmittedAtMs = Date.now();
+    firstSubmittedPath = location.pathname;
+    if (firstSubmittedPath === '/') {
+      const editor = editableElement();
+      firstSubmittedText = normalizeTitlePrompt(editor?.value || editor?.textContent);
+    }
   }
 
   // Only a real user submission may automatically recover a generic error.
@@ -203,7 +232,7 @@
       submittedPath = location.pathname;
       if (newChatLanding && isLanding(location.pathname)) {
         newChatSubmitted = true;
-        firstSubmittedAtMs ??= Date.now();
+        rememberFirstTitleSubmit();
       }
     }
   }, true);
@@ -217,7 +246,7 @@
       submittedPath = location.pathname;
       if (newChatLanding && isLanding(location.pathname)) {
         newChatSubmitted = true;
-        firstSubmittedAtMs ??= Date.now();
+        rememberFirstTitleSubmit();
       }
     }
   }, true);
@@ -288,6 +317,13 @@
       'No verified destination URL is stored. HSTRY will not guess or create a duplicate.';
   }
 
+  function hasUnsentComposer() {
+    const editor = editableElement();
+    return !!(editor?.value || editor?.textContent || '').trim() ||
+      [...document.querySelectorAll('input[type="file"]')].some(input => input.files?.length) ||
+      !!document.querySelector?.('[aria-label="Remove attachment"], [data-testid="attachment-preview"]');
+  }
+
   async function startTakeover(btn, automatic = false) {
     if (btn.disabled) return;
     if (serverLimitPath === location.pathname && rejectedTooLong) {
@@ -298,27 +334,36 @@
       fallbackBanner('HSTRY paused: the rejected submission contained attachments. Reattach them manually before continuing.');
       return;
     }
-    const editor = editableElement();
-    const hasDraft = !!(editor?.value || editor?.textContent || '').trim();
-    const hasFiles = [...document.querySelectorAll('input[type="file"]')]
-      .some(input => input.files?.length);
-    if (hasDraft || hasFiles || document.querySelector?.(
-      '[aria-label="Remove attachment"], [data-testid="attachment-preview"]')) {
+    if (hasUnsentComposer()) {
       fallbackBanner('HSTRY paused: save or send the unsent draft or attachment before continuing.');
       return;
     }
+    const sourcePath = location.pathname;
+    const requestedSource = location.href;
+    const attempt = ++startAttempt;
     btn.disabled = true;
     btn.textContent = 'Opening continuation...';
     let startTimeout;
     try {
       const result = await Promise.race([
-        send({ type: 'HSTRY_TAKEOVER_START', automatic, sourceUrl: location.href,
-          failedMessage: serverLimitPath === location.pathname ? rejectedMessage : '',
-          missingAttachments: serverLimitPath === location.pathname && rejectedHasAttachments }),
-        new Promise((_, reject) => { startTimeout = setTimeout(() => reject(new Error(
-          'HSTRY did not confirm navigation. Check this tab before retrying.')), 30_000); }),
+        send({ type: 'HSTRY_TAKEOVER_START', automatic, sourceUrl: requestedSource,
+          failedMessage: serverLimitPath === sourcePath ? rejectedMessage : '',
+          missingAttachments: serverLimitPath === sourcePath && rejectedHasAttachments }),
+        new Promise(resolve => { startTimeout = setTimeout(async () => {
+          if (attempt !== startAttempt || location.href !== requestedSource) return;
+          // Do not abandon a delayed reply. A read-only receipt check also
+          // recovers an acknowledgement that never reached this content script.
+          btn.disabled = false;
+          btn.textContent = 'Resume continuation';
+          try {
+            const status = await send({ type: 'HSTRY_TAKEOVER_STATUS', sourceUrl: requestedSource, resumePending: true });
+            if (status?.ok && status.resume) resolve({ ok: true, ...status.resume });
+          } catch { /* A later START reply or explicit retry remains eligible. */ }
+        }, 30_000); }),
       ]);
+      if (attempt !== startAttempt || location.href !== requestedSource) return;
       if (!result?.ok) throw new Error(result?.error || 'Unable to open the new chat');
+      if (hasUnsentComposer()) throw new Error('Save or send the new draft or attachment before continuing.');
       if (result.existing) {
         btn.textContent = result.completed ? 'Continuation already completed' : 'Continuation already opened';
       } else {
@@ -337,13 +382,13 @@
         }
         sessionStorage.setItem(INTENT_KEY, JSON.stringify({
           token: result.intentToken, sourceUrl: result.sourceUrl,
-          landingUrl: expected, at: Date.now(),
+          landingUrl: expected, at: result.intentCreatedAt ?? Date.now(),
         }));
+        btn.disabled = true;
         btn.textContent = 'Continuing in this tab';
-        const sourcePath = location.pathname;
         // If navigation is blocked, leave the existing saved handoff retryable.
         setTimeout(() => {
-          if (location.pathname === sourcePath) {
+          if (attempt === startAttempt && location.pathname === sourcePath) {
             btn.disabled = false;
             btn.textContent = 'Continue with HSTRY';
             fallbackBanner('HSTRY saved the handoff, but this tab did not navigate. Check before retrying.');
@@ -352,6 +397,7 @@
         location.assign(expected);
       }
     } catch (err) {
+      if (attempt !== startAttempt || location.href !== requestedSource) return;
       btn.disabled = false;
       btn.textContent = 'Continue with HSTRY';
       const message = String(err?.message || err);
@@ -541,6 +587,11 @@
       if (!button) throw new Error('Takeover text is ready; send it manually');
       if (!onHandoffLanding(result.landingPath)) throw new Error('Destination project changed before sending');
       const handoffSubmitAtMs = Date.now();
+      if (newChatLanding) {
+        firstSubmittedAtMs ??= handoffSubmitAtMs;
+        firstSubmittedPath ??= location.pathname;
+        titlePredecessorUrl = intent.sourceUrl;
+      }
       button.click();
       clicked = true;
       // A native click alone is not a successful submission. Keep the handoff
@@ -564,10 +615,19 @@
       if (onHandoffLanding(result.landingPath)) {
         throw new Error('ChatGPT has not created a new conversation. The handoff remains pending.');
       }
-      const done = await send({ type:'HSTRY_TAKEOVER_DONE', pagePath: location.pathname,
-        intentToken: intent.token, sourceUrl: intent.sourceUrl });
+      const destinationPath = location.pathname;
+      let done;
+      for (let i = 0; i < 40 && location.pathname === destinationPath; i++) {
+        done = await send({ type:'HSTRY_TAKEOVER_DONE', pagePath: destinationPath,
+          intentToken: intent.token, sourceUrl: intent.sourceUrl });
+        if (!done?.ok || !done.pending) break;
+        await pause(250);
+      }
       if (!done?.ok || !done.completed) throw new Error(done?.error || 'Continuation completion was not verified');
+      titleHandoffDestination = destinationPath;
       sessionStorage.removeItem(INTENT_KEY);
+      document.getElementById('hstry-takeover-feedback')?.remove();
+      scheduleWarningCheck();
     } catch (e) {
       if (!clicked) {
         handoffStarted = false;
@@ -576,8 +636,10 @@
       const message = String(e.message || e);
       fallbackBanner(/Destination project changed/.test(message)
         ? 'HSTRY paused because the tab changed projects. Do not send the continuation here; return to its original project.'
-        : 'HSTRY takeover: ' + message +
-          '. If the instruction is in the composer, press Send. Otherwise retry from the original chat.');
+        : 'HSTRY takeover: ' + message + (clicked &&
+          !(editableElement()?.value || editableElement()?.textContent || '').includes(prompt.slice(0, 32))
+          ? '. The instruction may already have been sent; do not send it again.'
+          : '. If the instruction is in the composer, press Send. Otherwise retry from the original chat.'));
     }
   }
 
@@ -628,6 +690,17 @@
     clearTimeout(detectionTimer);
     detectionTimer = setTimeout(() => { detectLimit(); maybeNameNewChat(); }, 700);
   }
+  window.addEventListener('hstry:native-submit-account', event => {
+    const detail = event?.detail;
+    if (!newChatLanding || firstSubmittedPath !== '/' || !firstSubmittedAtMs ||
+        !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(detail?.accountId ?? '') ||
+        !Number.isFinite(detail.requestedAt) || detail.requestedAt < firstSubmittedAtMs ||
+        detail.requestedAt - firstSubmittedAtMs > 60_000 ||
+        (detail.path !== '/' && detail.path !== location.pathname) ||
+        (location.pathname !== '/' && !/^\/c\/[0-9a-f-]{36}\/?$/i.test(location.pathname))) return;
+    titleAccount ??= { path: detail.path, accountId: detail.accountId };
+    scheduleWarningCheck();
+  });
   window.addEventListener('hstry:conversation-too-large', event => {
     const detail = event?.detail;
     if (!detail || detail.path !== location.pathname ||
@@ -645,6 +718,8 @@
   if (document.body) {
     observer = new MutationObserver(scheduleWarningCheck);
     observer.observe(document.body, { childList: true, subtree: true });
+    const titleNode = document.querySelector('title');
+    if (titleNode) observer.observe(titleNode, { childList: true, characterData: true, subtree: true });
     scheduleWarningCheck();
   }
   if (resumePending) {

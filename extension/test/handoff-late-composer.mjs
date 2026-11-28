@@ -13,6 +13,7 @@ const timers = new Map();
 const sent = [];
 let composerSends = 0;
 let finished = false;
+let doneAttempts = 0;
 let bannerCount = 0;
 let editorValue = '';
 let releaseFirstPoll;
@@ -102,7 +103,7 @@ const context = {
         const response = () => callback(message.type === 'HSTRY_TAKEOVER_POLL'
           ? { ok: true, found: true, prompt: 'HSTRY recovery fixture prompt',
               original: sourceUrl, intentToken, landingPath: '/' }
-          : { ok: true, completed: true });
+          : doneAttempts === 1 ? { ok: true, pending: true } : { ok: true, completed: true });
         // A congested Chrome worker can hold the FIRST storage response for
         // minutes; this must not exhaust the landing retry window.
         if (message.type === 'HSTRY_TAKEOVER_POLL' && !releaseFirstPoll) {
@@ -110,7 +111,7 @@ const context = {
         } else {
           queueMicrotask(response);
         }
-        if (message.type === 'HSTRY_TAKEOVER_DONE') finished = true;
+        if (message.type === 'HSTRY_TAKEOVER_DONE') { doneAttempts++; finished = doneAttempts === 2; }
       },
     },
   },
@@ -165,9 +166,13 @@ observerCallback(); // Returning to the intended landing may resume the handoff.
 await settle(); // No timer ticks: the DOM change itself must resume the handoff.
 assert.equal(editorValue, '', 'native submit clears the input');
 assert.equal(composerSends, 1);
+assert.equal(finished, false, 'a pending receipt must not be marked complete');
+flushTimers();
+await settle();
 assert.equal(finished, true);
+assert.equal(composerSends, 1, 'receipt retry never resends the native prompt');
 assert.deepEqual(sent, ['HSTRY_TAKEOVER_POLL', 'HSTRY_TAKEOVER_POLL',
-  'HSTRY_TAKEOVER_DONE'],
+  'HSTRY_TAKEOVER_DONE', 'HSTRY_TAKEOVER_DONE'],
   'wrong-project navigation must not consume a poll or lose the pending handoff');
 assert.equal(bannerCount, 0);
 
